@@ -1022,61 +1022,71 @@ class DoorEntryKiosk:
         """Main camera loop running in a separate thread"""
         try:
             self.camera.start()
-            frame_time = time.time()
+            
+            # Separate timing for display vs recognition
+            last_recognition_time = 0
+            recognition_interval = 0.1  # Run recognition every 100ms max
+            last_results = []  # Cache last recognition results for overlay
             
             while self.is_running:
-                loop_start = time.time()
-                
-                # Use capture_latest_frame to get the newest frame and reduce latency
+                # Get the latest frame immediately - no blocking
                 frame = self.camera.capture_latest_frame()
                 if frame is None:
+                    time.sleep(0.001)
                     continue
                 
                 display_frame = frame.copy()
+                current_time = time.time()
                 
                 if self.is_scanning and not self.registration_mode:
-                    # Perform optimized face recognition
-                    _, results = self.face_system.recognize_faces(frame)
+                    # Only run expensive recognition periodically, not every frame
+                    if current_time - last_recognition_time >= recognition_interval:
+                        last_recognition_time = current_time
+                        
+                        # Perform face recognition
+                        _, results = self.face_system.recognize_faces(frame)
+                        last_results = results
+                        
+                        # Track performance metrics
+                        self.faces_detected = len(results)
+                        cache_hits_this_frame = sum(1 for r in results if r.get('from_cache', False))
+                        cache_misses_this_frame = len(results) - cache_hits_this_frame
+                        self.cache_hits += cache_hits_this_frame
+                        self.cache_misses += cache_misses_this_frame
+                        
+                        # Process access grants/denials
+                        for result in results:
+                            name = result['name']
+                            confidence = result['confidence']
+                            from_cache = result.get('from_cache', False)
+                            
+                            if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
+                                now = time.time()
+                                if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
+                                    self.last_access[name] = now
+                                    self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
+                            else:
+                                if name == "Unknown" and self.current_status == "scanning" and not from_cache:
+                                    now = time.time()
+                                    if "Unknown" not in self.last_access or (now - self.last_access["Unknown"]) > Config.COOLDOWN_SECONDS:
+                                        self.last_access["Unknown"] = now
+                                        self.root.after(0, self.deny_access)
                     
-                    # Track performance metrics
-                    self.faces_detected = len(results)
-                    cache_hits_this_frame = sum(1 for r in results if r.get('from_cache', False))
-                    cache_misses_this_frame = len(results) - cache_hits_this_frame
-                    self.cache_hits += cache_hits_this_frame
-                    self.cache_misses += cache_misses_this_frame
-                    
-                    for result in results:
+                    # Always draw overlays using cached results (fast)
+                    for result in last_results:
                         top, right, bottom, left = result['location']
                         name = result['name']
                         confidence = result['confidence']
                         from_cache = result.get('from_cache', False)
                         
-                        # Determine access
                         if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
-                            # Check cooldown
-                            now = time.time()
-                            if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
-                                self.last_access[name] = now
-                                
-                                # Grant access
-                                self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
-                            
                             color = (0, 200, 80)  # Green
                         else:
-                            # Check if we should log denied access (only for non-cached results)
-                            if name == "Unknown" and self.current_status == "scanning" and not from_cache:
-                                now = time.time()
-                                if "Unknown" not in self.last_access or (now - self.last_access["Unknown"]) > Config.COOLDOWN_SECONDS:
-                                    self.last_access["Unknown"] = now
-                                    self.root.after(0, self.deny_access)
-                            
                             color = (0, 0, 255)  # Red
                         
-                        # Draw face box (thinner for cached results)
                         box_thickness = 2 if from_cache else 3
                         cv2.rectangle(display_frame, (left, top), (right, bottom), color, box_thickness)
                         
-                        # Draw label with cache indicator
                         cache_indicator = " [C]" if from_cache else ""
                         label = f"{name} ({confidence:.0%}){cache_indicator}" if name != "Unknown" else f"Unknown{cache_indicator}"
                         cv2.rectangle(display_frame, (left, top - 40), (right, top), color, cv2.FILLED)
@@ -1084,13 +1094,11 @@ class DoorEntryKiosk:
                                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1)
                 
                 elif self.registration_mode:
-                    # Registration mode - use the pre-loaded cascade from face_system
                     faces = self.face_system.detect_faces_fast(frame)
                     
                     for (top, right, bottom, left) in faces:
                         cv2.rectangle(display_frame, (left, top), (right, bottom), (0, 255, 255), 3)
                     
-                    # Show registration info
                     cv2.putText(display_frame, "REGISTRATION MODE", (10, 30),
                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
                     cv2.putText(display_frame, f"Person: {self.registration_name}", (10, 70),
@@ -1100,37 +1108,33 @@ class DoorEntryKiosk:
                     cv2.putText(display_frame, f"Faces detected: {len(faces)}", (10, 150),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
                 
-                # Calculate and display FPS
+                # FPS counter
                 self.fps_counter += 1
-                elapsed = time.time() - self.fps_start_time
+                elapsed = current_time - self.fps_start_time
                 if elapsed >= 1.0:
                     self.current_fps = self.fps_counter / elapsed
                     self.fps_counter = 0
-                    self.fps_start_time = time.time()
+                    self.fps_start_time = current_time
                 
-                # Draw performance overlay
                 fps_text = f"FPS: {self.current_fps:.1f}"
                 cv2.putText(display_frame, fps_text, (display_frame.shape[1] - 120, 30),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
-                # Periodic cache cleanup to prevent memory buildup
-                now = time.time()
-                if now - self.last_cache_cleanup > self.cache_cleanup_interval:
+                # Periodic cache cleanup
+                if current_time - self.last_cache_cleanup > self.cache_cleanup_interval:
                     expired_count = self.face_system.face_cache.cleanup_expired()
                     if expired_count and expired_count > 0:
                         print(f"Cache cleanup: removed {expired_count} expired entries")
-                    self.last_cache_cleanup = now
+                    self.last_cache_cleanup = current_time
                 
-                # Store current frame
-                self.current_frame = frame.copy()
+                # Store current frame for capture
+                self.current_frame = frame
                 
-                # Update display
+                # Update display immediately
                 self.root.after(0, lambda f=display_frame: self.display_frame(f))
                 
-                # Adaptive frame rate - aim for ~30 FPS
-                loop_time = time.time() - loop_start
-                sleep_time = max(0.001, 0.033 - loop_time)
-                time.sleep(sleep_time)
+                # Minimal sleep to prevent CPU spinning - display runs as fast as possible
+                time.sleep(0.001)
             
         except Exception as e:
             print(f"Camera error: {e}")
