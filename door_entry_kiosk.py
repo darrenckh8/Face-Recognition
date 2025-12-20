@@ -980,7 +980,7 @@ class DoorEntryKiosk:
             self.status_icon_label.config(text="✓")
             self.status_text_label.config(text=f"Welcome, {name}")
             self.status_detail_label.config(text="Access granted")
-            update_bg(Config.COLOR_GRANTED, "#FFFFFF", "#FFFFFF", "rgba(255,255,255,0.85)")
+            update_bg(Config.COLOR_GRANTED, "#FFFFFF", "#FFFFFF", "#E8F5E9")
             # Flash effect - briefly highlight then return
             self.root.after(2500, lambda: self.set_status("scanning"))
             
@@ -988,7 +988,7 @@ class DoorEntryKiosk:
             self.status_icon_label.config(text="✕")
             self.status_text_label.config(text="Not Recognized")
             self.status_detail_label.config(text="Access denied")
-            update_bg(Config.COLOR_DENIED, "#FFFFFF", "#FFFFFF", "rgba(255,255,255,0.85)")
+            update_bg(Config.COLOR_DENIED, "#FFFFFF", "#FFFFFF", "#FFEBEE")
             self.root.after(2500, lambda: self.set_status("scanning"))
             
         else:  # scanning
