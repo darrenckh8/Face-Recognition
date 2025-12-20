@@ -498,6 +498,60 @@ class FaceRecognitionSystem:
         
         return True, f"Training complete! {len(known_encodings)} encodings from {len(set(known_names))} persons"
     
+    def train_single_person(self, person_name, progress_callback=None):
+        """Train only a single person's images and add to existing model (incremental training)"""
+        from imutils import paths
+        
+        person_folder = os.path.join(self.dataset_path, person_name)
+        if not os.path.exists(person_folder):
+            return False, f"No folder found for {person_name}"
+        
+        image_paths = list(paths.list_images(person_folder))
+        if not image_paths:
+            return False, f"No images found for {person_name}"
+        
+        new_encodings = []
+        new_names = []
+        
+        for i, image_path in enumerate(image_paths):
+            if progress_callback:
+                progress_callback(i + 1, len(image_paths), image_path)
+            
+            image = cv2.imread(image_path)
+            if image is None:
+                continue
+            
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            boxes = face_recognition.face_locations(rgb, model="hog")
+            encodings = face_recognition.face_encodings(rgb, boxes)
+            
+            for encoding in encodings:
+                new_encodings.append(encoding)
+                new_names.append(person_name)
+        
+        if not new_encodings:
+            return False, f"No faces detected in images for {person_name}"
+        
+        # Remove any existing encodings for this person (in case of re-training)
+        indices_to_keep = [i for i, name in enumerate(self.known_names) if name != person_name]
+        self.known_encodings = [self.known_encodings[i] for i in indices_to_keep]
+        self.known_names = [self.known_names[i] for i in indices_to_keep]
+        
+        # Add new encodings
+        self.known_encodings.extend(new_encodings)
+        self.known_names.extend(new_names)
+        
+        # Save updated model
+        data = {"encodings": self.known_encodings, "names": self.known_names}
+        with open(self.encodings_path, "wb") as f:
+            f.write(pickle.dumps(data))
+        
+        # Clear cache since we have new encodings
+        self.face_cache.clear()
+        
+        return True, f"Added {len(new_encodings)} encodings for {person_name}"
+    
     def detect_faces_fast(self, frame):
         """Fast face detection using Haar cascade (no recognition)"""
         small_frame = cv2.resize(frame, (0, 0), fx=1/self.cv_scaler, fy=1/self.cv_scaler)
@@ -1410,6 +1464,23 @@ class DoorEntryKiosk:
         )
         self.stop_reg_btn.pack(fill=tk.X, pady=3, ipady=8)
         
+        # Auto-train option
+        self.auto_train_var = tk.BooleanVar(value=True)
+        auto_train_frame = tk.Frame(inner, bg=Config.COLOR_CARD)
+        auto_train_frame.pack(fill=tk.X, pady=(15, 0))
+        
+        self.auto_train_check = tk.Checkbutton(
+            auto_train_frame,
+            text="Auto-train after capture (recommended)",
+            variable=self.auto_train_var,
+            font=(Config.FONT_FAMILY, 11),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_CARD,
+            activebackground=Config.COLOR_CARD,
+            selectcolor=Config.COLOR_CARD
+        )
+        self.auto_train_check.pack(anchor=tk.W)
+        
         # Tips
         tips_frame = tk.Frame(parent, bg=Config.COLOR_BG)
         tips_frame.pack(fill=tk.X, padx=20, pady=10)
@@ -1760,7 +1831,10 @@ class DoorEntryKiosk:
             print(f"[REGISTER] Saved: {filepath}")
     
     def stop_registration(self):
-        """Stop face registration mode"""
+        """Stop face registration mode and optionally auto-train"""
+        person_name = self.registration_name
+        captured = self.captured_count
+        
         self.registration_mode = False
         self.registration_name = ""
         
@@ -1771,6 +1845,33 @@ class DoorEntryKiosk:
         self.reg_name_entry.delete(0, tk.END)
         
         self.refresh_manage_list()
+        
+        # Auto-train the new person if option is enabled and photos were captured
+        if hasattr(self, 'auto_train_var') and self.auto_train_var.get() and captured > 0 and person_name:
+            self.train_single_person(person_name)
+    
+    def train_single_person(self, person_name):
+        """Train only a single person (incremental training)"""
+        self.reg_count_label.config(text=f"Training {person_name}...")
+        
+        def training_thread():
+            success, message = self.face_system.train_single_person(person_name)
+            self.root.after(0, lambda: self.single_training_complete(success, message))
+        
+        thread = threading.Thread(target=training_thread, daemon=True)
+        thread.start()
+    
+    def single_training_complete(self, success, message):
+        """Handle single person training completion"""
+        if success:
+            self.reg_count_label.config(text=f"✓ {message}")
+            messagebox.showinfo("Training Complete", message)
+        else:
+            self.reg_count_label.config(text=f"✗ Training failed")
+            messagebox.showerror("Training Failed", message)
+        
+        # Reset after a delay
+        self.root.after(3000, lambda: self.reg_count_label.config(text="0 photos captured"))
     
     def start_training(self):
         """Start model training"""
