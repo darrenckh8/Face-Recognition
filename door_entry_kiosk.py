@@ -318,6 +318,8 @@ class CameraManager:
             
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
+            # Reduce buffer size to minimize latency (display newest frames)
+            self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
         self.is_running = True
         time.sleep(0.5)
@@ -331,6 +333,27 @@ class CameraManager:
             frame = self.camera.capture_array()
             frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
         else:
+            ret, frame = self.camera.read()
+            if not ret:
+                return None
+        
+        return frame
+    
+    def capture_latest_frame(self):
+        """Capture the latest frame, discarding any buffered frames to reduce latency"""
+        if not self.is_running:
+            return None
+        
+        if self.use_picamera:
+            # Picamera2 doesn't buffer the same way
+            frame = self.camera.capture_array()
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+        else:
+            # Flush the buffer by grabbing frames without decoding
+            # This discards stale frames and gets the newest one
+            for _ in range(2):
+                self.camera.grab()
+            
             ret, frame = self.camera.read()
             if not ret:
                 return None
@@ -936,7 +959,8 @@ class DoorEntryKiosk:
             while self.is_running:
                 loop_start = time.time()
                 
-                frame = self.camera.capture_frame()
+                # Use capture_latest_frame to get the newest frame and reduce latency
+                frame = self.camera.capture_latest_frame()
                 if frame is None:
                     continue
                 
