@@ -270,6 +270,36 @@ class AccessLog:
         """Get most recent entries"""
         return list(reversed(self.entries[-count:]))
     
+    def get_filtered(self, date_from=None, date_to=None, name_filter=None, count=100):
+        """Get entries filtered by date range and/or name"""
+        filtered = []
+        for entry in reversed(self.entries):
+            # Parse entry timestamp
+            entry_date = datetime.fromisoformat(entry['timestamp']).date()
+            
+            # Date range filter
+            if date_from and entry_date < date_from:
+                continue
+            if date_to and entry_date > date_to:
+                continue
+            
+            # Name filter (case-insensitive partial match)
+            if name_filter and name_filter.lower() not in entry['name'].lower():
+                continue
+            
+            filtered.append(entry)
+            if len(filtered) >= count:
+                break
+        
+        return filtered
+    
+    def get_unique_names(self):
+        """Get list of unique names in the log"""
+        names = set()
+        for entry in self.entries:
+            names.add(entry['name'])
+        return sorted(list(names))
+    
     def clear(self):
         """Clear all entries"""
         self.entries = []
@@ -1677,6 +1707,166 @@ class DoorEntryKiosk:
             command=self.clear_access_log
         ).pack(side=tk.RIGHT)
         
+        # Filter card
+        filter_card = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
+        filter_card.pack(fill=tk.X, padx=20, pady=(0, 10))
+        
+        filter_inner = tk.Frame(filter_card, bg=Config.COLOR_CARD)
+        filter_inner.pack(fill=tk.X, padx=15, pady=15)
+        
+        # Date filter row
+        date_row = tk.Frame(filter_inner, bg=Config.COLOR_CARD)
+        date_row.pack(fill=tk.X, pady=(0, 10))
+        
+        tk.Label(
+            date_row,
+            text="Date Range:",
+            font=(Config.FONT_FAMILY, 11),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_CARD
+        ).pack(side=tk.LEFT)
+        
+        # From date
+        tk.Label(
+            date_row,
+            text="From:",
+            font=(Config.FONT_FAMILY, 11),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_CARD
+        ).pack(side=tk.LEFT, padx=(15, 5))
+        
+        self.log_date_from = tk.Entry(
+            date_row,
+            font=(Config.FONT_FAMILY, 11),
+            width=12,
+            bg=Config.COLOR_CARD_SECONDARY,
+            fg=Config.COLOR_TEXT,
+            relief=tk.FLAT,
+            highlightbackground=Config.COLOR_BORDER,
+            highlightthickness=1
+        )
+        self.log_date_from.pack(side=tk.LEFT, ipady=4)
+        self.log_date_from.insert(0, "YYYY-MM-DD")
+        self.log_date_from.bind("<FocusIn>", lambda e: self._clear_placeholder(e, "YYYY-MM-DD"))
+        self.log_date_from.bind("<FocusOut>", lambda e: self._restore_placeholder(e, "YYYY-MM-DD"))
+        
+        # To date
+        tk.Label(
+            date_row,
+            text="To:",
+            font=(Config.FONT_FAMILY, 11),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_CARD
+        ).pack(side=tk.LEFT, padx=(15, 5))
+        
+        self.log_date_to = tk.Entry(
+            date_row,
+            font=(Config.FONT_FAMILY, 11),
+            width=12,
+            bg=Config.COLOR_CARD_SECONDARY,
+            fg=Config.COLOR_TEXT,
+            relief=tk.FLAT,
+            highlightbackground=Config.COLOR_BORDER,
+            highlightthickness=1
+        )
+        self.log_date_to.pack(side=tk.LEFT, ipady=4)
+        self.log_date_to.insert(0, "YYYY-MM-DD")
+        self.log_date_to.bind("<FocusIn>", lambda e: self._clear_placeholder(e, "YYYY-MM-DD"))
+        self.log_date_to.bind("<FocusOut>", lambda e: self._restore_placeholder(e, "YYYY-MM-DD"))
+        
+        # Name filter row
+        name_row = tk.Frame(filter_inner, bg=Config.COLOR_CARD)
+        name_row.pack(fill=tk.X, pady=(0, 10))
+        
+        tk.Label(
+            name_row,
+            text="Filter by Name:",
+            font=(Config.FONT_FAMILY, 11),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_CARD
+        ).pack(side=tk.LEFT)
+        
+        # Name dropdown with autocomplete
+        self.log_name_var = tk.StringVar(value="All")
+        unique_names = ["All"] + self.access_log.get_unique_names()
+        
+        self.log_name_combo = ttk.Combobox(
+            name_row,
+            textvariable=self.log_name_var,
+            values=unique_names,
+            font=(Config.FONT_FAMILY, 11),
+            width=20,
+            state="readonly"
+        )
+        self.log_name_combo.pack(side=tk.LEFT, padx=(10, 0))
+        
+        # Filter buttons
+        btn_row = tk.Frame(filter_inner, bg=Config.COLOR_CARD)
+        btn_row.pack(fill=tk.X)
+        
+        tk.Button(
+            btn_row,
+            text="Apply Filter",
+            font=(Config.FONT_FAMILY, 11),
+            fg="white",
+            bg=Config.COLOR_SCANNING,
+            activeforeground="white",
+            activebackground="#0056b3",
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=self.apply_log_filter
+        ).pack(side=tk.LEFT, ipadx=10, ipady=4)
+        
+        tk.Button(
+            btn_row,
+            text="Clear Filter",
+            font=(Config.FONT_FAMILY, 11),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_CARD_SECONDARY,
+            activeforeground=Config.COLOR_TEXT,
+            activebackground=Config.COLOR_CARD_SECONDARY,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=self.clear_log_filter
+        ).pack(side=tk.LEFT, padx=(10, 0), ipadx=10, ipady=4)
+        
+        # Quick date buttons
+        tk.Button(
+            btn_row,
+            text="Today",
+            font=(Config.FONT_FAMILY, 10),
+            fg=Config.COLOR_SCANNING,
+            bg=Config.COLOR_CARD,
+            activeforeground=Config.COLOR_SCANNING,
+            bd=0,
+            cursor="hand2",
+            command=lambda: self.set_log_date_range(0)
+        ).pack(side=tk.RIGHT, padx=5)
+        
+        tk.Button(
+            btn_row,
+            text="Last 7 Days",
+            font=(Config.FONT_FAMILY, 10),
+            fg=Config.COLOR_SCANNING,
+            bg=Config.COLOR_CARD,
+            activeforeground=Config.COLOR_SCANNING,
+            bd=0,
+            cursor="hand2",
+            command=lambda: self.set_log_date_range(7)
+        ).pack(side=tk.RIGHT, padx=5)
+        
+        tk.Button(
+            btn_row,
+            text="Last 30 Days",
+            font=(Config.FONT_FAMILY, 10),
+            fg=Config.COLOR_SCANNING,
+            bg=Config.COLOR_CARD,
+            activeforeground=Config.COLOR_SCANNING,
+            bd=0,
+            cursor="hand2",
+            command=lambda: self.set_log_date_range(30)
+        ).pack(side=tk.RIGHT, padx=5)
+        
         # Log card
         card = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
         card.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
@@ -1695,8 +1885,94 @@ class DoorEntryKiosk:
         )
         self.admin_log_listbox.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
         
-        # Populate
-        for entry in self.access_log.get_recent(50):
+        # Populate with all entries initially
+        self.populate_log_listbox(self.access_log.get_recent(100))
+    
+    def _clear_placeholder(self, event, placeholder):
+        """Clear placeholder text on focus"""
+        if event.widget.get() == placeholder:
+            event.widget.delete(0, tk.END)
+            event.widget.config(fg=Config.COLOR_TEXT)
+    
+    def _restore_placeholder(self, event, placeholder):
+        """Restore placeholder text if empty"""
+        if not event.widget.get():
+            event.widget.insert(0, placeholder)
+            event.widget.config(fg=Config.COLOR_TEXT_SECONDARY)
+    
+    def set_log_date_range(self, days_back):
+        """Set date range for quick filters"""
+        from datetime import timedelta
+        today = datetime.now().date()
+        
+        self.log_date_to.delete(0, tk.END)
+        self.log_date_to.insert(0, today.isoformat())
+        self.log_date_to.config(fg=Config.COLOR_TEXT)
+        
+        if days_back == 0:
+            # Today only
+            self.log_date_from.delete(0, tk.END)
+            self.log_date_from.insert(0, today.isoformat())
+        else:
+            from_date = today - timedelta(days=days_back)
+            self.log_date_from.delete(0, tk.END)
+            self.log_date_from.insert(0, from_date.isoformat())
+        
+        self.log_date_from.config(fg=Config.COLOR_TEXT)
+        self.apply_log_filter()
+    
+    def apply_log_filter(self):
+        """Apply filters and refresh log display"""
+        from datetime import date
+        
+        # Parse date from
+        date_from = None
+        date_from_str = self.log_date_from.get()
+        if date_from_str and date_from_str != "YYYY-MM-DD":
+            try:
+                date_from = date.fromisoformat(date_from_str)
+            except ValueError:
+                messagebox.showerror("Invalid Date", "From date must be in YYYY-MM-DD format")
+                return
+        
+        # Parse date to
+        date_to = None
+        date_to_str = self.log_date_to.get()
+        if date_to_str and date_to_str != "YYYY-MM-DD":
+            try:
+                date_to = date.fromisoformat(date_to_str)
+            except ValueError:
+                messagebox.showerror("Invalid Date", "To date must be in YYYY-MM-DD format")
+                return
+        
+        # Get name filter
+        name_filter = None
+        selected_name = self.log_name_var.get()
+        if selected_name and selected_name != "All":
+            name_filter = selected_name
+        
+        # Get filtered entries
+        entries = self.access_log.get_filtered(date_from, date_to, name_filter, count=100)
+        self.populate_log_listbox(entries)
+    
+    def clear_log_filter(self):
+        """Clear all filters and show all entries"""
+        self.log_date_from.delete(0, tk.END)
+        self.log_date_from.insert(0, "YYYY-MM-DD")
+        self.log_date_from.config(fg=Config.COLOR_TEXT_SECONDARY)
+        
+        self.log_date_to.delete(0, tk.END)
+        self.log_date_to.insert(0, "YYYY-MM-DD")
+        self.log_date_to.config(fg=Config.COLOR_TEXT_SECONDARY)
+        
+        self.log_name_var.set("All")
+        
+        self.populate_log_listbox(self.access_log.get_recent(100))
+    
+    def populate_log_listbox(self, entries):
+        """Populate the log listbox with entries"""
+        self.admin_log_listbox.delete(0, tk.END)
+        for entry in entries:
             timestamp = datetime.fromisoformat(entry['timestamp']).strftime("%b %d, %H:%M")
             status_icon = "●" if entry['access_granted'] else "○"
             self.admin_log_listbox.insert(tk.END, f"  {status_icon}  {timestamp}    {entry['name']}")
