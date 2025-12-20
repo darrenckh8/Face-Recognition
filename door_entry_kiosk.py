@@ -176,12 +176,13 @@ class FaceCache:
             self.cache.clear()
     
     def cleanup_expired(self):
-        """Remove expired entries from cache"""
+        """Remove expired entries from cache, returns count of removed entries"""
         now = time.time()
         with self.lock:
             expired_keys = [k for k, v in self.cache.items() if now - v['timestamp'] > self.ttl]
             for key in expired_keys:
                 del self.cache[key]
+            return len(expired_keys)
 
 
 # ==================== DOOR CONTROLLER ====================
@@ -1024,7 +1025,7 @@ class DoorEntryKiosk:
                 now = time.time()
                 if now - self.last_cache_cleanup > self.cache_cleanup_interval:
                     expired_count = self.face_system.face_cache.cleanup_expired()
-                    if expired_count > 0:
+                    if expired_count and expired_count > 0:
                         print(f"Cache cleanup: removed {expired_count} expired entries")
                     self.last_cache_cleanup = now
                 
