@@ -294,7 +294,27 @@ class CameraManager:
             ))
             self.camera.start()
         else:
-            self.camera = cv2.VideoCapture(0)
+            # Try multiple video indices in case camera mounts at /dev/video1 or /dev/video2
+            camera_indices = [0, 1, 2]
+            self.camera = None
+            
+            for idx in camera_indices:
+                cap = cv2.VideoCapture(idx)
+                if cap.isOpened():
+                    # Test if we can actually read a frame
+                    ret, _ = cap.read()
+                    if ret:
+                        self.camera = cap
+                        print(f"[CAMERA] Connected to video device {idx}")
+                        break
+                    else:
+                        cap.release()
+                else:
+                    cap.release()
+            
+            if self.camera is None:
+                raise RuntimeError("Could not connect to any camera. Tried indices: 0, 1, 2")
+            
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
         
@@ -339,9 +359,21 @@ class FaceRecognitionSystem:
         self.cv_scaler = Config.DETECTION_SCALE_FACTOR
         
         # Performance: Pre-load Haar cascade for fast face detection
-        self.face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        )
+        try:
+            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            if not os.path.exists(cascade_path):
+                raise FileNotFoundError(f"Haar cascade file not found at: {cascade_path}")
+            
+            self.face_cascade = cv2.CascadeClassifier(cascade_path)
+            
+            if self.face_cascade.empty():
+                raise RuntimeError("Failed to load Haar cascade classifier - file may be corrupted")
+                
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not load face detection model: {e}\n"
+                f"Please ensure OpenCV is properly installed with: pip install opencv-python"
+            )
         
         # Performance: Face cache to avoid repeated recognition
         self.face_cache = FaceCache()
@@ -613,6 +645,13 @@ class DoorEntryKiosk:
         self.faces_detected = 0
         self.cache_hits = 0
         self.cache_misses = 0
+        
+        # User management state
+        self.person_map = {}  # Maps listbox index to person name
+        
+        # Memory management - periodic cache cleanup
+        self.last_cache_cleanup = time.time()
+        self.cache_cleanup_interval = 60  # seconds
         
         # Create GUI
         self.create_kiosk_interface()
@@ -980,6 +1019,14 @@ class DoorEntryKiosk:
                 fps_text = f"FPS: {self.current_fps:.1f}"
                 cv2.putText(display_frame, fps_text, (display_frame.shape[1] - 120, 30),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Periodic cache cleanup to prevent memory buildup
+                now = time.time()
+                if now - self.last_cache_cleanup > self.cache_cleanup_interval:
+                    expired_count = self.face_system.face_cache.cleanup_expired()
+                    if expired_count > 0:
+                        print(f"Cache cleanup: removed {expired_count} expired entries")
+                    self.last_cache_cleanup = now
                 
                 # Store current frame
                 self.current_frame = frame.copy()
@@ -1557,8 +1604,11 @@ class DoorEntryKiosk:
     def refresh_manage_list(self):
         """Refresh the manage users list"""
         self.manage_listbox.delete(0, tk.END)
+        self.person_map = {}  # Reset the mapping
+        
         persons = self.face_system.get_registered_persons()
-        for name, count in persons:
+        for idx, (name, count) in enumerate(persons):
+            self.person_map[idx] = name  # Store index-to-name mapping
             self.manage_listbox.insert(tk.END, f"  {name}   •   {count} photos")
     
     def start_registration(self):
@@ -1638,8 +1688,13 @@ class DoorEntryKiosk:
             messagebox.showwarning("Warning", "Please select a person to delete")
             return
         
-        item = self.manage_listbox.get(selection[0])
-        name = item.split(" (")[0]
+        selected_index = selection[0]
+        
+        # Use person_map for robust name lookup (avoids string parsing issues)
+        name = self.person_map.get(selected_index)
+        if name is None:
+            messagebox.showerror("Error", "Could not identify selected person. Please refresh and try again.")
+            return
         
         if messagebox.askyesno("Confirm Delete", f"Delete all photos for '{name}'?"):
             import shutil
