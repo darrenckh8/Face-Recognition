@@ -1,16 +1,3 @@
-"""
-Door Entry System Kiosk
-=======================
-A full-screen face recognition door entry system with:
-- Real-time face recognition
-- Access granted/denied visual feedback
-- Access log with timestamps
-- Admin panel for face registration and training
-- Door control simulation (with GPIO hooks for Raspberry Pi)
-
-Compatible with standard webcams (OpenCV) and Raspberry Pi Camera (picamera2)
-"""
-
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 import cv2
@@ -1845,7 +1832,7 @@ class DoorEntryKiosk:
         
         tk.Button(
             btn_row,
-            text="Last 7 Days",
+            text="7 Days",
             font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_CARD,
@@ -1857,7 +1844,7 @@ class DoorEntryKiosk:
         
         tk.Button(
             btn_row,
-            text="Last 30 Days",
+            text="30 Days",
             font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_CARD,
