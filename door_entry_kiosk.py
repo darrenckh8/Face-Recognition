@@ -63,6 +63,13 @@ class Config:
     RECOGNITION_THRESHOLD = 0.5  # Lower = more strict (0.0 - 1.0)
     COOLDOWN_SECONDS = 5  # Prevent repeated access logs for same person
     
+    # Performance Settings
+    RECOGNITION_INTERVAL_FRAMES = 3  # Only run recognition every N frames
+    FACE_CACHE_TTL = 2.0  # Seconds to cache a recognized face
+    FACE_POSITION_TOLERANCE = 80  # Pixels tolerance for face position matching
+    DETECTION_SCALE_FACTOR = 4  # Scale down factor for faster processing
+    USE_FAST_DETECTION = True  # Use Haar cascade for initial detection
+    
     # Door Control (GPIO Pin for Raspberry Pi)
     DOOR_RELAY_PIN = 17
     DOOR_UNLOCK_DURATION = 5  # Seconds to keep door unlocked
@@ -80,6 +87,90 @@ class Config:
     COLOR_PANEL_BG = "#16213e"
     COLOR_TEXT = "#ffffff"
     COLOR_TEXT_DIM = "#888888"
+
+
+# ==================== FACE CACHE ====================
+class FaceCache:
+    """Caches recognized faces to avoid repeated recognition of the same face"""
+    
+    def __init__(self, ttl=None, position_tolerance=None):
+        self.ttl = ttl or Config.FACE_CACHE_TTL
+        self.position_tolerance = position_tolerance or Config.FACE_POSITION_TOLERANCE
+        self.cache = {}  # {cache_key: {name, confidence, location, timestamp, encoding}}
+        self.lock = threading.Lock()
+    
+    def _get_position_key(self, location):
+        """Generate a grid-based position key for face location"""
+        top, right, bottom, left = location
+        center_x = (left + right) // 2
+        center_y = (top + bottom) // 2
+        # Round to grid cells based on tolerance
+        grid_x = center_x // self.position_tolerance
+        grid_y = center_y // self.position_tolerance
+        return (grid_x, grid_y)
+    
+    def _find_nearby_cache(self, location):
+        """Find a cached face near the given location"""
+        top, right, bottom, left = location
+        center_x = (left + right) // 2
+        center_y = (top + bottom) // 2
+        
+        now = time.time()
+        best_match = None
+        best_distance = float('inf')
+        
+        with self.lock:
+            # Clean expired entries and find closest match
+            expired_keys = []
+            for key, entry in self.cache.items():
+                if now - entry['timestamp'] > self.ttl:
+                    expired_keys.append(key)
+                    continue
+                
+                cached_top, cached_right, cached_bottom, cached_left = entry['location']
+                cached_center_x = (cached_left + cached_right) // 2
+                cached_center_y = (cached_top + cached_bottom) // 2
+                
+                distance = ((center_x - cached_center_x) ** 2 + (center_y - cached_center_y) ** 2) ** 0.5
+                
+                if distance < self.position_tolerance and distance < best_distance:
+                    best_distance = distance
+                    best_match = entry
+            
+            # Remove expired entries
+            for key in expired_keys:
+                del self.cache[key]
+        
+        return best_match
+    
+    def get(self, location):
+        """Get cached recognition result for a face at given location"""
+        return self._find_nearby_cache(location)
+    
+    def put(self, location, name, confidence, encoding=None):
+        """Cache a recognition result"""
+        key = self._get_position_key(location)
+        with self.lock:
+            self.cache[key] = {
+                'name': name,
+                'confidence': confidence,
+                'location': location,
+                'timestamp': time.time(),
+                'encoding': encoding
+            }
+    
+    def clear(self):
+        """Clear all cached entries"""
+        with self.lock:
+            self.cache.clear()
+    
+    def cleanup_expired(self):
+        """Remove expired entries from cache"""
+        now = time.time()
+        with self.lock:
+            expired_keys = [k for k, v in self.cache.items() if now - v['timestamp'] > self.ttl]
+            for key in expired_keys:
+                del self.cache[key]
 
 
 # ==================== DOOR CONTROLLER ====================
@@ -227,14 +318,25 @@ class CameraManager:
 
 # ==================== FACE RECOGNITION SYSTEM ====================
 class FaceRecognitionSystem:
-    """Core face recognition logic"""
+    """Core face recognition logic with performance optimizations"""
     
     def __init__(self, dataset_path=None, encodings_path=None):
         self.dataset_path = dataset_path or Config.DATASET_PATH
         self.encodings_path = encodings_path or Config.ENCODINGS_PATH
         self.known_encodings = []
         self.known_names = []
-        self.cv_scaler = 4
+        self.cv_scaler = Config.DETECTION_SCALE_FACTOR
+        
+        # Performance: Pre-load Haar cascade for fast face detection
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+        
+        # Performance: Face cache to avoid repeated recognition
+        self.face_cache = FaceCache()
+        
+        # Performance: Frame counter for skipping
+        self.frame_count = 0
         
         if not os.path.exists(self.dataset_path):
             os.makedirs(self.dataset_path)
@@ -329,43 +431,130 @@ class FaceRecognitionSystem:
         
         return True, f"Training complete! {len(known_encodings)} encodings from {len(set(known_names))} persons"
     
-    def recognize_faces(self, frame):
-        """Detect and recognize faces in a frame"""
+    def detect_faces_fast(self, frame):
+        """Fast face detection using Haar cascade (no recognition)"""
+        small_frame = cv2.resize(frame, (0, 0), fx=1/self.cv_scaler, fy=1/self.cv_scaler)
+        gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+        
+        # Detect faces with Haar cascade (fast)
+        faces = self.face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(30, 30)
+        )
+        
+        # Convert to face_recognition format and scale up
+        locations = []
+        for (x, y, w, h) in faces:
+            # Scale back to original frame size
+            top = y * self.cv_scaler
+            right = (x + w) * self.cv_scaler
+            bottom = (y + h) * self.cv_scaler
+            left = x * self.cv_scaler
+            locations.append((top, right, bottom, left))
+        
+        return locations
+    
+    def recognize_faces(self, frame, force_recognition=False):
+        """Detect and recognize faces in a frame with caching and optimization"""
+        self.frame_count += 1
+        
         if not self.known_encodings:
             return frame, []
         
-        small_frame = cv2.resize(frame, (0, 0), fx=1/self.cv_scaler, fy=1/self.cv_scaler)
-        rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-        
-        face_locations = face_recognition.face_locations(rgb_small)
-        face_encodings = face_recognition.face_encodings(rgb_small, face_locations)
-        
         results = []
         
-        for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-            top *= self.cv_scaler
-            right *= self.cv_scaler
-            bottom *= self.cv_scaler
-            left *= self.cv_scaler
+        # Step 1: Fast face detection using Haar cascade
+        if Config.USE_FAST_DETECTION:
+            fast_locations = self.detect_faces_fast(frame)
             
-            matches = face_recognition.compare_faces(self.known_encodings, face_encoding)
-            name = "Unknown"
-            confidence = 0.0
+            # If no faces detected by fast method, skip expensive recognition
+            if not fast_locations:
+                return frame, []
+        
+        # Step 2: Check cache for each detected face
+        faces_to_recognize = []
+        cached_results = []
+        
+        if Config.USE_FAST_DETECTION:
+            for location in fast_locations:
+                cached = self.face_cache.get(location)
+                if cached and not force_recognition:
+                    # Use cached result
+                    cached_results.append({
+                        'name': cached['name'],
+                        'confidence': cached['confidence'],
+                        'location': location,
+                        'from_cache': True
+                    })
+                else:
+                    faces_to_recognize.append(location)
+        
+        # Step 3: Only run expensive face_recognition if needed
+        should_recognize = (
+            force_recognition or
+            len(faces_to_recognize) > 0 or
+            (self.frame_count % Config.RECOGNITION_INTERVAL_FRAMES == 0 and Config.USE_FAST_DETECTION)
+        )
+        
+        if should_recognize and (faces_to_recognize or not Config.USE_FAST_DETECTION):
+            # Prepare frame for face_recognition
+            small_frame = cv2.resize(frame, (0, 0), fx=1/self.cv_scaler, fy=1/self.cv_scaler)
+            rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
             
-            if True in matches:
-                face_distances = face_recognition.face_distance(self.known_encodings, face_encoding)
-                best_match_index = np.argmin(face_distances)
-                if matches[best_match_index]:
-                    name = self.known_names[best_match_index]
-                    confidence = 1 - face_distances[best_match_index]
+            # Get face locations and encodings
+            if Config.USE_FAST_DETECTION and faces_to_recognize:
+                # Use the locations we already found, scaled down
+                scaled_locations = [
+                    (t // self.cv_scaler, r // self.cv_scaler, 
+                     b // self.cv_scaler, l // self.cv_scaler)
+                    for (t, r, b, l) in faces_to_recognize
+                ]
+                face_encodings = face_recognition.face_encodings(rgb_small, scaled_locations)
+                face_locations = faces_to_recognize
+            else:
+                # Full detection with face_recognition library
+                scaled_locations = face_recognition.face_locations(rgb_small)
+                face_encodings = face_recognition.face_encodings(rgb_small, scaled_locations)
+                # Scale up locations
+                face_locations = [
+                    (t * self.cv_scaler, r * self.cv_scaler,
+                     b * self.cv_scaler, l * self.cv_scaler)
+                    for (t, r, b, l) in scaled_locations
+                ]
             
-            results.append({
-                "name": name,
-                "confidence": confidence,
-                "location": (top, right, bottom, left)
-            })
+            # Recognize each face
+            for location, face_encoding in zip(face_locations, face_encodings):
+                matches = face_recognition.compare_faces(self.known_encodings, face_encoding)
+                name = "Unknown"
+                confidence = 0.0
+                
+                if True in matches:
+                    face_distances = face_recognition.face_distance(self.known_encodings, face_encoding)
+                    best_match_index = np.argmin(face_distances)
+                    if matches[best_match_index]:
+                        name = self.known_names[best_match_index]
+                        confidence = 1 - face_distances[best_match_index]
+                
+                # Cache this result
+                self.face_cache.put(location, name, confidence, face_encoding)
+                
+                results.append({
+                    'name': name,
+                    'confidence': confidence,
+                    'location': location,
+                    'from_cache': False
+                })
+        
+        # Combine cached and new results
+        results.extend(cached_results)
         
         return frame, results
+    
+    def clear_cache(self):
+        """Clear the face recognition cache"""
+        self.face_cache.clear()
 
 
 # ==================== KIOSK GUI ====================
@@ -405,6 +594,14 @@ class DoorEntryKiosk:
         self.registration_name = ""
         self.captured_count = 0
         self.current_frame = None
+        
+        # Performance tracking
+        self.fps_counter = 0
+        self.fps_start_time = time.time()
+        self.current_fps = 0.0
+        self.faces_detected = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
         
         # Create GUI
         self.create_kiosk_interface()
@@ -616,8 +813,11 @@ class DoorEntryKiosk:
         """Main camera loop running in a separate thread"""
         try:
             self.camera.start()
+            frame_time = time.time()
             
             while self.is_running:
+                loop_start = time.time()
+                
                 frame = self.camera.capture_frame()
                 if frame is None:
                     continue
@@ -625,13 +825,21 @@ class DoorEntryKiosk:
                 display_frame = frame.copy()
                 
                 if self.is_scanning and not self.registration_mode:
-                    # Perform face recognition
+                    # Perform optimized face recognition
                     _, results = self.face_system.recognize_faces(frame)
+                    
+                    # Track performance metrics
+                    self.faces_detected = len(results)
+                    cache_hits_this_frame = sum(1 for r in results if r.get('from_cache', False))
+                    cache_misses_this_frame = len(results) - cache_hits_this_frame
+                    self.cache_hits += cache_hits_this_frame
+                    self.cache_misses += cache_misses_this_frame
                     
                     for result in results:
                         top, right, bottom, left = result['location']
                         name = result['name']
                         confidence = result['confidence']
+                        from_cache = result.get('from_cache', False)
                         
                         # Determine access
                         if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
@@ -645,8 +853,8 @@ class DoorEntryKiosk:
                             
                             color = (0, 200, 80)  # Green
                         else:
-                            # Check if we should log denied access
-                            if name == "Unknown" and self.current_status == "scanning":
+                            # Check if we should log denied access (only for non-cached results)
+                            if name == "Unknown" and self.current_status == "scanning" and not from_cache:
                                 now = time.time()
                                 if "Unknown" not in self.last_access or (now - self.last_access["Unknown"]) > Config.COOLDOWN_SECONDS:
                                     self.last_access["Unknown"] = now
@@ -654,23 +862,23 @@ class DoorEntryKiosk:
                             
                             color = (0, 0, 255)  # Red
                         
-                        # Draw face box
-                        cv2.rectangle(display_frame, (left, top), (right, bottom), color, 3)
+                        # Draw face box (thinner for cached results)
+                        box_thickness = 2 if from_cache else 3
+                        cv2.rectangle(display_frame, (left, top), (right, bottom), color, box_thickness)
                         
-                        # Draw label
-                        label = f"{name} ({confidence:.0%})" if name != "Unknown" else "Unknown"
+                        # Draw label with cache indicator
+                        cache_indicator = " [C]" if from_cache else ""
+                        label = f"{name} ({confidence:.0%}){cache_indicator}" if name != "Unknown" else f"Unknown{cache_indicator}"
                         cv2.rectangle(display_frame, (left, top - 40), (right, top), color, cv2.FILLED)
                         cv2.putText(display_frame, label, (left + 10, top - 10),
-                                   cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 1)
+                                   cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1)
                 
                 elif self.registration_mode:
-                    # Registration mode - show face detection
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-                    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+                    # Registration mode - use the pre-loaded cascade from face_system
+                    faces = self.face_system.detect_faces_fast(frame)
                     
-                    for (x, y, w, h) in faces:
-                        cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 255, 255), 3)
+                    for (top, right, bottom, left) in faces:
+                        cv2.rectangle(display_frame, (left, top), (right, bottom), (0, 255, 255), 3)
                     
                     # Show registration info
                     cv2.putText(display_frame, "REGISTRATION MODE", (10, 30),
@@ -679,6 +887,21 @@ class DoorEntryKiosk:
                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                     cv2.putText(display_frame, f"Captured: {self.captured_count}", (10, 110),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                    cv2.putText(display_frame, f"Faces detected: {len(faces)}", (10, 150),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
+                
+                # Calculate and display FPS
+                self.fps_counter += 1
+                elapsed = time.time() - self.fps_start_time
+                if elapsed >= 1.0:
+                    self.current_fps = self.fps_counter / elapsed
+                    self.fps_counter = 0
+                    self.fps_start_time = time.time()
+                
+                # Draw performance overlay
+                fps_text = f"FPS: {self.current_fps:.1f}"
+                cv2.putText(display_frame, fps_text, (display_frame.shape[1] - 120, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
                 # Store current frame
                 self.current_frame = frame.copy()
@@ -686,7 +909,10 @@ class DoorEntryKiosk:
                 # Update display
                 self.root.after(0, lambda f=display_frame: self.display_frame(f))
                 
-                time.sleep(0.03)
+                # Adaptive frame rate - aim for ~30 FPS
+                loop_time = time.time() - loop_start
+                sleep_time = max(0.001, 0.033 - loop_time)
+                time.sleep(sleep_time)
             
         except Exception as e:
             print(f"Camera error: {e}")
@@ -741,6 +967,9 @@ class DoorEntryKiosk:
         """Show the admin control panel"""
         self.admin_mode = True
         self.is_scanning = False
+        
+        # Clear the face cache when entering admin mode
+        self.face_system.clear_cache()
         
         # Create admin window
         self.admin_window = tk.Toplevel(self.root)
@@ -1232,6 +1461,12 @@ class DoorEntryKiosk:
         
         self.admin_mode = False
         self.is_scanning = True
+        
+        # Clear cache and reset performance stats when returning to scanning
+        self.face_system.clear_cache()
+        self.cache_hits = 0
+        self.cache_misses = 0
+        
         self.admin_window.destroy()
         self.update_log_display()
         self.update_info_label()
