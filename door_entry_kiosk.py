@@ -1232,21 +1232,7 @@ class DoorEntryKiosk:
         def on_cancel(event=None):
             login_dialog.destroy()
         
-        cancel_btn = tk.Button(
-            btn_frame,
-            text="Cancel",
-            font=(Config.FONT_FAMILY, 12),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_CARD,
-            activeforeground=Config.COLOR_TEXT,
-            activebackground=Config.COLOR_CARD,
-            relief=tk.FLAT,
-            cursor="hand2",
-            width=10,
-            command=on_cancel
-        )
-        cancel_btn.pack(side=tk.RIGHT, padx=(10, 0))
-        
+        # Pack OK button first (will be on the right)
         ok_btn = tk.Button(
             btn_frame,
             text="OK",
@@ -1261,6 +1247,22 @@ class DoorEntryKiosk:
             command=on_ok
         )
         ok_btn.pack(side=tk.RIGHT)
+        
+        # Pack Cancel button second (will be to the left of OK)
+        cancel_btn = tk.Button(
+            btn_frame,
+            text="Cancel",
+            font=(Config.FONT_FAMILY, 12),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_CARD,
+            activeforeground=Config.COLOR_TEXT,
+            activebackground=Config.COLOR_CARD,
+            relief=tk.FLAT,
+            cursor="hand2",
+            width=10,
+            command=on_cancel
+        )
+        cancel_btn.pack(side=tk.RIGHT, padx=(0, 10))
         
         # Bind Enter and Escape keys
         password_entry.bind('<Return>', on_ok)
@@ -1495,7 +1497,7 @@ class DoorEntryKiosk:
         
         tk.Label(
             tips_frame,
-            text="• Capture 10-20 photos from different angles\n• Ensure good, even lighting\n• Look directly at the camera",
+            text="• Capture 50-60 photos from different angles\n• Ensure good, even lighting\n• Look directly at the camera",
             font=(Config.FONT_FAMILY, 11),
             fg=Config.COLOR_TEXT_TERTIARY,
             bg=Config.COLOR_BG,
