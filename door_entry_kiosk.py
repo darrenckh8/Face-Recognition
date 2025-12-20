@@ -738,6 +738,11 @@ class DoorEntryKiosk:
         self.cache_hits = 0
         self.cache_misses = 0
         
+        # Frame display synchronization - prevents queue buildup
+        self.display_pending = False
+        self.pending_frame = None
+        self.frame_lock = threading.Lock()
+        
         # User management state
         self.person_map = {}  # Maps listbox index to person name
         
@@ -1130,10 +1135,20 @@ class DoorEntryKiosk:
                 # Store current frame for capture
                 self.current_frame = frame
                 
-                # Update display immediately
-                self.root.after(0, lambda f=display_frame: self.display_frame(f))
+                # Pre-process frame for display (do heavy work in this thread)
+                if USE_PICAMERA:
+                    frame_rgb = display_frame
+                else:
+                    frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
                 
-                # Minimal sleep to prevent CPU spinning - display runs as fast as possible
+                # Only queue new frame if previous one was displayed (prevents buildup)
+                with self.frame_lock:
+                    if not self.display_pending:
+                        self.pending_frame = frame_rgb
+                        self.display_pending = True
+                        self.root.after(0, self.display_pending_frame)
+                
+                # Minimal sleep to prevent CPU spinning
                 time.sleep(0.001)
             
         except Exception as e:
@@ -1141,41 +1156,40 @@ class DoorEntryKiosk:
         finally:
             self.camera.stop()
     
-    def display_frame(self, frame):
-        """Display a frame on the video label"""
-        if USE_PICAMERA:
-            frame_rgb = frame
-        else:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    def display_pending_frame(self):
+        """Display the pending frame (called on main thread)"""
+        with self.frame_lock:
+            if self.pending_frame is None:
+                self.display_pending = False
+                return
+            frame_rgb = self.pending_frame
+            self.pending_frame = None
+            self.display_pending = False
         
-        # Get container size (not label size to avoid feedback loop)
-        container_width = self.video_container.winfo_width()
-        container_height = self.video_container.winfo_height()
-        
-        # Only resize if container has valid dimensions
-        if container_width > 10 and container_height > 10:
-            frame_h, frame_w = frame_rgb.shape[:2]
+        try:
+            # Get container size
+            container_width = self.video_container.winfo_width()
+            container_height = self.video_container.winfo_height()
             
-            # Calculate scale to fit within container while maintaining aspect ratio
-            scale = min((container_width - 4) / frame_w, (container_height - 4) / frame_h)
+            # Only resize if container has valid dimensions
+            if container_width > 10 and container_height > 10:
+                frame_h, frame_w = frame_rgb.shape[:2]
+                
+                scale = min((container_width - 4) / frame_w, (container_height - 4) / frame_h)
+                scale = min(scale, 1.5)
+                
+                new_w = max(int(frame_w * scale), 320)
+                new_h = max(int(frame_h * scale), 240)
+                
+                frame_rgb = cv2.resize(frame_rgb, (new_w, new_h))
             
-            # Don't scale up beyond original size
-            scale = min(scale, 1.5)
+            img = Image.fromarray(frame_rgb)
+            imgtk = ImageTk.PhotoImage(image=img)
             
-            new_w = int(frame_w * scale)
-            new_h = int(frame_h * scale)
-            
-            # Ensure minimum size
-            new_w = max(new_w, 320)
-            new_h = max(new_h, 240)
-            
-            frame_rgb = cv2.resize(frame_rgb, (new_w, new_h))
-        
-        img = Image.fromarray(frame_rgb)
-        imgtk = ImageTk.PhotoImage(image=img)
-        
-        self.video_label.imgtk = imgtk
-        self.video_label.configure(image=imgtk)
+            self.video_label.imgtk = imgtk
+            self.video_label.configure(image=imgtk)
+        except Exception:
+            pass  # Ignore display errors during shutdown
     
     def grant_access(self, name, confidence):
         """Handle access granted"""
