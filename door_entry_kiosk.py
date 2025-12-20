@@ -1097,8 +1097,102 @@ class DoorEntryKiosk:
         print("[ACCESS] Denied: Unknown person")
     
     def show_admin_login(self):
-        """Show admin login dialog"""
-        password = simpledialog.askstring("Admin Login", "Enter admin password:", show='*')
+        """Show admin login dialog with custom dialog for fullscreen compatibility"""
+        # Create custom dialog (simpledialog has issues with fullscreen on macOS)
+        login_dialog = tk.Toplevel(self.root)
+        login_dialog.title("Admin Login")
+        login_dialog.geometry("350x180")
+        login_dialog.configure(bg=Config.COLOR_BG)
+        login_dialog.resizable(False, False)
+        
+        # Center on screen
+        login_dialog.update_idletasks()
+        x = (login_dialog.winfo_screenwidth() - 350) // 2
+        y = (login_dialog.winfo_screenheight() - 180) // 2
+        login_dialog.geometry(f"350x180+{x}+{y}")
+        
+        # Make modal
+        login_dialog.transient(self.root)
+        login_dialog.grab_set()
+        login_dialog.focus_set()
+        
+        # Password entry result
+        result = {'password': None}
+        
+        # Content frame
+        content = tk.Frame(login_dialog, bg=Config.COLOR_BG)
+        content.pack(fill=tk.BOTH, expand=True, padx=25, pady=20)
+        
+        tk.Label(
+            content,
+            text="Enter admin password:",
+            font=(Config.FONT_FAMILY, 14),
+            fg=Config.COLOR_TEXT,
+            bg=Config.COLOR_BG
+        ).pack(anchor=tk.W, pady=(0, 10))
+        
+        password_entry = tk.Entry(
+            content,
+            font=(Config.FONT_FAMILY, 14),
+            show='*',
+            relief=tk.FLAT,
+            bg=Config.COLOR_CARD,
+            fg=Config.COLOR_TEXT,
+            insertbackground=Config.COLOR_TEXT
+        )
+        password_entry.pack(fill=tk.X, ipady=8)
+        password_entry.focus_set()
+        
+        # Button frame
+        btn_frame = tk.Frame(content, bg=Config.COLOR_BG)
+        btn_frame.pack(fill=tk.X, pady=(20, 0))
+        
+        def on_ok(event=None):
+            result['password'] = password_entry.get()
+            login_dialog.destroy()
+        
+        def on_cancel(event=None):
+            login_dialog.destroy()
+        
+        cancel_btn = tk.Button(
+            btn_frame,
+            text="Cancel",
+            font=(Config.FONT_FAMILY, 12),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_CARD,
+            activeforeground=Config.COLOR_TEXT,
+            activebackground=Config.COLOR_CARD,
+            relief=tk.FLAT,
+            cursor="hand2",
+            width=10,
+            command=on_cancel
+        )
+        cancel_btn.pack(side=tk.RIGHT, padx=(10, 0))
+        
+        ok_btn = tk.Button(
+            btn_frame,
+            text="OK",
+            font=(Config.FONT_FAMILY, 12),
+            fg="white",
+            bg=Config.COLOR_SCANNING,
+            activeforeground="white",
+            activebackground=Config.COLOR_SCANNING,
+            relief=tk.FLAT,
+            cursor="hand2",
+            width=10,
+            command=on_ok
+        )
+        ok_btn.pack(side=tk.RIGHT)
+        
+        # Bind Enter and Escape keys
+        password_entry.bind('<Return>', on_ok)
+        login_dialog.bind('<Escape>', on_cancel)
+        
+        # Wait for dialog to close
+        self.root.wait_window(login_dialog)
+        
+        # Check password
+        password = result['password']
         if password == Config.ADMIN_PASSWORD:
             self.show_admin_panel()
         elif password is not None:
