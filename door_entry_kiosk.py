@@ -583,7 +583,7 @@ class DoorEntryKiosk:
         else:
             self.root.geometry("1280x800")
         
-        self.root.configure(bg=Config.COLOR_DARK_BG)
+        self.root.configure(bg=Config.COLOR_BG)
         
         # Initialize components
         self.camera = CameraManager(use_picamera=USE_PICAMERA, resolution=Config.CAMERA_RESOLUTION)
