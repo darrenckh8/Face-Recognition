@@ -34,9 +34,18 @@ except ImportError:
 USE_PICAMERA = False
 try:
     from picamera2 import Picamera2
-    USE_PICAMERA = True
+    # Check if we're actually on a Pi with a camera
+    try:
+        _test_cam = Picamera2()
+        _test_cam.close()
+        USE_PICAMERA = True
+        print("[STARTUP] Picamera2 detected - using Pi camera")
+    except Exception:
+        USE_PICAMERA = False
+        print("[STARTUP] Picamera2 imported but no Pi camera found - using OpenCV")
 except ImportError:
     USE_PICAMERA = False
+    print("[STARTUP] Picamera2 not available - using OpenCV")
 
 # Try to import GPIO for Raspberry Pi door control
 USE_GPIO = False
@@ -56,19 +65,21 @@ class Config:
     # Admin Settings
     ADMIN_PASSWORD = "admin123"  # Change this in production!
     
-    # Camera Settings
-    CAMERA_RESOLUTION = (640, 480)
+    # Camera Settings - optimized for Raspberry Pi 5
+    CAMERA_RESOLUTION = (640, 480)  # Lower resolution = faster processing
+    CAMERA_FPS = 30  # Target FPS
     
     # Recognition Settings
     RECOGNITION_THRESHOLD = 0.8  # Lower = more strict (0.0 - 1.0)
     COOLDOWN_SECONDS = 5  # Prevent repeated access logs for same person
     
-    # Performance Settings
+    # Performance Settings - tuned for Pi 5
     RECOGNITION_INTERVAL_FRAMES = 3  # Only run recognition every N frames
     FACE_CACHE_TTL = 2.0  # Seconds to cache a recognized face
     FACE_POSITION_TOLERANCE = 80  # Pixels tolerance for face position matching
     DETECTION_SCALE_FACTOR = 4  # Scale down factor for faster processing
     USE_FAST_DETECTION = True  # Use Haar cascade for initial detection
+    RECOGNITION_INTERVAL_MS = 150  # Run recognition every N milliseconds (Pi 5: 150ms good)
     
     # Door Control (GPIO Pin for Raspberry Pi)
     DOOR_RELAY_PIN = 17
@@ -290,41 +301,90 @@ class CameraManager:
         self.current_frame = None
         self.frame_lock = threading.Lock()
         self.capture_thread = None
+        self.frame_ready = threading.Event()
     
     def start(self):
         """Initialize and start the camera with background capture thread"""
         if self.use_picamera:
             self.camera = Picamera2()
-            self.camera.configure(self.camera.create_preview_configuration(
-                main={"format": 'XRGB8888', "size": self.resolution}, buffer_count=2
-            ))
+            
+            # Optimized configuration for Pi Camera Module 3 (IMX708 sensor)
+            config = self.camera.create_preview_configuration(
+                main={"format": 'RGB888', "size": self.resolution},
+                buffer_count=2,  # Minimum buffers for low latency
+                queue=False,  # Don't queue frames - always get latest
+            )
+            
+            self.camera.configure(config)
             self.camera.start()
+            
+            # Set controls after starting for Pi Camera Module 3
+            try:
+                from libcamera import controls
+                self.camera.set_controls({
+                    "FrameDurationLimits": (33333, 33333),  # Lock to 30fps (microseconds)
+                    "AfMode": controls.AfModeEnum.Continuous,  # Continuous autofocus for Module 3
+                    "AfSpeed": controls.AfSpeedEnum.Fast,  # Fast autofocus
+                })
+                print(f"[CAMERA] Pi Camera Module 3 started at {self.resolution} with continuous autofocus")
+            except (ImportError, Exception) as e:
+                # Fallback for older Picamera2 or non-autofocus cameras
+                try:
+                    self.camera.set_controls({"FrameDurationLimits": (33333, 33333)})
+                except Exception:
+                    pass
+                print(f"[CAMERA] Picamera2 started at {self.resolution}")
         else:
-            # Try multiple video indices in case camera mounts at /dev/video1 or /dev/video2
+            # Try different backends based on OS
+            import platform
+            system = platform.system()
+            
+            if system == "Darwin":  # macOS
+                backends = [cv2.CAP_AVFOUNDATION, cv2.CAP_ANY]
+            elif system == "Linux":
+                backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
+            else:  # Windows
+                backends = [cv2.CAP_DSHOW, cv2.CAP_ANY]
+            
             camera_indices = [0, 1, 2]
             self.camera = None
             
-            for idx in camera_indices:
-                cap = cv2.VideoCapture(idx)
-                if cap.isOpened():
-                    # Test if we can actually read a frame
-                    ret, _ = cap.read()
-                    if ret:
-                        self.camera = cap
-                        print(f"[CAMERA] Connected to video device {idx}")
-                        break
-                    else:
-                        cap.release()
-                else:
-                    cap.release()
+            for backend in backends:
+                if self.camera is not None:
+                    break
+                for idx in camera_indices:
+                    try:
+                        cap = cv2.VideoCapture(idx, backend)
+                        if cap.isOpened():
+                            ret, _ = cap.read()
+                            if ret:
+                                self.camera = cap
+                                backend_name = {cv2.CAP_AVFOUNDATION: "AVFoundation", 
+                                              cv2.CAP_V4L2: "V4L2", 
+                                              cv2.CAP_DSHOW: "DirectShow",
+                                              cv2.CAP_ANY: "default"}.get(backend, str(backend))
+                                print(f"[CAMERA] Connected to device {idx} using {backend_name}")
+                                break
+                            else:
+                                cap.release()
+                        else:
+                            cap.release()
+                    except Exception:
+                        pass
             
             if self.camera is None:
                 raise RuntimeError("Could not connect to any camera. Tried indices: 0, 1, 2")
             
+            # Set camera properties for minimum latency
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
-            # Reduce buffer size to minimize latency
             self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            
+            # Use MJPEG format if available (much lower latency than YUYV)
+            self.camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            
+            # Set higher FPS if supported
+            self.camera.set(cv2.CAP_PROP_FPS, 30)
         
         self.is_running = True
         
@@ -333,27 +393,39 @@ class CameraManager:
         self.capture_thread.start()
         
         # Wait for first frame
-        time.sleep(0.3)
+        self.frame_ready.wait(timeout=2.0)
     
     def _capture_loop(self):
-        """Background thread that continuously captures frames"""
+        """Background thread that continuously captures frames, always getting the latest"""
         while self.is_running:
             try:
                 if self.use_picamera:
-                    frame = self.camera.capture_array()
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+                    # Picamera2 on Pi 5: capture_array with wait=False for lowest latency
+                    # RGB888 format means no color conversion needed
+                    frame = self.camera.capture_array("main")
+                    # Convert RGB to BGR for OpenCV compatibility
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 else:
-                    ret, frame = self.camera.read()
+                    # Drain the buffer by grabbing without decoding
+                    # This ensures we always get the most recent frame
+                    self.camera.grab()
+                    
+                    # Now retrieve the latest frame
+                    ret, frame = self.camera.retrieve()
                     if not ret:
-                        continue
+                        # Fallback to read() if retrieve fails
+                        ret, frame = self.camera.read()
+                        if not ret:
+                            continue
                 
-                # Store the latest frame thread-safely
+                # Store the latest frame thread-safely (no copy needed here)
                 with self.frame_lock:
                     self.current_frame = frame
+                    self.frame_ready.set()
                     
             except Exception as e:
                 print(f"[CAMERA] Capture error: {e}")
-                time.sleep(0.1)
+                time.sleep(0.01)
     
     def capture_frame(self):
         """Get the latest captured frame (non-blocking)"""
@@ -362,7 +434,7 @@ class CameraManager:
         
         with self.frame_lock:
             if self.current_frame is not None:
-                return self.current_frame.copy()
+                return self.current_frame  # Return reference, caller copies if needed
         return None
     
     def capture_latest_frame(self):
@@ -740,8 +812,9 @@ class DoorEntryKiosk:
         
         # Frame display synchronization - prevents queue buildup
         self.display_pending = False
-        self.pending_frame = None
+        self.pending_imgtk = None  # Pre-processed ImageTk ready for display
         self.frame_lock = threading.Lock()
+        self.display_size = (640, 480)  # Cached display size
         
         # User management state
         self.person_map = {}  # Maps listbox index to person name
@@ -1030,7 +1103,7 @@ class DoorEntryKiosk:
             
             # Separate timing for display vs recognition
             last_recognition_time = 0
-            recognition_interval = 0.1  # Run recognition every 100ms max
+            recognition_interval = Config.RECOGNITION_INTERVAL_MS / 1000.0  # Convert ms to seconds
             last_results = []  # Cache last recognition results for overlay
             
             while self.is_running:
@@ -1135,16 +1208,29 @@ class DoorEntryKiosk:
                 # Store current frame for capture
                 self.current_frame = frame
                 
-                # Pre-process frame for display (do heavy work in this thread)
+                # Pre-process frame for display (do ALL heavy work in this thread)
                 if USE_PICAMERA:
                     frame_rgb = display_frame
                 else:
                     frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
                 
+                # Resize in camera thread (not main thread)
+                target_w, target_h = self.display_size
+                if target_w > 10 and target_h > 10:
+                    frame_h, frame_w = frame_rgb.shape[:2]
+                    scale = min(target_w / frame_w, target_h / frame_h, 1.5)
+                    new_w = max(int(frame_w * scale), 320)
+                    new_h = max(int(frame_h * scale), 240)
+                    frame_rgb = cv2.resize(frame_rgb, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+                
+                # Convert to PIL Image in camera thread
+                pil_img = Image.fromarray(frame_rgb)
+                
                 # Only queue new frame if previous one was displayed (prevents buildup)
                 with self.frame_lock:
                     if not self.display_pending:
-                        self.pending_frame = frame_rgb
+                        # Create ImageTk in camera thread (this is the expensive part)
+                        self.pending_imgtk = ImageTk.PhotoImage(image=pil_img)
                         self.display_pending = True
                         self.root.after(0, self.display_pending_frame)
                 
@@ -1157,35 +1243,23 @@ class DoorEntryKiosk:
             self.camera.stop()
     
     def display_pending_frame(self):
-        """Display the pending frame (called on main thread)"""
+        """Display the pending frame (called on main thread) - minimal work here"""
         with self.frame_lock:
-            if self.pending_frame is None:
+            if self.pending_imgtk is None:
                 self.display_pending = False
                 return
-            frame_rgb = self.pending_frame
-            self.pending_frame = None
+            imgtk = self.pending_imgtk
+            self.pending_imgtk = None
             self.display_pending = False
         
         try:
-            # Get container size
+            # Update cached display size (only occasionally)
             container_width = self.video_container.winfo_width()
             container_height = self.video_container.winfo_height()
-            
-            # Only resize if container has valid dimensions
             if container_width > 10 and container_height > 10:
-                frame_h, frame_w = frame_rgb.shape[:2]
-                
-                scale = min((container_width - 4) / frame_w, (container_height - 4) / frame_h)
-                scale = min(scale, 1.5)
-                
-                new_w = max(int(frame_w * scale), 320)
-                new_h = max(int(frame_h * scale), 240)
-                
-                frame_rgb = cv2.resize(frame_rgb, (new_w, new_h))
+                self.display_size = (container_width - 4, container_height - 4)
             
-            img = Image.fromarray(frame_rgb)
-            imgtk = ImageTk.PhotoImage(image=img)
-            
+            # Just set the pre-processed image - minimal main thread work
             self.video_label.imgtk = imgtk
             self.video_label.configure(image=imgtk)
         except Exception:
