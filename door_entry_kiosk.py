@@ -700,12 +700,16 @@ class DoorEntryKiosk:
         )
         self.fps_indicator.pack(side=tk.RIGHT)
         
-        # Video frame container
+        # Video frame container - fixed aspect ratio
         video_container = tk.Frame(camera_card, bg=Config.COLOR_CARD_SECONDARY)
         video_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
+        video_container.pack_propagate(False)  # Prevent container from resizing to fit content
         
         self.video_label = tk.Label(video_container, bg=Config.COLOR_CARD_SECONDARY)
         self.video_label.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        
+        # Store reference to video container for sizing
+        self.video_container = video_container
         
         # Right side - Status panel
         right_panel = tk.Frame(content_frame, bg=Config.COLOR_BG, width=380)
@@ -997,15 +1001,27 @@ class DoorEntryKiosk:
         """Display a frame on the video label"""
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Resize to fit display
-        label_width = self.video_label.winfo_width()
-        label_height = self.video_label.winfo_height()
+        # Get container size (not label size to avoid feedback loop)
+        container_width = self.video_container.winfo_width()
+        container_height = self.video_container.winfo_height()
         
-        if label_width > 1 and label_height > 1:
+        # Only resize if container has valid dimensions
+        if container_width > 10 and container_height > 10:
             frame_h, frame_w = frame_rgb.shape[:2]
-            scale = min(label_width / frame_w, label_height / frame_h)
+            
+            # Calculate scale to fit within container while maintaining aspect ratio
+            scale = min((container_width - 4) / frame_w, (container_height - 4) / frame_h)
+            
+            # Don't scale up beyond original size
+            scale = min(scale, 1.5)
+            
             new_w = int(frame_w * scale)
             new_h = int(frame_h * scale)
+            
+            # Ensure minimum size
+            new_w = max(new_w, 320)
+            new_h = max(new_h, 240)
+            
             frame_rgb = cv2.resize(frame_rgb, (new_w, new_h))
         
         img = Image.fromarray(frame_rgb)
