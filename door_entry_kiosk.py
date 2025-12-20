@@ -79,14 +79,25 @@ class Config:
     ENCODINGS_PATH = "encodings.pickle"
     ACCESS_LOG_PATH = "access_log.json"
     
-    # Colors (RGB)
-    COLOR_GRANTED = "#00C853"  # Green
-    COLOR_DENIED = "#FF1744"   # Red
-    COLOR_SCANNING = "#2196F3" # Blue
-    COLOR_DARK_BG = "#1a1a2e"
-    COLOR_PANEL_BG = "#16213e"
-    COLOR_TEXT = "#ffffff"
-    COLOR_TEXT_DIM = "#888888"
+    # Apple-like Clean Design Colors
+    COLOR_GRANTED = "#34C759"    # Apple Green
+    COLOR_DENIED = "#FF3B30"     # Apple Red
+    COLOR_SCANNING = "#007AFF"   # Apple Blue
+    COLOR_WARNING = "#FF9500"    # Apple Orange
+    
+    # Light Theme
+    COLOR_BG = "#F2F2F7"         # Light gray background
+    COLOR_CARD = "#FFFFFF"       # White cards
+    COLOR_CARD_SECONDARY = "#F9F9F9"  # Slightly off-white
+    COLOR_TEXT = "#1C1C1E"       # Near black text
+    COLOR_TEXT_SECONDARY = "#8E8E93"  # Gray text
+    COLOR_TEXT_TERTIARY = "#AEAEB2"   # Light gray text
+    COLOR_BORDER = "#E5E5EA"     # Subtle border
+    COLOR_SHADOW = "#C7C7CC"     # Shadow color
+    
+    # Typography (System fonts that look like SF Pro)
+    FONT_FAMILY = "SF Pro Display" if os.name == 'darwin' else "Segoe UI" if os.name == 'nt' else "Helvetica Neue"
+    FONT_FAMILY_MONO = "SF Mono" if os.name == 'darwin' else "Consolas" if os.name == 'nt' else "Monaco"
 
 
 # ==================== FACE CACHE ====================
@@ -622,122 +633,172 @@ class DoorEntryKiosk:
         self.root.attributes('-fullscreen', not is_fullscreen)
     
     def create_kiosk_interface(self):
-        """Create the main kiosk interface"""
-        # Main container
-        self.main_frame = tk.Frame(self.root, bg=Config.COLOR_DARK_BG)
-        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        """Create the main kiosk interface with Apple-like design"""
+        # Configure root window
+        self.root.configure(bg=Config.COLOR_BG)
         
-        # Header
-        header_frame = tk.Frame(self.main_frame, bg=Config.COLOR_DARK_BG)
-        header_frame.pack(fill=tk.X, pady=(0, 20))
+        # Main container with padding
+        self.main_frame = tk.Frame(self.root, bg=Config.COLOR_BG)
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=40, pady=30)
         
-        # Title
+        # Header area
+        header_frame = tk.Frame(self.main_frame, bg=Config.COLOR_BG)
+        header_frame.pack(fill=tk.X, pady=(0, 30))
+        
+        # Title - clean, minimal
         self.title_label = tk.Label(
             header_frame, 
-            text="🚪 DOOR ENTRY SYSTEM", 
-            font=("Helvetica", 32, "bold"),
+            text="Door Entry", 
+            font=(Config.FONT_FAMILY, 34, "bold"),
             fg=Config.COLOR_TEXT,
-            bg=Config.COLOR_DARK_BG
+            bg=Config.COLOR_BG
         )
         self.title_label.pack(side=tk.LEFT)
         
-        # Time display
+        # Time display - right aligned, elegant
+        time_frame = tk.Frame(header_frame, bg=Config.COLOR_BG)
+        time_frame.pack(side=tk.RIGHT)
+        
         self.time_label = tk.Label(
-            header_frame,
+            time_frame,
             text="",
-            font=("Helvetica", 24),
-            fg=Config.COLOR_TEXT_DIM,
-            bg=Config.COLOR_DARK_BG
+            font=(Config.FONT_FAMILY, 15),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_BG,
+            justify=tk.RIGHT
         )
-        self.time_label.pack(side=tk.RIGHT)
+        self.time_label.pack()
         self.update_time()
         
-        # Content area (camera + status)
-        content_frame = tk.Frame(self.main_frame, bg=Config.COLOR_DARK_BG)
+        # Content area
+        content_frame = tk.Frame(self.main_frame, bg=Config.COLOR_BG)
         content_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Left side - Camera feed
-        camera_container = tk.Frame(content_frame, bg=Config.COLOR_PANEL_BG, bd=3, relief=tk.RAISED)
-        camera_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        # Left side - Camera feed in a clean card
+        camera_card = tk.Frame(content_frame, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
+        camera_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 20))
         
-        self.video_label = tk.Label(camera_container, bg=Config.COLOR_PANEL_BG)
-        self.video_label.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # Camera header
+        camera_header = tk.Frame(camera_card, bg=Config.COLOR_CARD)
+        camera_header.pack(fill=tk.X, padx=20, pady=(20, 10))
+        
+        tk.Label(
+            camera_header,
+            text="Camera",
+            font=(Config.FONT_FAMILY, 13, "bold"),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_CARD
+        ).pack(side=tk.LEFT)
+        
+        # FPS indicator
+        self.fps_indicator = tk.Label(
+            camera_header,
+            text="● Live",
+            font=(Config.FONT_FAMILY, 11),
+            fg=Config.COLOR_GRANTED,
+            bg=Config.COLOR_CARD
+        )
+        self.fps_indicator.pack(side=tk.RIGHT)
+        
+        # Video frame container
+        video_container = tk.Frame(camera_card, bg=Config.COLOR_CARD_SECONDARY)
+        video_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
+        
+        self.video_label = tk.Label(video_container, bg=Config.COLOR_CARD_SECONDARY)
+        self.video_label.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         
         # Right side - Status panel
-        status_container = tk.Frame(content_frame, bg=Config.COLOR_PANEL_BG, width=400)
-        status_container.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
-        status_container.pack_propagate(False)
+        right_panel = tk.Frame(content_frame, bg=Config.COLOR_BG, width=380)
+        right_panel.pack(side=tk.RIGHT, fill=tk.Y)
+        right_panel.pack_propagate(False)
         
-        # Status indicator (large icon area)
-        self.status_frame = tk.Frame(status_container, bg=Config.COLOR_PANEL_BG, height=300)
-        self.status_frame.pack(fill=tk.X, padx=20, pady=20)
-        self.status_frame.pack_propagate(False)
+        # Status Card
+        self.status_card = tk.Frame(right_panel, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
+        self.status_card.pack(fill=tk.X, pady=(0, 20))
+        
+        # Status content
+        status_content = tk.Frame(self.status_card, bg=Config.COLOR_CARD)
+        status_content.pack(fill=tk.X, padx=30, pady=40)
         
         self.status_icon_label = tk.Label(
-            self.status_frame,
-            text="👁",
-            font=("Helvetica", 80),
+            status_content,
+            text="◉",
+            font=(Config.FONT_FAMILY, 72),
             fg=Config.COLOR_SCANNING,
-            bg=Config.COLOR_PANEL_BG
+            bg=Config.COLOR_CARD
         )
-        self.status_icon_label.pack(expand=True)
+        self.status_icon_label.pack()
         
         self.status_text_label = tk.Label(
-            self.status_frame,
-            text="SCANNING...",
-            font=("Helvetica", 24, "bold"),
-            fg=Config.COLOR_SCANNING,
-            bg=Config.COLOR_PANEL_BG
+            status_content,
+            text="Ready to Scan",
+            font=(Config.FONT_FAMILY, 22, "bold"),
+            fg=Config.COLOR_TEXT,
+            bg=Config.COLOR_CARD
         )
-        self.status_text_label.pack()
+        self.status_text_label.pack(pady=(15, 5))
         
         self.status_detail_label = tk.Label(
-            self.status_frame,
-            text="Please look at the camera",
-            font=("Helvetica", 14),
-            fg=Config.COLOR_TEXT_DIM,
-            bg=Config.COLOR_PANEL_BG
+            status_content,
+            text="Position your face in the camera",
+            font=(Config.FONT_FAMILY, 13),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_CARD
         )
-        self.status_detail_label.pack(pady=(10, 0))
+        self.status_detail_label.pack()
         
-        # Recent access log
-        log_label = tk.Label(
-            status_container,
-            text="Recent Access",
-            font=("Helvetica", 16, "bold"),
-            fg=Config.COLOR_TEXT,
-            bg=Config.COLOR_PANEL_BG
-        )
-        log_label.pack(pady=(20, 10))
+        # Store status frame reference for background updates
+        self.status_frame = status_content
         
-        log_frame = tk.Frame(status_container, bg=Config.COLOR_DARK_BG)
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
+        # Recent Activity Card
+        activity_card = tk.Frame(right_panel, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
+        activity_card.pack(fill=tk.BOTH, expand=True)
+        
+        # Activity header
+        activity_header = tk.Frame(activity_card, bg=Config.COLOR_CARD)
+        activity_header.pack(fill=tk.X, padx=20, pady=(20, 15))
+        
+        tk.Label(
+            activity_header,
+            text="Recent Activity",
+            font=(Config.FONT_FAMILY, 13, "bold"),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_CARD
+        ).pack(side=tk.LEFT)
+        
+        # Activity list container
+        list_container = tk.Frame(activity_card, bg=Config.COLOR_CARD)
+        list_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
         
         self.log_listbox = tk.Listbox(
-            log_frame,
-            font=("Consolas", 11),
+            list_container,
+            font=(Config.FONT_FAMILY_MONO, 12),
             fg=Config.COLOR_TEXT,
-            bg=Config.COLOR_DARK_BG,
-            selectbackground=Config.COLOR_PANEL_BG,
+            bg=Config.COLOR_CARD,
+            selectbackground=Config.COLOR_BG,
+            selectforeground=Config.COLOR_TEXT,
             highlightthickness=0,
-            bd=0
+            bd=0,
+            relief=tk.FLAT,
+            activestyle='none'
         )
         self.log_listbox.pack(fill=tk.BOTH, expand=True)
         
         # Footer
-        footer_frame = tk.Frame(self.main_frame, bg=Config.COLOR_DARK_BG)
-        footer_frame.pack(fill=tk.X, pady=(20, 0))
+        footer_frame = tk.Frame(self.main_frame, bg=Config.COLOR_BG)
+        footer_frame.pack(fill=tk.X, pady=(30, 0))
         
-        # Admin button (subtle)
+        # Admin button - subtle, clean
         self.admin_btn = tk.Button(
             footer_frame,
-            text="⚙",
-            font=("Helvetica", 16),
-            fg=Config.COLOR_TEXT_DIM,
-            bg=Config.COLOR_DARK_BG,
-            activebackground=Config.COLOR_PANEL_BG,
-            activeforeground=Config.COLOR_TEXT,
+            text="Settings",
+            font=(Config.FONT_FAMILY, 12),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_BG,
+            activebackground=Config.COLOR_BG,
+            activeforeground=Config.COLOR_SCANNING,
             bd=0,
+            cursor="hand2",
             command=self.show_admin_login
         )
         self.admin_btn.pack(side=tk.LEFT)
@@ -745,10 +806,10 @@ class DoorEntryKiosk:
         # Status info
         self.info_label = tk.Label(
             footer_frame,
-            text=f"Model: {len(self.face_system.get_trained_persons())} persons registered | Press F1 for admin",
-            font=("Helvetica", 10),
-            fg=Config.COLOR_TEXT_DIM,
-            bg=Config.COLOR_DARK_BG
+            text=f"{len(self.face_system.get_trained_persons())} registered users",
+            font=(Config.FONT_FAMILY, 11),
+            fg=Config.COLOR_TEXT_TERTIARY,
+            bg=Config.COLOR_BG
         )
         self.info_label.pack(side=tk.RIGHT)
         
@@ -757,52 +818,65 @@ class DoorEntryKiosk:
     
     def update_time(self):
         """Update the time display"""
-        current_time = datetime.now().strftime("%H:%M:%S")
-        current_date = datetime.now().strftime("%A, %B %d, %Y")
-        self.time_label.config(text=f"{current_date}\n{current_time}")
+        current_time = datetime.now().strftime("%H:%M")
+        current_date = datetime.now().strftime("%A, %B %d")
+        self.time_label.config(text=f"{current_date}  •  {current_time}")
         self.root.after(1000, self.update_time)
     
     def update_log_display(self):
         """Update the access log display"""
         self.log_listbox.delete(0, tk.END)
-        entries = self.access_log.get_recent(10)
+        entries = self.access_log.get_recent(8)
         
         for entry in entries:
-            timestamp = datetime.fromisoformat(entry['timestamp']).strftime("%H:%M:%S")
-            status = "✓" if entry['access_granted'] else "✗"
-            color_tag = "granted" if entry['access_granted'] else "denied"
-            self.log_listbox.insert(tk.END, f"{timestamp} {status} {entry['name']}")
+            timestamp = datetime.fromisoformat(entry['timestamp']).strftime("%H:%M")
+            status_icon = "●" if entry['access_granted'] else "○"
+            status_color = "" 
+            name = entry['name'][:15] + "..." if len(entry['name']) > 15 else entry['name']
+            self.log_listbox.insert(tk.END, f"  {status_icon}  {timestamp}   {name}")
     
     def set_status(self, status, name="", confidence=0.0):
-        """Update the status display"""
+        """Update the status display with Apple-like styling"""
         self.current_status = status
         
         if status == "granted":
             self.status_icon_label.config(text="✓", fg=Config.COLOR_GRANTED)
-            self.status_text_label.config(text="ACCESS GRANTED", fg=Config.COLOR_GRANTED)
-            self.status_detail_label.config(text=f"Welcome, {name}!\nConfidence: {confidence:.1%}")
+            self.status_text_label.config(text="Welcome", fg=Config.COLOR_TEXT)
+            self.status_detail_label.config(text=f"{name}")
+            self.status_card.config(bg=Config.COLOR_GRANTED, highlightbackground=Config.COLOR_GRANTED)
+            for widget in self.status_frame.winfo_children():
+                widget.config(bg=Config.COLOR_GRANTED)
+                if widget == self.status_icon_label:
+                    widget.config(fg="#FFFFFF")
+                elif widget in [self.status_text_label, self.status_detail_label]:
+                    widget.config(fg="#FFFFFF")
             self.status_frame.config(bg=Config.COLOR_GRANTED)
             self.root.after(3000, lambda: self.set_status("scanning"))
             
         elif status == "denied":
-            self.status_icon_label.config(text="✗", fg=Config.COLOR_DENIED)
-            self.status_text_label.config(text="ACCESS DENIED", fg=Config.COLOR_DENIED)
-            self.status_detail_label.config(text="Unrecognized person\nContact administrator")
+            self.status_icon_label.config(text="✕", fg=Config.COLOR_DENIED)
+            self.status_text_label.config(text="Not Recognized", fg=Config.COLOR_TEXT)
+            self.status_detail_label.config(text="Access denied")
+            self.status_card.config(bg=Config.COLOR_DENIED, highlightbackground=Config.COLOR_DENIED)
+            for widget in self.status_frame.winfo_children():
+                widget.config(bg=Config.COLOR_DENIED)
+                if widget == self.status_icon_label:
+                    widget.config(fg="#FFFFFF")
+                elif widget in [self.status_text_label, self.status_detail_label]:
+                    widget.config(fg="#FFFFFF")
             self.status_frame.config(bg=Config.COLOR_DENIED)
             self.root.after(3000, lambda: self.set_status("scanning"))
             
         else:  # scanning
-            self.status_icon_label.config(text="👁", fg=Config.COLOR_SCANNING)
-            self.status_text_label.config(text="SCANNING...", fg=Config.COLOR_SCANNING)
-            self.status_detail_label.config(text="Please look at the camera")
-            self.status_frame.config(bg=Config.COLOR_PANEL_BG)
-        
-        # Update background colors for all children
-        for widget in self.status_frame.winfo_children():
-            if status in ["granted", "denied"]:
-                widget.config(bg=self.status_frame.cget('bg'))
-            else:
-                widget.config(bg=Config.COLOR_PANEL_BG)
+            self.status_icon_label.config(text="◉", fg=Config.COLOR_SCANNING)
+            self.status_text_label.config(text="Ready to Scan", fg=Config.COLOR_TEXT)
+            self.status_detail_label.config(text="Position your face in the camera")
+            self.status_card.config(bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER)
+            for widget in self.status_frame.winfo_children():
+                widget.config(bg=Config.COLOR_CARD)
+            self.status_frame.config(bg=Config.COLOR_CARD)
+            self.status_text_label.config(fg=Config.COLOR_TEXT)
+            self.status_detail_label.config(fg=Config.COLOR_TEXT_SECONDARY)
     
     def start_camera(self):
         """Start the camera in a background thread"""
@@ -971,67 +1045,80 @@ class DoorEntryKiosk:
         # Clear the face cache when entering admin mode
         self.face_system.clear_cache()
         
-        # Create admin window
+        # Create admin window with Apple-like styling
         self.admin_window = tk.Toplevel(self.root)
-        self.admin_window.title("Admin Panel")
-        self.admin_window.geometry("600x700")
-        self.admin_window.configure(bg=Config.COLOR_DARK_BG)
+        self.admin_window.title("Settings")
+        self.admin_window.geometry("650x750")
+        self.admin_window.configure(bg=Config.COLOR_BG)
         self.admin_window.transient(self.root)
         self.admin_window.grab_set()
         
         # Title
-        tk.Label(
-            self.admin_window,
-            text="⚙ ADMIN PANEL",
-            font=("Helvetica", 24, "bold"),
-            fg=Config.COLOR_TEXT,
-            bg=Config.COLOR_DARK_BG
-        ).pack(pady=20)
+        header = tk.Frame(self.admin_window, bg=Config.COLOR_BG)
+        header.pack(fill=tk.X, padx=30, pady=(25, 15))
         
-        # Notebook for tabs
+        tk.Label(
+            header,
+            text="Settings",
+            font=(Config.FONT_FAMILY, 28, "bold"),
+            fg=Config.COLOR_TEXT,
+            bg=Config.COLOR_BG
+        ).pack(side=tk.LEFT)
+        
+        # Close button in header
+        close_btn = tk.Button(
+            header,
+            text="Done",
+            font=(Config.FONT_FAMILY, 14),
+            fg=Config.COLOR_SCANNING,
+            bg=Config.COLOR_BG,
+            activeforeground=Config.COLOR_SCANNING,
+            activebackground=Config.COLOR_BG,
+            bd=0,
+            cursor="hand2",
+            command=self.close_admin_panel
+        )
+        close_btn.pack(side=tk.RIGHT)
+        
+        # Configure notebook style for Apple look
         style = ttk.Style()
-        style.configure('Admin.TNotebook', background=Config.COLOR_DARK_BG)
-        style.configure('Admin.TFrame', background=Config.COLOR_DARK_BG)
+        style.configure('TNotebook', background=Config.COLOR_BG, borderwidth=0)
+        style.configure('TNotebook.Tab', 
+                       font=(Config.FONT_FAMILY, 11),
+                       padding=[20, 10],
+                       background=Config.COLOR_BG,
+                       foreground=Config.COLOR_TEXT_SECONDARY)
+        style.map('TNotebook.Tab',
+                 background=[('selected', Config.COLOR_BG)],
+                 foreground=[('selected', Config.COLOR_SCANNING)])
         
         notebook = ttk.Notebook(self.admin_window)
         notebook.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
         
         # Tab 1: Register New Face
-        register_tab = tk.Frame(notebook, bg=Config.COLOR_DARK_BG)
-        notebook.add(register_tab, text="📷 Register")
+        register_tab = tk.Frame(notebook, bg=Config.COLOR_BG)
+        notebook.add(register_tab, text="  Register  ")
         self.create_register_tab(register_tab)
         
         # Tab 2: Train Model
-        train_tab = tk.Frame(notebook, bg=Config.COLOR_DARK_BG)
-        notebook.add(train_tab, text="🧠 Train")
+        train_tab = tk.Frame(notebook, bg=Config.COLOR_BG)
+        notebook.add(train_tab, text="  Train  ")
         self.create_train_tab(train_tab)
         
         # Tab 3: Manage Users
-        manage_tab = tk.Frame(notebook, bg=Config.COLOR_DARK_BG)
-        notebook.add(manage_tab, text="👥 Manage")
+        manage_tab = tk.Frame(notebook, bg=Config.COLOR_BG)
+        notebook.add(manage_tab, text="  Users  ")
         self.create_manage_tab(manage_tab)
         
         # Tab 4: Access Log
-        log_tab = tk.Frame(notebook, bg=Config.COLOR_DARK_BG)
-        notebook.add(log_tab, text="📋 Log")
+        log_tab = tk.Frame(notebook, bg=Config.COLOR_BG)
+        notebook.add(log_tab, text="  Activity  ")
         self.create_log_tab(log_tab)
         
         # Tab 5: Settings
-        settings_tab = tk.Frame(notebook, bg=Config.COLOR_DARK_BG)
-        notebook.add(settings_tab, text="⚙ Settings")
+        settings_tab = tk.Frame(notebook, bg=Config.COLOR_BG)
+        notebook.add(settings_tab, text="  System  ")
         self.create_settings_tab(settings_tab)
-        
-        # Close button
-        close_btn = tk.Button(
-            self.admin_window,
-            text="Close Admin Panel",
-            font=("Helvetica", 14),
-            fg=Config.COLOR_TEXT,
-            bg=Config.COLOR_DENIED,
-            activebackground="#cc0000",
-            command=self.close_admin_panel
-        )
-        close_btn.pack(pady=20)
         
         self.admin_window.protocol("WM_DELETE_WINDOW", self.close_admin_panel)
     
