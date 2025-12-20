@@ -278,16 +278,21 @@ class AccessLog:
 
 # ==================== CAMERA MANAGER ====================
 class CameraManager:
-    """Manages camera operations for both standard webcams and Raspberry Pi camera"""
+    """Manages camera operations in a separate thread for zero-latency frame capture"""
     
     def __init__(self, use_picamera=False, resolution=(640, 480)):
         self.use_picamera = use_picamera
         self.resolution = resolution
         self.camera = None
         self.is_running = False
+        
+        # Thread-safe frame storage
+        self.current_frame = None
+        self.frame_lock = threading.Lock()
+        self.capture_thread = None
     
     def start(self):
-        """Initialize and start the camera"""
+        """Initialize and start the camera with background capture thread"""
         if self.use_picamera:
             self.camera = Picamera2()
             self.camera.configure(self.camera.create_preview_configuration(
@@ -318,51 +323,60 @@ class CameraManager:
             
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
-            # Reduce buffer size to minimize latency (display newest frames)
+            # Reduce buffer size to minimize latency
             self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
         self.is_running = True
-        time.sleep(0.5)
+        
+        # Start background capture thread
+        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.capture_thread.start()
+        
+        # Wait for first frame
+        time.sleep(0.3)
+    
+    def _capture_loop(self):
+        """Background thread that continuously captures frames"""
+        while self.is_running:
+            try:
+                if self.use_picamera:
+                    frame = self.camera.capture_array()
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+                else:
+                    ret, frame = self.camera.read()
+                    if not ret:
+                        continue
+                
+                # Store the latest frame thread-safely
+                with self.frame_lock:
+                    self.current_frame = frame
+                    
+            except Exception as e:
+                print(f"[CAMERA] Capture error: {e}")
+                time.sleep(0.1)
     
     def capture_frame(self):
-        """Capture a single frame from the camera"""
+        """Get the latest captured frame (non-blocking)"""
         if not self.is_running:
             return None
         
-        if self.use_picamera:
-            frame = self.camera.capture_array()
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-        else:
-            ret, frame = self.camera.read()
-            if not ret:
-                return None
-        
-        return frame
+        with self.frame_lock:
+            if self.current_frame is not None:
+                return self.current_frame.copy()
+        return None
     
     def capture_latest_frame(self):
-        """Capture the latest frame, discarding any buffered frames to reduce latency"""
-        if not self.is_running:
-            return None
-        
-        if self.use_picamera:
-            # Picamera2 doesn't buffer the same way
-            frame = self.camera.capture_array()
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-        else:
-            # Flush the buffer by grabbing frames without decoding
-            # This discards stale frames and gets the newest one
-            for _ in range(2):
-                self.camera.grab()
-            
-            ret, frame = self.camera.read()
-            if not ret:
-                return None
-        
-        return frame
+        """Get the latest captured frame - same as capture_frame with threaded capture"""
+        return self.capture_frame()
     
     def stop(self):
-        """Stop and release the camera"""
+        """Stop capture thread and release the camera"""
         self.is_running = False
+        
+        # Wait for capture thread to finish
+        if self.capture_thread and self.capture_thread.is_alive():
+            self.capture_thread.join(timeout=1.0)
+        
         if self.camera is not None:
             if self.use_picamera:
                 self.camera.stop()
