@@ -290,7 +290,7 @@ class CameraManager:
         if self.use_picamera:
             self.camera = Picamera2()
             self.camera.configure(self.camera.create_preview_configuration(
-                main={"format": 'XRGB8888', "size": self.resolution}
+                main={"format": 'XRGB8888', "size": self.resolution}, buffer_count=2
             ))
             self.camera.start()
         else:
@@ -1046,7 +1046,10 @@ class DoorEntryKiosk:
     
     def display_frame(self, frame):
         """Display a frame on the video label"""
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if USE_PICAMERA:
+            frame_rgb = frame
+        else:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
         # Get container size (not label size to avoid feedback loop)
         container_width = self.video_container.winfo_width()
