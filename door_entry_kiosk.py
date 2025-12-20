@@ -1232,7 +1232,21 @@ class DoorEntryKiosk:
         def on_cancel(event=None):
             login_dialog.destroy()
         
-        # Pack OK button first (will be on the right)
+        cancel_btn = tk.Button(
+            btn_frame,
+            text="Cancel",
+            font=(Config.FONT_FAMILY, 12),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_CARD,
+            activeforeground=Config.COLOR_TEXT,
+            activebackground=Config.COLOR_CARD,
+            relief=tk.FLAT,
+            cursor="hand2",
+            width=10,
+            command=on_cancel
+        )
+        cancel_btn.pack(side=tk.LEFT)
+        
         ok_btn = tk.Button(
             btn_frame,
             text="OK",
@@ -1247,22 +1261,6 @@ class DoorEntryKiosk:
             command=on_ok
         )
         ok_btn.pack(side=tk.RIGHT)
-        
-        # Pack Cancel button second (will be to the left of OK)
-        cancel_btn = tk.Button(
-            btn_frame,
-            text="Cancel",
-            font=(Config.FONT_FAMILY, 12),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_CARD,
-            activeforeground=Config.COLOR_TEXT,
-            activebackground=Config.COLOR_CARD,
-            relief=tk.FLAT,
-            cursor="hand2",
-            width=10,
-            command=on_cancel
-        )
-        cancel_btn.pack(side=tk.RIGHT, padx=(0, 10))
         
         # Bind Enter and Escape keys
         password_entry.bind('<Return>', on_ok)
@@ -1486,14 +1484,6 @@ class DoorEntryKiosk:
         # Tips
         tips_frame = tk.Frame(parent, bg=Config.COLOR_BG)
         tips_frame.pack(fill=tk.X, padx=20, pady=10)
-        
-        tk.Label(
-            tips_frame,
-            text="Tips for best results",
-            font=(Config.FONT_FAMILY, 11, "bold"),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_BG
-        ).pack(anchor=tk.W)
         
         tk.Label(
             tips_frame,
