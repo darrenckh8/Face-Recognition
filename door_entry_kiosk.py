@@ -60,7 +60,7 @@ class Config:
     CAMERA_RESOLUTION = (640, 480)
     
     # Recognition Settings
-    RECOGNITION_THRESHOLD = 0.5  # Lower = more strict (0.0 - 1.0)
+    RECOGNITION_THRESHOLD = 0.8  # Lower = more strict (0.0 - 1.0)
     COOLDOWN_SECONDS = 5  # Prevent repeated access logs for same person
     
     # Performance Settings
@@ -72,7 +72,7 @@ class Config:
     
     # Door Control (GPIO Pin for Raspberry Pi)
     DOOR_RELAY_PIN = 17
-    DOOR_UNLOCK_DURATION = 5  # Seconds to keep door unlocked
+    DOOR_UNLOCK_DURATION = 1  # Seconds to keep door unlocked
     
     # File Paths
     DATASET_PATH = "dataset"
