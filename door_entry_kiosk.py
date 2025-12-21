@@ -1336,18 +1336,14 @@ class DoorEntryKiosk:
         # Display on admin video label if in registration mode
         if self.registration_mode and hasattr(self, 'admin_video_label') and self.admin_video_label.winfo_exists():
             try:
-                # Get admin video label size
-                label_width = self.admin_video_label.winfo_width()
-                label_height = self.admin_video_label.winfo_height()
+                # Use fixed size to prevent expansion feedback loop
+                target_w, target_h = getattr(self, 'admin_video_size', (496, 376))
                 
-                if label_width > 10 and label_height > 10:
-                    frame_h, frame_w = frame_rgb.shape[:2]
-                    scale = min(label_width / frame_w, label_height / frame_h)
-                    new_w = int(frame_w * scale)
-                    new_h = int(frame_h * scale)
-                    admin_frame = cv2.resize(frame_rgb, (new_w, new_h))
-                else:
-                    admin_frame = frame_rgb
+                frame_h, frame_w = frame_rgb.shape[:2]
+                scale = min(target_w / frame_w, target_h / frame_h)
+                new_w = int(frame_w * scale)
+                new_h = int(frame_h * scale)
+                admin_frame = cv2.resize(frame_rgb, (new_w, new_h))
                 
                 admin_img = Image.fromarray(admin_frame)
                 admin_imgtk = ImageTk.PhotoImage(image=admin_img)
@@ -1588,85 +1584,59 @@ class DoorEntryKiosk:
     
     def create_register_tab(self, parent):
         """Create registration tab in admin panel with camera preview"""
-        # Main container with two columns
+        # Main container - vertical layout
         main_container = tk.Frame(parent, bg=Config.COLOR_BG)
-        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=15)
         
-        # Left side - Camera preview
-        camera_frame = tk.Frame(main_container, bg=Config.COLOR_CARD, 
-                               highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
-        camera_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 5), pady=10)
+        # Camera preview container with FIXED size to prevent expansion
+        camera_container = tk.Frame(main_container, bg=Config.COLOR_CARD, 
+                                   highlightbackground=Config.COLOR_BORDER, highlightthickness=1,
+                                   width=500, height=380)
+        camera_container.pack(pady=(0, 15))
+        camera_container.pack_propagate(False)  # Prevent size changes
         
         # Camera preview label
-        self.admin_video_label = tk.Label(camera_frame, bg="#000000")
+        self.admin_video_label = tk.Label(camera_container, bg="#000000")
         self.admin_video_label.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         
-        # Right side - Controls
-        controls_frame = tk.Frame(main_container, bg=Config.COLOR_BG, width=280)
-        controls_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 10), pady=10)
-        controls_frame.pack_propagate(False)
+        # Store fixed size for scaling calculations
+        self.admin_video_size = (496, 376)
         
-        # Card container for controls
-        card = tk.Frame(controls_frame, bg=Config.COLOR_CARD, 
-                       highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
-        card.pack(fill=tk.BOTH, expand=True)
+        # === SETUP PANEL (shown before starting) ===
+        self.reg_setup_panel = tk.Frame(main_container, bg=Config.COLOR_CARD,
+                                        highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
+        self.reg_setup_panel.pack(fill=tk.X, pady=5)
         
-        inner = tk.Frame(card, bg=Config.COLOR_CARD)
-        inner.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        setup_inner = tk.Frame(self.reg_setup_panel, bg=Config.COLOR_CARD)
+        setup_inner.pack(fill=tk.X, padx=20, pady=15)
+        
+        # Name entry row
+        name_row = tk.Frame(setup_inner, bg=Config.COLOR_CARD)
+        name_row.pack(fill=tk.X)
         
         tk.Label(
-            inner,
-            text="Add New Person",
-            font=(Config.FONT_FAMILY, 15, "bold"),
+            name_row,
+            text="Name:",
+            font=(Config.FONT_FAMILY, 13),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_CARD
-        ).pack(anchor=tk.W)
-        
-        tk.Label(
-            inner,
-            text="Capture face photos",
-            font=(Config.FONT_FAMILY, 11),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_CARD
-        ).pack(anchor=tk.W, pady=(3, 15))
-        
-        # Name entry
-        tk.Label(
-            inner,
-            text="Full Name",
-            font=(Config.FONT_FAMILY, 11),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_CARD
-        ).pack(anchor=tk.W)
+        ).pack(side=tk.LEFT)
         
         self.reg_name_entry = tk.Entry(
-            inner, 
-            font=(Config.FONT_FAMILY, 14), 
+            name_row, 
+            font=(Config.FONT_FAMILY, 13), 
             bg=Config.COLOR_CARD_SECONDARY,
             fg=Config.COLOR_TEXT,
             relief=tk.FLAT,
             highlightbackground=Config.COLOR_BORDER,
-            highlightthickness=1
+            highlightthickness=1,
+            width=25
         )
-        self.reg_name_entry.pack(fill=tk.X, pady=(5, 12), ipady=6)
-        
-        # Capture count
-        self.reg_count_label = tk.Label(
-            inner,
-            text="0 photos captured",
-            font=(Config.FONT_FAMILY, 12),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_CARD
-        )
-        self.reg_count_label.pack(pady=(0, 12))
-        
-        # Buttons frame
-        btn_frame = tk.Frame(inner, bg=Config.COLOR_CARD)
-        btn_frame.pack(fill=tk.X)
+        self.reg_name_entry.pack(side=tk.LEFT, padx=(10, 15), ipady=5)
         
         self.start_reg_btn = tk.Button(
-            btn_frame,
-            text="Start",
+            name_row,
+            text="Start Registration",
             font=(Config.FONT_FAMILY, 12),
             fg="#FFFFFF",
             bg=Config.COLOR_SCANNING,
@@ -1676,11 +1646,59 @@ class DoorEntryKiosk:
             cursor="hand2",
             command=self.start_registration
         )
-        self.start_reg_btn.pack(fill=tk.X, pady=2, ipady=6)
+        self.start_reg_btn.pack(side=tk.LEFT, ipady=5, ipadx=15)
+        
+        # === CAPTURE PANEL (shown during registration) ===
+        self.reg_capture_panel = tk.Frame(main_container, bg=Config.COLOR_CARD,
+                                          highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
+        # Don't pack yet - will be shown when registration starts
+        
+        capture_inner = tk.Frame(self.reg_capture_panel, bg=Config.COLOR_CARD)
+        capture_inner.pack(fill=tk.X, padx=20, pady=15)
+        
+        # Top row: status and stop button
+        top_row = tk.Frame(capture_inner, bg=Config.COLOR_CARD)
+        top_row.pack(fill=tk.X, pady=(0, 10))
+        
+        self.reg_name_display = tk.Label(
+            top_row,
+            text="",
+            font=(Config.FONT_FAMILY, 14, "bold"),
+            fg=Config.COLOR_TEXT,
+            bg=Config.COLOR_CARD
+        )
+        self.reg_name_display.pack(side=tk.LEFT)
+        
+        self.reg_count_label = tk.Label(
+            top_row,
+            text="0 photos",
+            font=(Config.FONT_FAMILY, 12),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_CARD
+        )
+        self.reg_count_label.pack(side=tk.LEFT, padx=(15, 0))
+        
+        self.stop_reg_btn = tk.Button(
+            top_row,
+            text="Stop & Train",
+            font=(Config.FONT_FAMILY, 12),
+            fg="#FFFFFF",
+            bg=Config.COLOR_DENIED,
+            activeforeground="#FFFFFF",
+            activebackground="#c0392b",
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=self.stop_registration
+        )
+        self.stop_reg_btn.pack(side=tk.RIGHT, ipady=4, ipadx=10)
+        
+        # Bottom row: capture buttons
+        btn_row = tk.Frame(capture_inner, bg=Config.COLOR_CARD)
+        btn_row.pack(fill=tk.X)
         
         self.capture_btn = tk.Button(
-            btn_frame,
-            text="Capture Photo",
+            btn_row,
+            text="📷 Capture Photo",
             font=(Config.FONT_FAMILY, 12),
             fg="#FFFFFF",
             bg=Config.COLOR_GRANTED,
@@ -1688,47 +1706,29 @@ class DoorEntryKiosk:
             activeforeground="#FFFFFF",
             relief=tk.FLAT,
             cursor="hand2",
-            command=self.capture_photo,
-            state=tk.DISABLED
+            command=self.capture_photo
         )
-        self.capture_btn.pack(fill=tk.X, pady=2, ipady=6)
+        self.capture_btn.pack(side=tk.LEFT, ipady=5, ipadx=15)
         
-        # Auto-capture button (Face ID style)
         self.auto_capture_btn = tk.Button(
-            btn_frame,
-            text="⟳ Auto Capture",
+            btn_row,
+            text="⟳ Auto Capture (100 photos)",
             font=(Config.FONT_FAMILY, 12),
             fg="#FFFFFF",
-            bg="#5856D6",  # Purple like Face ID
+            bg="#5856D6",
             activebackground="#4744c4",
             activeforeground="#FFFFFF",
             relief=tk.FLAT,
             cursor="hand2",
-            command=self.start_auto_capture,
-            state=tk.DISABLED
+            command=self.start_auto_capture
         )
-        self.auto_capture_btn.pack(fill=tk.X, pady=2, ipady=6)
+        self.auto_capture_btn.pack(side=tk.LEFT, padx=(10, 0), ipady=5, ipadx=15)
         
-        self.stop_reg_btn = tk.Button(
-            btn_frame,
-            text="Stop & Train",
-            font=(Config.FONT_FAMILY, 12),
-            fg=Config.COLOR_DENIED,
-            bg=Config.COLOR_CARD,
-            activeforeground=Config.COLOR_DENIED,
-            activebackground=Config.COLOR_CARD_SECONDARY,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self.stop_registration,
-            state=tk.DISABLED
-        )
-        self.stop_reg_btn.pack(fill=tk.X, pady=2, ipady=6)
-        
-        # Auto-train option
+        # Auto-train checkbox (smaller, right side)
         self.auto_train_var = tk.BooleanVar(value=True)
         self.auto_train_check = tk.Checkbutton(
-            inner,
-            text="Auto-train after capture",
+            btn_row,
+            text="Auto-train",
             variable=self.auto_train_var,
             font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_TEXT_SECONDARY,
@@ -1736,7 +1736,7 @@ class DoorEntryKiosk:
             activebackground=Config.COLOR_CARD,
             selectcolor=Config.COLOR_CARD
         )
-        self.auto_train_check.pack(anchor=tk.W, pady=(10, 0))
+        self.auto_train_check.pack(side=tk.RIGHT)
     
     def create_train_tab(self, parent):
         """Create training tab in admin panel with Apple styling"""
@@ -2299,20 +2299,20 @@ class DoorEntryKiosk:
         self.auto_capture_mode = False
         self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
         
-        self.start_reg_btn.config(state=tk.DISABLED)
-        self.capture_btn.config(state=tk.NORMAL)
-        self.auto_capture_btn.config(state=tk.NORMAL)
-        self.stop_reg_btn.config(state=tk.NORMAL)
-        self.reg_name_entry.config(state=tk.DISABLED)
+        # Swap panels - hide setup, show capture
+        self.reg_setup_panel.pack_forget()
+        self.reg_capture_panel.pack(fill=tk.X, pady=5)
         
-        self.reg_count_label.config(text=f"{self.captured_count} photos captured")
+        # Update capture panel with name
+        self.reg_name_display.config(text=name)
+        self.reg_count_label.config(text="0 photos")
     
     def capture_photo(self):
         """Capture a photo for registration"""
         if self.current_frame is not None and self.registration_mode:
             filepath = self.face_system.save_face_image(self.current_frame, self.registration_name)
             self.captured_count += 1
-            self.reg_count_label.config(text=f"{self.captured_count} photos captured")
+            self.reg_count_label.config(text=f"{self.captured_count} photos")
             print(f"[REGISTER] Saved: {filepath}")
     
     def stop_registration(self):
@@ -2325,11 +2325,15 @@ class DoorEntryKiosk:
         self.auto_capture_mode = False
         self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
         
-        self.start_reg_btn.config(state=tk.NORMAL)
-        self.capture_btn.config(state=tk.DISABLED)
-        self.auto_capture_btn.config(state=tk.DISABLED, text="⟳ Auto Capture (100 photos)", bg="#5856D6")
-        self.stop_reg_btn.config(state=tk.DISABLED)
-        self.reg_name_entry.config(state=tk.NORMAL)
+        # Swap panels - hide capture, show setup
+        self.reg_capture_panel.pack_forget()
+        self.reg_setup_panel.pack(fill=tk.X, pady=5)
+        
+        # Reset capture panel buttons for next time
+        self.auto_capture_btn.config(text="⟳ Auto Capture (100 photos)", bg="#5856D6", command=self.start_auto_capture)
+        self.capture_btn.config(state=tk.NORMAL)
+        
+        # Clear name entry
         self.reg_name_entry.delete(0, tk.END)
         
         self.refresh_manage_list()
@@ -2589,7 +2593,7 @@ class DoorEntryKiosk:
                 text=f"{self.captured_count} photos • {zones_done}/5 zones"
             )
         else:
-            self.reg_count_label.config(text=f"{self.captured_count} photos captured")
+            self.reg_count_label.config(text=f"{self.captured_count} photos")
     
     def complete_auto_registration(self):
         """Called when auto-capture reaches target"""
