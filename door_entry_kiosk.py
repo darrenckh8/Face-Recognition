@@ -646,21 +646,52 @@ class FaceRecognitionSystem:
         """
         Robust face detection using dlib (via face_recognition library).
         Better at detecting faces at various angles - ideal for registration.
-        Slower than Haar cascade but more reliable.
+        Uses minimal downscaling for better detection at extreme angles.
         """
-        # Downscale for faster processing
-        small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-        rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+        # Use less aggressive downscaling for better angle detection
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Use face_recognition's HOG-based detector (more robust to angles)
-        face_locations = face_recognition.face_locations(rgb_small, model="hog")
+        # Use face_recognition's HOG-based detector with number_of_times_to_upsample=1
+        # for better small/angled face detection
+        face_locations = face_recognition.face_locations(rgb_frame, model="hog", number_of_times_to_upsample=1)
         
-        # Scale back to original size
-        scaled_locations = []
-        for (top, right, bottom, left) in face_locations:
-            scaled_locations.append((top * 2, right * 2, bottom * 2, left * 2))
+        return face_locations
+    
+    def detect_faces_for_registration(self, frame):
+        """
+        Optimized face detection specifically for registration mode.
+        Prioritizes detection reliability over speed.
+        Uses multiple detection attempts with different parameters.
+        """
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        return scaled_locations
+        # Try standard HOG detection first (faster)
+        face_locations = face_recognition.face_locations(rgb_frame, model="hog", number_of_times_to_upsample=1)
+        
+        if face_locations:
+            return face_locations
+        
+        # If no face found, try with upsampling for smaller/distant faces
+        face_locations = face_recognition.face_locations(rgb_frame, model="hog", number_of_times_to_upsample=2)
+        
+        if face_locations:
+            return face_locations
+        
+        # Last resort: try Haar cascade with relaxed parameters
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.05,  # More thorough scanning
+            minNeighbors=3,    # More permissive
+            minSize=(20, 20),
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
+        
+        locations = []
+        for (x, y, w, h) in faces:
+            locations.append((y, x + w, y + h, x))
+        
+        return locations
     
     def detect_faces_combined(self, frame):
         """
@@ -1214,9 +1245,8 @@ class DoorEntryKiosk:
                                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1)
                 
                 elif self.registration_mode:
-                    # Registration mode - use robust detection for better angle coverage
-                    # Combined detection tries fast Haar first, then robust dlib
-                    faces = self.face_system.detect_faces_combined(frame)
+                    # Registration mode - use optimized detection for best angle coverage
+                    faces = self.face_system.detect_faces_for_registration(frame)
                     
                     frame_height, frame_width = display_frame.shape[:2]
                     
@@ -1262,7 +1292,24 @@ class DoorEntryKiosk:
                             cv2.putText(display_frame, guidance, (frame_width // 2 - 150, frame_height - 40),
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                         else:
-                            cv2.rectangle(display_frame, (int(left), int(top)), (int(right), int(bottom)), (0, 255, 255), 3)
+                            # Pose estimation failed but face detected - still capture in auto mode
+                            # This happens at extreme angles where landmarks aren't visible
+                            cv2.rectangle(display_frame, (int(left), int(top)), (int(right), int(bottom)), (255, 165, 0), 3)
+                            
+                            if self.auto_capture_mode:
+                                now = time.time()
+                                # Capture at extreme angles with slightly longer interval
+                                if now - self.last_auto_capture >= self.auto_capture_interval * 1.5:
+                                    if self.captured_count < self.auto_capture_target:
+                                        filepath = self.face_system.save_face_image(frame, self.registration_name)
+                                        self.captured_count += 1
+                                        # Mark as 'extreme' zone for tracking
+                                        self.pose_zones_captured['extreme'] = self.pose_zones_captured.get('extreme', 0) + 1
+                                        self.last_auto_capture = now
+                                        self.root.after(0, self.update_registration_ui)
+                            
+                            cv2.putText(display_frame, "Extreme angle - keep moving slowly", (frame_width // 2 - 160, frame_height - 40),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
                     
                     elif len(faces) == 0:
                         cv2.putText(display_frame, "No face detected - position your face", (frame_width // 2 - 180, frame_height // 2),
