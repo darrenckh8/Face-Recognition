@@ -1026,7 +1026,7 @@ class DoorEntryKiosk:
     def update_time(self):
         """Update the time display"""
         current_time = datetime.now().strftime("%H:%M:%S")
-        current_date = datetime.now().strftime("%a, %b %d")
+        current_date = datetime.now().strftime("%a, %b %d %Y")
         self.time_label.config(text=f"{current_time}  ·  {current_date}")
         self.root.after(1000, self.update_time)
     
