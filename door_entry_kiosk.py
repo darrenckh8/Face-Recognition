@@ -1223,61 +1223,27 @@ class DoorEntryKiosk:
                                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1)
                 
                 elif self.registration_mode:
-                    # Registration mode - use robust detection for better angle coverage
-                    faces = self.face_system.detect_faces_robust(frame)
-                    
                     frame_height, frame_width = display_frame.shape[:2]
                     
-                    if len(faces) == 1:
-                        top, right, bottom, left = faces[0]
+                    # Auto-capture mode - capture continuously at interval
+                    if self.auto_capture_mode:
+                        now = time.time()
+                        if now - self.last_auto_capture >= self.auto_capture_interval:
+                            if self.captured_count < self.auto_capture_target:
+                                # Save frame directly without face check
+                                filepath = self.face_system.save_face_image(frame, self.registration_name)
+                                self.captured_count += 1
+                                self.last_auto_capture = now
+                                self.root.after(0, self.update_registration_ui)
+                                
+                                # Flash effect on capture
+                                cv2.rectangle(display_frame, (0, 0), (frame_width, frame_height), (255, 255, 255), 10)
+                            else:
+                                # Auto-capture complete
+                                self.root.after(0, self.complete_auto_registration)
                         
-                        # Estimate head pose
-                        pose = self.face_system.estimate_head_pose(frame, faces[0])
-                        self.current_pose = pose
-                        
-                        if pose:
-                            yaw, pitch = pose
-                            
-                            # Determine pose zone (8 zones like Face ID)
-                            zone = self.get_pose_zone(yaw, pitch)
-                            
-                            # Auto-capture logic
-                            if self.auto_capture_mode:
-                                now = time.time()
-                                if now - self.last_auto_capture >= self.auto_capture_interval:
-                                    if self.captured_count < self.auto_capture_target:
-                                        # Check if this pose angle is sufficiently different
-                                        if self.should_capture_pose(yaw, pitch):
-                                            filepath = self.face_system.save_face_image(frame, self.registration_name)
-                                            self.captured_count += 1
-                                            self.captured_poses.append((yaw, pitch))
-                                            self.pose_zones_captured[zone] = self.pose_zones_captured.get(zone, 0) + 1
-                                            self.last_auto_capture = now
-                                            self.root.after(0, self.update_registration_ui)
-                                    else:
-                                        # Auto-capture complete
-                                        self.root.after(0, self.complete_auto_registration)
-                            
-                            # Draw pose indicator on frame
-                            self.draw_pose_indicator(display_frame, yaw, pitch, zone)
-                            
-                            # Draw face box with pose-based color
-                            color = (0, 255, 0) if zone in self.pose_zones_captured else (0, 255, 255)
-                            cv2.rectangle(display_frame, (int(left), int(top)), (int(right), int(bottom)), color, 3)
-                            
-                            # Guidance text
-                            guidance = self.get_pose_guidance()
-                            cv2.putText(display_frame, guidance, (frame_width // 2 - 150, frame_height - 40),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                        else:
-                            cv2.rectangle(display_frame, (int(left), int(top)), (int(right), int(bottom)), (0, 255, 255), 3)
-                    
-                    elif len(faces) == 0:
-                        cv2.putText(display_frame, "No face detected - position your face", (frame_width // 2 - 180, frame_height // 2),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
-                    else:
-                        cv2.putText(display_frame, "Multiple faces detected - only one person", (frame_width // 2 - 200, frame_height // 2),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        # Draw progress bar
+                        self.draw_capture_progress(display_frame)
                     
                     # Show registration info overlay
                     self.draw_registration_overlay(display_frame)
@@ -2317,13 +2283,11 @@ class DoorEntryKiosk:
         
         self.auto_capture_mode = True
         self.last_auto_capture = time.time()
-        self.captured_poses = []
-        self.pose_zones_captured = {}
         
         # Update UI
         self.capture_btn.config(state=tk.DISABLED)
         self.auto_capture_btn.config(text="⏹ Stop Auto Capture", bg=Config.COLOR_DENIED, command=self.stop_auto_capture)
-        self.reg_count_label.config(text="Move your head slowly in a circle...")
+        self.reg_count_label.config(text="Recording... Move your head slowly")
     
     def stop_auto_capture(self):
         """Stop automatic capture"""
@@ -2332,157 +2296,70 @@ class DoorEntryKiosk:
         self.auto_capture_btn.config(text="⟳ Auto Capture (100 photos)", bg="#5856D6", command=self.start_auto_capture)
         self.update_registration_ui()
     
-    def get_pose_zone(self, yaw, pitch):
-        """
-        Determine which of 9 pose zones the current head pose falls into.
-        Returns zone name: 'center', 'up', 'down', 'left', 'right', 
-                          'up_left', 'up_right', 'down_left', 'down_right'
-        """
-        yaw_threshold = 12
-        pitch_threshold = 10
-        
-        if abs(yaw) < yaw_threshold and abs(pitch) < pitch_threshold:
-            return 'center'
-        elif pitch > pitch_threshold:
-            if yaw < -yaw_threshold:
-                return 'up_left'
-            elif yaw > yaw_threshold:
-                return 'up_right'
-            else:
-                return 'up'
-        elif pitch < -pitch_threshold:
-            if yaw < -yaw_threshold:
-                return 'down_left'
-            elif yaw > yaw_threshold:
-                return 'down_right'
-            else:
-                return 'down'
-        else:
-            if yaw < -yaw_threshold:
-                return 'left'
-            else:
-                return 'right'
-    
-    def should_capture_pose(self, yaw, pitch):
-        """
-        Determine if we should capture at this pose.
-        Ensures variety in captured angles.
-        """
-        min_angle_diff = 5  # Minimum angle difference from previous captures
-        
-        # Always capture first few photos
-        if len(self.captured_poses) < 10:
-            return True
-        
-        # Check if this pose is different enough from recent captures
-        for prev_yaw, prev_pitch in self.captured_poses[-15:]:
-            if abs(yaw - prev_yaw) < min_angle_diff and abs(pitch - prev_pitch) < min_angle_diff:
-                return False
-        
-        return True
-    
-    def get_pose_guidance(self):
-        """Get guidance text based on which zones need more coverage"""
-        zone_targets = {
-            'center': 15, 'up': 12, 'down': 12, 'left': 12, 'right': 12,
-            'up_left': 10, 'up_right': 10, 'down_left': 10, 'down_right': 10
-        }
-        
-        # Find zones that need more photos
-        needed_zones = []
-        for zone, target in zone_targets.items():
-            captured = self.pose_zones_captured.get(zone, 0)
-            if captured < target:
-                needed_zones.append(zone)
-        
-        if not needed_zones:
-            return "Great coverage! Keep moving for more variety"
-        
-        # Prioritize guidance
-        zone_guidance = {
-            'center': "Look straight at camera",
-            'up': "Look up slightly",
-            'down': "Look down slightly", 
-            'left': "Turn head left",
-            'right': "Turn head right",
-            'up_left': "Look up and left",
-            'up_right': "Look up and right",
-            'down_left': "Look down and left",
-            'down_right': "Look down and right"
-        }
-        
-        # Return guidance for first needed zone
-        return zone_guidance.get(needed_zones[0], "Move your head slowly")
-    
-    def draw_pose_indicator(self, frame, yaw, pitch, zone):
-        """Draw a visual indicator showing current head pose and progress"""
+    def draw_capture_progress(self, frame):
+        """Draw enhanced capture progress visualization"""
         frame_height, frame_width = frame.shape[:2]
         
-        # Draw pose compass in top-right corner
-        compass_size = 80
-        compass_x = frame_width - compass_size - 20
-        compass_y = 60
-        
-        # Draw compass background circle
-        cv2.circle(frame, (compass_x, compass_y), compass_size // 2, (50, 50, 50), -1)
-        cv2.circle(frame, (compass_x, compass_y), compass_size // 2, (100, 100, 100), 2)
-        
-        # Draw zone indicators (9 zones)
-        zones_pos = {
-            'up_left': (-20, -20), 'up': (0, -25), 'up_right': (20, -20),
-            'left': (-25, 0), 'center': (0, 0), 'right': (25, 0),
-            'down_left': (-20, 20), 'down': (0, 25), 'down_right': (20, 20)
-        }
-        
-        for z, (dx, dy) in zones_pos.items():
-            color = (0, 255, 0) if z in self.pose_zones_captured else (80, 80, 80)
-            pos = (compass_x + dx, compass_y + dy)
-            radius = 8 if z == 'center' else 5
-            cv2.circle(frame, pos, radius, color, -1)
-        
-        # Draw current pose position (red dot)
-        pose_x = int(compass_x + (yaw / 30) * 30)  # Scale yaw to compass
-        pose_y = int(compass_y - (pitch / 20) * 25)  # Scale pitch to compass
-        cv2.circle(frame, (pose_x, pose_y), 6, (0, 0, 255), -1)
-        cv2.circle(frame, (pose_x, pose_y), 6, (255, 255, 255), 2)
-        
-        # Draw progress bar
+        # Calculate progress
         progress = min(1.0, self.captured_count / self.auto_capture_target)
-        bar_width = 200
-        bar_height = 8
-        bar_x = frame_width // 2 - bar_width // 2
-        bar_y = 25
         
-        # Background
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
-        # Progress
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + int(bar_width * progress), bar_y + bar_height), (0, 255, 0), -1)
+        # Draw circular progress indicator (Apple-like)
+        center_x = frame_width // 2
+        center_y = 50
+        radius = 35
+        thickness = 6
         
-        # Progress text
-        progress_text = f"{self.captured_count}/{self.auto_capture_target}"
-        cv2.putText(frame, progress_text, (bar_x + bar_width + 10, bar_y + 8),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Background circle
+        cv2.circle(frame, (center_x, center_y), radius, (60, 60, 60), thickness)
+        
+        # Progress arc
+        start_angle = -90
+        end_angle = -90 + int(360 * progress)
+        if progress > 0:
+            cv2.ellipse(frame, (center_x, center_y), (radius, radius), 
+                       0, start_angle, end_angle, (0, 255, 100), thickness)
+        
+        # Center text with count
+        count_text = str(self.captured_count)
+        text_size = cv2.getTextSize(count_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        cv2.putText(frame, count_text, 
+                   (center_x - text_size[0] // 2, center_y + text_size[1] // 3),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        # Target text below
+        target_text = f"of {self.auto_capture_target}"
+        target_size = cv2.getTextSize(target_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
+        cv2.putText(frame, target_text,
+                   (center_x - target_size[0] // 2, center_y + radius + 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+        
+        # Instruction text
+        instruction = "Move your head slowly in all directions"
+        inst_size = cv2.getTextSize(instruction, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
+        cv2.putText(frame, instruction,
+                   (center_x - inst_size[0] // 2, frame_height - 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
     
     def draw_registration_overlay(self, frame):
         """Draw registration mode overlay"""
         frame_height, frame_width = frame.shape[:2]
         
         # Mode indicator
-        mode_text = "AUTO CAPTURE" if self.auto_capture_mode else "REGISTRATION"
-        mode_color = (200, 100, 200) if self.auto_capture_mode else (0, 255, 255)
+        mode_text = "● REC" if self.auto_capture_mode else "REGISTRATION"
+        mode_color = (0, 0, 255) if self.auto_capture_mode else (0, 255, 255)
         cv2.putText(frame, mode_text, (15, 35),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, mode_color, 2)
         
         # Person name
-        cv2.putText(frame, f"Name: {self.registration_name}", (15, 70),
+        cv2.putText(frame, f"{self.registration_name}", (15, 70),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
     
     def update_registration_ui(self):
         """Update the registration UI with current progress"""
-        zones_filled = len(self.pose_zones_captured)
         if self.auto_capture_mode:
+            progress_pct = int((self.captured_count / self.auto_capture_target) * 100)
             self.reg_count_label.config(
-                text=f"{self.captured_count}/{self.auto_capture_target} photos • {zones_filled}/9 angles"
+                text=f"{self.captured_count}/{self.auto_capture_target} photos ({progress_pct}%)"
             )
         else:
             self.reg_count_label.config(text=f"{self.captured_count} photos captured")
@@ -2493,14 +2370,13 @@ class DoorEntryKiosk:
         self.capture_btn.config(state=tk.NORMAL)
         self.auto_capture_btn.config(text="✓ Complete!", bg=Config.COLOR_GRANTED, state=tk.DISABLED)
         
-        zones_filled = len(self.pose_zones_captured)
         self.reg_count_label.config(
-            text=f"✓ {self.captured_count} photos from {zones_filled} angles"
+            text=f"✓ {self.captured_count} photos captured"
         )
         
         messagebox.showinfo(
             "Auto Capture Complete", 
-            f"Successfully captured {self.captured_count} photos covering {zones_filled} head pose angles.\\n\\n"
+            f"Successfully captured {self.captured_count} photos.\\n\\n"
             "Click 'Stop' to finish and train the model."
         )
     
