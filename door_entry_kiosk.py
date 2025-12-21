@@ -1543,7 +1543,7 @@ class DoorEntryKiosk:
         login_dialog.bind('<Escape>', on_cancel)
         
         # Show keyboard immediately
-        login_dialog.after(100, lambda: self._show_password_keyboard(login_dialog, content, password_entry))
+        login_dialog.after(5, lambda: self._show_password_keyboard(login_dialog, content, password_entry))
         
         # Wait for dialog to close
         self.root.wait_window(login_dialog)
