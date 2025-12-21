@@ -910,7 +910,7 @@ class DoorEntryKiosk:
             highlightbackground=Config.COLOR_BORDER,
             highlightthickness=1
         )
-        self.video_container.pack(padx=2, pady=2)
+        self.video_container.pack()
         self.video_container.pack_propagate(False)
         
         # Fixed video size for consistent UI
@@ -1419,6 +1419,10 @@ class DoorEntryKiosk:
         # Hide the main kiosk UI
         self.main_frame.pack_forget()
         
+        # Force window size to stay consistent
+        if not Config.FULLSCREEN:
+            self.root.geometry("1280x800")
+        
         # Create admin frame in the same window
         self.admin_frame = tk.Frame(self.root, bg=Config.COLOR_BG)
         self.admin_frame.pack(fill=tk.BOTH, expand=True)
@@ -1509,7 +1513,7 @@ class DoorEntryKiosk:
         
         # Camera preview label
         self.admin_video_label = tk.Label(camera_container, bg="#000000")
-        self.admin_video_label.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        self.admin_video_label.pack(fill=tk.BOTH, expand=True)
         
         # === SETUP PANEL (shown before starting) ===
         self.reg_setup_panel = tk.Frame(main_container, bg=Config.COLOR_CARD,
@@ -2642,6 +2646,11 @@ class DoorEntryKiosk:
         
         # Destroy admin frame and restore main kiosk UI
         self.admin_frame.destroy()
+        
+        # Force window size to stay consistent
+        if not Config.FULLSCREEN:
+            self.root.geometry("1280x800")
+        
         self.main_frame.pack(fill=tk.BOTH, expand=True)
         
         self.update_log_display()
