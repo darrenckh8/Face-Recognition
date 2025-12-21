@@ -773,6 +773,127 @@ class FaceRecognitionSystem:
         self.face_cache.clear()
 
 
+# ==================== ON-SCREEN KEYBOARD ====================
+class OnScreenKeyboard:
+    """Touch-friendly on-screen keyboard for text entry"""
+    
+    _active_keyboard = None  # Track active keyboard to prevent duplicates
+    
+    def __init__(self, parent, entry_widget, is_password=False):
+        # Close any existing keyboard first
+        if OnScreenKeyboard._active_keyboard is not None:
+            try:
+                OnScreenKeyboard._active_keyboard.close()
+            except:
+                pass
+        
+        self.parent = parent
+        self.entry = entry_widget
+        self.is_password = is_password
+        self.shift_on = False
+        self.caps_on = False
+        
+        # Create keyboard window
+        self.keyboard_window = tk.Toplevel(parent)
+        self.keyboard_window.title("")
+        self.keyboard_window.overrideredirect(True)
+        self.keyboard_window.attributes('-topmost', True)
+        self.keyboard_window.configure(bg=Config.COLOR_BG)
+        
+        # Position keyboard at bottom of parent window
+        parent.update_idletasks()
+        x = parent.winfo_rootx()
+        y = parent.winfo_rooty() + parent.winfo_height() - 220
+        self.keyboard_window.geometry(f"480x220+{x}+{y}")
+        
+        self._create_keyboard()
+        
+        # Handle window close
+        self.keyboard_window.protocol("WM_DELETE_WINDOW", self.close)
+        OnScreenKeyboard._active_keyboard = self
+    
+    def _create_keyboard(self):
+        """Create the keyboard layout"""
+        main_frame = tk.Frame(self.keyboard_window, bg=Config.COLOR_BG)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
+        
+        # Keyboard rows
+        rows = [
+            ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
+            ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'],
+            ['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l'],
+            ['⇧', 'z', 'x', 'c', 'v', 'b', 'n', 'm', '⌫'],
+            ['Done', ' ', '.']
+        ]
+        
+        for row_idx, row in enumerate(rows):
+            row_frame = tk.Frame(main_frame, bg=Config.COLOR_BG)
+            row_frame.pack(fill=tk.X, pady=2)
+            
+            for key in row:
+                if key == ' ':
+                    btn_width = 20
+                elif key in ('Done', '⇧', '⌫'):
+                    btn_width = 5
+                else:
+                    btn_width = 3
+                
+                btn = tk.Button(
+                    row_frame,
+                    text=key,
+                    font=(Config.FONT_FAMILY, 14),
+                    width=btn_width,
+                    height=1,
+                    bg=Config.COLOR_CARD,
+                    fg=Config.COLOR_TEXT,
+                    activebackground=Config.COLOR_CARD_SECONDARY,
+                    relief=tk.FLAT,
+                    highlightthickness=1,
+                    highlightbackground=Config.COLOR_BORDER,
+                    command=lambda k=key: self._on_key_press(k)
+                )
+                btn.pack(side=tk.LEFT, padx=1, ipady=8)
+                
+                # Store shift button reference
+                if key == '⇧':
+                    self.shift_btn = btn
+    
+    def _on_key_press(self, key):
+        """Handle key press"""
+        if key == 'Done':
+            self.close()
+        elif key == '⌫':
+            # Backspace
+            current = self.entry.get()
+            self.entry.delete(0, tk.END)
+            self.entry.insert(0, current[:-1])
+        elif key == '⇧':
+            # Toggle shift
+            self.shift_on = not self.shift_on
+            self.shift_btn.config(bg=Config.COLOR_SCANNING if self.shift_on else Config.COLOR_CARD,
+                                  fg="#FFFFFF" if self.shift_on else Config.COLOR_TEXT)
+        elif key == ' ':
+            self.entry.insert(tk.END, ' ')
+        else:
+            # Regular character
+            char = key.upper() if self.shift_on else key
+            self.entry.insert(tk.END, char)
+            # Turn off shift after one character
+            if self.shift_on:
+                self.shift_on = False
+                self.shift_btn.config(bg=Config.COLOR_CARD, fg=Config.COLOR_TEXT)
+    
+    def close(self):
+        """Close the keyboard"""
+        OnScreenKeyboard._active_keyboard = None
+        self.keyboard_window.destroy()
+
+
+def show_keyboard(parent, entry_widget, is_password=False):
+    """Show the on-screen keyboard for an entry widget"""
+    OnScreenKeyboard(parent, entry_widget, is_password)
+
+
 # ==================== KIOSK GUI ====================
 class DoorEntryKiosk:
     """Main Kiosk Application"""
@@ -1348,6 +1469,7 @@ class DoorEntryKiosk:
             insertbackground=Config.COLOR_TEXT
         )
         password_entry.pack(fill=tk.X, ipady=8)
+        password_entry.bind('<Button-1>', lambda e: show_keyboard(login_dialog, password_entry, is_password=True))
         password_entry.focus_set()
         
         # Button frame
@@ -1545,6 +1667,7 @@ class DoorEntryKiosk:
             width=30
         )
         self.reg_name_entry.pack(side=tk.LEFT, padx=(8, 10), ipady=3)
+        self.reg_name_entry.bind('<Button-1>', lambda e: show_keyboard(self.root, self.reg_name_entry))
         
         self.start_reg_btn = tk.Button(
             name_row,
@@ -2033,6 +2156,13 @@ class DoorEntryKiosk:
             self.person_map[idx] = name  # Store index-to-name mapping
             self.manage_listbox.insert(tk.END, f"  {name}   •   {count} photos")
     
+    def refresh_train_tab(self):
+        """Refresh the train tab dataset info"""
+        if hasattr(self, 'dataset_info_label'):
+            persons = self.face_system.get_registered_persons()
+            total_images = sum(count for _, count in persons)
+            self.dataset_info_label.config(text=f"{len(persons)} people  •  {total_images} photos")
+    
     def start_registration(self):
         """Start face registration mode"""
         name = self.reg_name_entry.get().strip()
@@ -2089,6 +2219,7 @@ class DoorEntryKiosk:
         self.reg_name_entry.delete(0, tk.END)
         
         self.refresh_manage_list()
+        self.refresh_train_tab()
         
         # Auto-train the new person if option is enabled and photos were captured
         # Skip if already trained via auto-capture flow
