@@ -1327,40 +1327,65 @@ class DoorEntryKiosk:
             self.camera.stop()
     
     def display_frame(self, frame):
-        """Display a frame on the video label"""
+        """Display a frame on the video label (and admin preview if in registration mode)"""
         if USE_PICAMERA:
             frame_rgb = frame
         else:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Get container size (not label size to avoid feedback loop)
-        container_width = self.video_container.winfo_width()
-        container_height = self.video_container.winfo_height()
+        # Display on admin video label if in registration mode
+        if self.registration_mode and hasattr(self, 'admin_video_label') and self.admin_video_label.winfo_exists():
+            try:
+                # Get admin video label size
+                label_width = self.admin_video_label.winfo_width()
+                label_height = self.admin_video_label.winfo_height()
+                
+                if label_width > 10 and label_height > 10:
+                    frame_h, frame_w = frame_rgb.shape[:2]
+                    scale = min(label_width / frame_w, label_height / frame_h)
+                    new_w = int(frame_w * scale)
+                    new_h = int(frame_h * scale)
+                    admin_frame = cv2.resize(frame_rgb, (new_w, new_h))
+                else:
+                    admin_frame = frame_rgb
+                
+                admin_img = Image.fromarray(admin_frame)
+                admin_imgtk = ImageTk.PhotoImage(image=admin_img)
+                self.admin_video_label.imgtk = admin_imgtk
+                self.admin_video_label.configure(image=admin_imgtk)
+            except tk.TclError:
+                pass  # Widget was destroyed
         
-        # Only resize if container has valid dimensions
-        if container_width > 10 and container_height > 10:
-            frame_h, frame_w = frame_rgb.shape[:2]
+        # Update main video label only if visible (not hidden during admin mode)
+        if not self.admin_mode:
+            # Get container size (not label size to avoid feedback loop)
+            container_width = self.video_container.winfo_width()
+            container_height = self.video_container.winfo_height()
             
-            # Calculate scale to fit within container while maintaining aspect ratio
-            scale = min((container_width - 4) / frame_w, (container_height - 4) / frame_h)
+            # Only resize if container has valid dimensions
+            if container_width > 10 and container_height > 10:
+                frame_h, frame_w = frame_rgb.shape[:2]
+                
+                # Calculate scale to fit within container while maintaining aspect ratio
+                scale = min((container_width - 4) / frame_w, (container_height - 4) / frame_h)
+                
+                # Don't scale up beyond original size
+                scale = min(scale, 1.5)
+                
+                new_w = int(frame_w * scale)
+                new_h = int(frame_h * scale)
+                
+                # Ensure minimum size
+                new_w = max(new_w, 320)
+                new_h = max(new_h, 240)
+                
+                frame_rgb = cv2.resize(frame_rgb, (new_w, new_h))
             
-            # Don't scale up beyond original size
-            scale = min(scale, 1.5)
+            img = Image.fromarray(frame_rgb)
+            imgtk = ImageTk.PhotoImage(image=img)
             
-            new_w = int(frame_w * scale)
-            new_h = int(frame_h * scale)
-            
-            # Ensure minimum size
-            new_w = max(new_w, 320)
-            new_h = max(new_h, 240)
-            
-            frame_rgb = cv2.resize(frame_rgb, (new_w, new_h))
-        
-        img = Image.fromarray(frame_rgb)
-        imgtk = ImageTk.PhotoImage(image=img)
-        
-        self.video_label.imgtk = imgtk
-        self.video_label.configure(image=imgtk)
+            self.video_label.imgtk = imgtk
+            self.video_label.configure(image=imgtk)
     
     def grant_access(self, name, confidence):
         """Handle access granted"""
@@ -1562,29 +1587,48 @@ class DoorEntryKiosk:
         self.create_settings_tab(settings_tab)
     
     def create_register_tab(self, parent):
-        """Create registration tab in admin panel with Apple styling"""
-        # Card container
-        card = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
-        card.pack(fill=tk.X, padx=20, pady=20)
+        """Create registration tab in admin panel with camera preview"""
+        # Main container with two columns
+        main_container = tk.Frame(parent, bg=Config.COLOR_BG)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Left side - Camera preview
+        camera_frame = tk.Frame(main_container, bg=Config.COLOR_CARD, 
+                               highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
+        camera_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 5), pady=10)
+        
+        # Camera preview label
+        self.admin_video_label = tk.Label(camera_frame, bg="#000000")
+        self.admin_video_label.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        
+        # Right side - Controls
+        controls_frame = tk.Frame(main_container, bg=Config.COLOR_BG, width=280)
+        controls_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 10), pady=10)
+        controls_frame.pack_propagate(False)
+        
+        # Card container for controls
+        card = tk.Frame(controls_frame, bg=Config.COLOR_CARD, 
+                       highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
+        card.pack(fill=tk.BOTH, expand=True)
         
         inner = tk.Frame(card, bg=Config.COLOR_CARD)
-        inner.pack(fill=tk.X, padx=25, pady=25)
+        inner.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
         
         tk.Label(
             inner,
             text="Add New Person",
-            font=(Config.FONT_FAMILY, 17, "bold"),
+            font=(Config.FONT_FAMILY, 15, "bold"),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_CARD
         ).pack(anchor=tk.W)
         
         tk.Label(
             inner,
-            text="Capture face photos for recognition training",
-            font=(Config.FONT_FAMILY, 12),
+            text="Capture face photos",
+            font=(Config.FONT_FAMILY, 11),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD
-        ).pack(anchor=tk.W, pady=(5, 20))
+        ).pack(anchor=tk.W, pady=(3, 15))
         
         # Name entry
         tk.Label(
@@ -1604,17 +1648,17 @@ class DoorEntryKiosk:
             highlightbackground=Config.COLOR_BORDER,
             highlightthickness=1
         )
-        self.reg_name_entry.pack(fill=tk.X, pady=(5, 20), ipady=8)
+        self.reg_name_entry.pack(fill=tk.X, pady=(5, 12), ipady=6)
         
         # Capture count
         self.reg_count_label = tk.Label(
             inner,
             text="0 photos captured",
-            font=(Config.FONT_FAMILY, 13),
+            font=(Config.FONT_FAMILY, 12),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD
         )
-        self.reg_count_label.pack(pady=(0, 20))
+        self.reg_count_label.pack(pady=(0, 12))
         
         # Buttons frame
         btn_frame = tk.Frame(inner, bg=Config.COLOR_CARD)
@@ -1622,8 +1666,8 @@ class DoorEntryKiosk:
         
         self.start_reg_btn = tk.Button(
             btn_frame,
-            text="Start Camera",
-            font=(Config.FONT_FAMILY, 13),
+            text="Start",
+            font=(Config.FONT_FAMILY, 12),
             fg="#FFFFFF",
             bg=Config.COLOR_SCANNING,
             activebackground="#0056b3",
@@ -1632,12 +1676,12 @@ class DoorEntryKiosk:
             cursor="hand2",
             command=self.start_registration
         )
-        self.start_reg_btn.pack(fill=tk.X, pady=3, ipady=8)
+        self.start_reg_btn.pack(fill=tk.X, pady=2, ipady=6)
         
         self.capture_btn = tk.Button(
             btn_frame,
             text="Capture Photo",
-            font=(Config.FONT_FAMILY, 13),
+            font=(Config.FONT_FAMILY, 12),
             fg="#FFFFFF",
             bg=Config.COLOR_GRANTED,
             activebackground="#28a745",
@@ -1647,13 +1691,13 @@ class DoorEntryKiosk:
             command=self.capture_photo,
             state=tk.DISABLED
         )
-        self.capture_btn.pack(fill=tk.X, pady=3, ipady=8)
+        self.capture_btn.pack(fill=tk.X, pady=2, ipady=6)
         
         # Auto-capture button (Face ID style)
         self.auto_capture_btn = tk.Button(
             btn_frame,
-            text="⟳ Auto Capture (100 photos)",
-            font=(Config.FONT_FAMILY, 13),
+            text="⟳ Auto Capture",
+            font=(Config.FONT_FAMILY, 12),
             fg="#FFFFFF",
             bg="#5856D6",  # Purple like Face ID
             activebackground="#4744c4",
@@ -1663,12 +1707,12 @@ class DoorEntryKiosk:
             command=self.start_auto_capture,
             state=tk.DISABLED
         )
-        self.auto_capture_btn.pack(fill=tk.X, pady=3, ipady=8)
+        self.auto_capture_btn.pack(fill=tk.X, pady=2, ipady=6)
         
         self.stop_reg_btn = tk.Button(
             btn_frame,
-            text="Stop",
-            font=(Config.FONT_FAMILY, 13),
+            text="Stop & Train",
+            font=(Config.FONT_FAMILY, 12),
             fg=Config.COLOR_DENIED,
             bg=Config.COLOR_CARD,
             activeforeground=Config.COLOR_DENIED,
@@ -1678,37 +1722,21 @@ class DoorEntryKiosk:
             command=self.stop_registration,
             state=tk.DISABLED
         )
-        self.stop_reg_btn.pack(fill=tk.X, pady=3, ipady=8)
+        self.stop_reg_btn.pack(fill=tk.X, pady=2, ipady=6)
         
         # Auto-train option
         self.auto_train_var = tk.BooleanVar(value=True)
-        auto_train_frame = tk.Frame(inner, bg=Config.COLOR_CARD)
-        auto_train_frame.pack(fill=tk.X, pady=(15, 0))
-        
         self.auto_train_check = tk.Checkbutton(
-            auto_train_frame,
-            text="Auto-train after capture (recommended)",
+            inner,
+            text="Auto-train after capture",
             variable=self.auto_train_var,
-            font=(Config.FONT_FAMILY, 11),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD,
             activebackground=Config.COLOR_CARD,
             selectcolor=Config.COLOR_CARD
         )
-        self.auto_train_check.pack(anchor=tk.W)
-        
-        # Tips
-        tips_frame = tk.Frame(parent, bg=Config.COLOR_BG)
-        tips_frame.pack(fill=tk.X, padx=20, pady=10)
-        
-        tk.Label(
-            tips_frame,
-            text="Face ID Style Registration:\n• Use Auto Capture for best results\n• Slowly rotate your head in a circle\n• Cover all angles: up, down, left, right",
-            font=(Config.FONT_FAMILY, 11),
-            fg=Config.COLOR_TEXT_TERTIARY,
-            bg=Config.COLOR_BG,
-            justify=tk.LEFT
-        ).pack(anchor=tk.W, pady=(5, 0))
+        self.auto_train_check.pack(anchor=tk.W, pady=(10, 0))
     
     def create_train_tab(self, parent):
         """Create training tab in admin panel with Apple styling"""
