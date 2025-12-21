@@ -787,6 +787,7 @@ class DoorEntryKiosk:
             self.root.bind('<Escape>', lambda e: self.toggle_fullscreen())
         else:
             self.root.geometry("1280x800")
+            self.root.resizable(False, False)
         
         self.root.configure(bg=Config.COLOR_BG)
         
@@ -1269,54 +1270,24 @@ class DoorEntryKiosk:
         else:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Display on admin video label if admin panel is open and widget exists
+        # Fixed 640x480 display size for both views
+        frame_h, frame_w = frame_rgb.shape[:2]
+        if frame_w != 640 or frame_h != 480:
+            frame_rgb = cv2.resize(frame_rgb, (640, 480))
+        
+        img = Image.fromarray(frame_rgb)
+        imgtk = ImageTk.PhotoImage(image=img)
+        
+        # Display on admin video label if admin panel is open
         if self.admin_mode and hasattr(self, 'admin_video_label'):
             try:
                 if self.admin_video_label.winfo_exists():
-                    # Use fixed size to prevent expansion feedback loop
-                    target_w, target_h = getattr(self, 'admin_video_size', (496, 376))
-                    
-                    frame_h, frame_w = frame_rgb.shape[:2]
-                    scale = min(target_w / frame_w, target_h / frame_h)
-                    new_w = int(frame_w * scale)
-                    new_h = int(frame_h * scale)
-                    admin_frame = cv2.resize(frame_rgb, (new_w, new_h))
-                    
-                    admin_img = Image.fromarray(admin_frame)
-                    admin_imgtk = ImageTk.PhotoImage(image=admin_img)
-                    self.admin_video_label.imgtk = admin_imgtk
-                    self.admin_video_label.configure(image=admin_imgtk)
+                    self.admin_video_label.imgtk = imgtk
+                    self.admin_video_label.configure(image=imgtk)
             except tk.TclError:
                 pass  # Widget was destroyed
-        
-        # Update main video label only if visible (not hidden during admin mode)
-        if not self.admin_mode:
-            # Get container size (not label size to avoid feedback loop)
-            container_width = self.video_container.winfo_width()
-            container_height = self.video_container.winfo_height()
-            
-            # Only resize if container has valid dimensions
-            if container_width > 10 and container_height > 10:
-                frame_h, frame_w = frame_rgb.shape[:2]
-                
-                # Calculate scale to fit within container while maintaining aspect ratio
-                scale = min((container_width - 4) / frame_w, (container_height - 4) / frame_h)
-                
-                # Don't scale up beyond original size
-                scale = min(scale, 1.5)
-                
-                new_w = int(frame_w * scale)
-                new_h = int(frame_h * scale)
-                
-                # Ensure minimum size
-                new_w = max(new_w, 320)
-                new_h = max(new_h, 240)
-                
-                frame_rgb = cv2.resize(frame_rgb, (new_w, new_h))
-            
-            img = Image.fromarray(frame_rgb)
-            imgtk = ImageTk.PhotoImage(image=img)
-            
+        else:
+            # Update main video label
             self.video_label.imgtk = imgtk
             self.video_label.configure(image=imgtk)
     
@@ -1539,9 +1510,6 @@ class DoorEntryKiosk:
         # Camera preview label
         self.admin_video_label = tk.Label(camera_container, bg="#000000")
         self.admin_video_label.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
-        
-        # Store fixed size for scaling calculations
-        self.admin_video_size = (640, 480)
         
         # === SETUP PANEL (shown before starting) ===
         self.reg_setup_panel = tk.Frame(main_container, bg=Config.COLOR_CARD,
