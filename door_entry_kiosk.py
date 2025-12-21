@@ -2660,6 +2660,14 @@ class DoorEntryKiosk:
         self.reg_process_locked = True  # Ensure lock is set
         total_images = 0
         
+        def update_progress_label(text):
+            """Safely update progress label"""
+            try:
+                if hasattr(self, 'reg_count_label') and self.reg_count_label.winfo_exists():
+                    self.reg_count_label.config(text=text)
+            except tk.TclError:
+                pass
+        
         def training_thread():
             nonlocal total_images
             # Count images first
@@ -2671,13 +2679,9 @@ class DoorEntryKiosk:
             def progress_callback(current, total, filepath):
                 if current == total:
                     # Last image - show saving message
-                    self.root.after(0, lambda: self.reg_count_label.config(
-                        text=f"Saving encodings..."
-                    ))
+                    self.root.after(0, lambda: update_progress_label("Saving encodings..."))
                 else:
-                    self.root.after(0, lambda: self.reg_count_label.config(
-                        text=f"Encoding {current}/{total}..."
-                    ))
+                    self.root.after(0, lambda c=current, t=total: update_progress_label(f"Encoding {c}/{t}..."))
             
             success, message = self.face_system.train_single_person(person_name, progress_callback)
             # Only release lock after training AND saving is complete
@@ -2691,19 +2695,38 @@ class DoorEntryKiosk:
         self.is_training = False
         self.reg_process_locked = False  # NOW we can release the lock - everything is done
         
-        if success:
-            self.reg_count_label.config(text=f"✓ {message}")
-            self.auto_capture_btn.config(text="✓ Complete", bg=Config.COLOR_GRANTED)
-            # Auto-close registration after short delay
-            self.root.after(1500, self.stop_registration)
-        else:
-            self.reg_count_label.config(text=f"✗ {message}")
-            self.auto_capture_btn.config(text="✗ Failed", bg=Config.COLOR_DENIED)
-            self.stop_reg_btn.config(state=tk.NORMAL)
+        # Safely update UI if widgets still exist
+        try:
+            if hasattr(self, 'reg_count_label') and self.reg_count_label.winfo_exists():
+                if success:
+                    self.reg_count_label.config(text=f"✓ {message}")
+                else:
+                    self.reg_count_label.config(text=f"✗ {message}")
+            
+            if hasattr(self, 'auto_capture_btn') and self.auto_capture_btn.winfo_exists():
+                if success:
+                    self.auto_capture_btn.config(text="✓ Complete", bg=Config.COLOR_GRANTED)
+                else:
+                    self.auto_capture_btn.config(text="✗ Failed", bg=Config.COLOR_DENIED)
+            
+            if not success and hasattr(self, 'stop_reg_btn') and self.stop_reg_btn.winfo_exists():
+                self.stop_reg_btn.config(state=tk.NORMAL)
+            
+            if success:
+                # Auto-close registration after short delay
+                self.root.after(1500, self.stop_registration)
+        except tk.TclError:
+            pass  # Widgets were destroyed
     
     def train_single_person(self, person_name):
         """Train only a single person (incremental training)"""
-        self.reg_count_label.config(text=f"Training {person_name}...")
+        # Safely update label if it exists
+        try:
+            if hasattr(self, 'reg_count_label') and self.reg_count_label.winfo_exists():
+                self.reg_count_label.config(text=f"Training {person_name}...")
+        except tk.TclError:
+            pass
+        
         self.is_training = True  # Pause recognition during training
         
         def training_thread():
@@ -2717,15 +2740,30 @@ class DoorEntryKiosk:
         """Handle single person training completion"""
         self.is_training = False  # Resume recognition
         
+        # Safely update label if it exists
+        try:
+            if hasattr(self, 'reg_count_label') and self.reg_count_label.winfo_exists():
+                if success:
+                    self.reg_count_label.config(text=f"✓ {message}")
+                else:
+                    self.reg_count_label.config(text=f"✗ Training failed")
+                # Reset after a delay
+                self.root.after(3000, self._reset_reg_count_label)
+        except tk.TclError:
+            pass
+        
         if success:
-            self.reg_count_label.config(text=f"✓ {message}")
             messagebox.showinfo("Training Complete", message)
         else:
-            self.reg_count_label.config(text=f"✗ Training failed")
             messagebox.showerror("Training Failed", message)
-        
-        # Reset after a delay
-        self.root.after(3000, lambda: self.reg_count_label.config(text="0 photos captured"))
+    
+    def _reset_reg_count_label(self):
+        """Safely reset the registration count label"""
+        try:
+            if hasattr(self, 'reg_count_label') and self.reg_count_label.winfo_exists():
+                self.reg_count_label.config(text="0 photos")
+        except tk.TclError:
+            pass
     
     def start_training(self):
         """Start model training"""
