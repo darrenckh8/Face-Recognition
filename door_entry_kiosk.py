@@ -1238,19 +1238,6 @@ class DoorEntryKiosk:
                     # Just display the frame without overlays
                     pass
                 
-                # Calculate and display FPS
-                self.fps_counter += 1
-                elapsed = time.time() - self.fps_start_time
-                if elapsed >= 1.0:
-                    self.current_fps = self.fps_counter / elapsed
-                    self.fps_counter = 0
-                    self.fps_start_time = time.time()
-                
-                # Draw performance overlay
-                fps_text = f"FPS: {self.current_fps:.1f}"
-                cv2.putText(display_frame, fps_text, (display_frame.shape[1] - 120, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
                 # Periodic cache cleanup to prevent memory buildup
                 now = time.time()
                 if now - self.last_cache_cleanup > self.cache_cleanup_interval:
@@ -1554,7 +1541,7 @@ class DoorEntryKiosk:
         self.admin_video_label.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         
         # Store fixed size for scaling calculations
-        self.admin_video_size = (636, 476)
+        self.admin_video_size = (640, 480)
         
         # === SETUP PANEL (shown before starting) ===
         self.reg_setup_panel = tk.Frame(main_container, bg=Config.COLOR_CARD,
