@@ -1545,7 +1545,7 @@ class DoorEntryKiosk:
             relief=tk.FLAT,
             highlightbackground=Config.COLOR_BORDER,
             highlightthickness=1,
-            width=18
+            width=30
         )
         self.reg_name_entry.pack(side=tk.LEFT, padx=(8, 10), ipady=3)
         
@@ -1561,7 +1561,7 @@ class DoorEntryKiosk:
             cursor="hand2",
             command=self.start_registration
         )
-        self.start_reg_btn.pack(side=tk.LEFT, ipady=3, ipadx=10)
+        self.start_reg_btn.pack(side=tk.RIGHT, ipady=3, ipadx=10)
         
         # === CAPTURE PANEL (shown during registration) ===
         self.reg_capture_panel = tk.Frame(main_container, bg=Config.COLOR_CARD,
@@ -1923,7 +1923,7 @@ class DoorEntryKiosk:
         """Populate the log listbox with entries"""
         self.admin_log_listbox.delete(0, tk.END)
         for entry in entries:
-            timestamp = datetime.fromisoformat(entry['timestamp']).strftime("%b %d, %H:%M")
+            timestamp = datetime.fromisoformat(entry['timestamp']).strftime("%b %d, %H:%M:%S")
             status_icon = "●" if entry['access_granted'] else "○"
             self.admin_log_listbox.insert(tk.END, f"  {status_icon}  {timestamp}    {entry['name']}")
     
