@@ -885,12 +885,13 @@ class DoorEntryKiosk:
         # Auto-capture Face ID style registration
         self.auto_capture_mode = False
         self.auto_capture_target = 100  # Target number of photos
-        self.auto_capture_interval = 0.15  # Seconds between captures
+        self.auto_capture_interval = 0.2  # Seconds between captures
         self.last_auto_capture = 0
-        self.captured_poses = []  # List of (yaw, pitch) for captured photos
-        self.current_pose = None  # Current detected head pose
-        self.pose_zones_captured = {}  # Track which pose zones have been captured
-        self.pose_guidance_text = ""
+        
+        # Face ID style zone tracking (based on face position, not pose estimation)
+        self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
+        self.current_zone = 'center'
+        self.zone_targets = {'center': 30, 'left': 18, 'right': 18, 'up': 17, 'down': 17}  # = 100 total
         
         # Performance tracking
         self.fps_counter = 0
@@ -1214,65 +1215,71 @@ class DoorEntryKiosk:
                                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1)
                 
                 elif self.registration_mode:
-                    # Registration mode - use robust detection for better angle coverage
-                    # Combined detection tries fast Haar first, then robust dlib
+                    # Registration mode - use robust detection
                     faces = self.face_system.detect_faces_combined(frame)
                     
                     frame_height, frame_width = display_frame.shape[:2]
+                    frame_center_x = frame_width // 2
+                    frame_center_y = frame_height // 2
                     
                     if len(faces) == 1:
                         top, right, bottom, left = faces[0]
                         
-                        # Estimate head pose
-                        pose = self.face_system.estimate_head_pose(frame, faces[0])
-                        self.current_pose = pose
+                        # Calculate face center
+                        face_center_x = (left + right) / 2
+                        face_center_y = (top + bottom) / 2
                         
-                        if pose:
-                            yaw, pitch = pose
+                        # Determine zone based on face position in frame (very simple & reliable)
+                        # This works by where the user positions their face, not head pose
+                        offset_x = (face_center_x - frame_center_x) / (frame_width / 2)  # -1 to 1
+                        offset_y = (face_center_y - frame_center_y) / (frame_height / 2)  # -1 to 1
+                        
+                        # Determine zone with generous thresholds
+                        zone_threshold = 0.15  # Very forgiving
+                        if abs(offset_x) < zone_threshold and abs(offset_y) < zone_threshold:
+                            self.current_zone = 'center'
+                        elif abs(offset_x) > abs(offset_y):  # Horizontal dominant
+                            self.current_zone = 'left' if offset_x < 0 else 'right'
+                        else:  # Vertical dominant
+                            self.current_zone = 'up' if offset_y < 0 else 'down'
+                        
+                        # Get zone color based on fill status
+                        zone_filled = self.zone_captures.get(self.current_zone, 0) >= self.zone_targets.get(self.current_zone, 0)
+                        box_color = (0, 255, 0) if zone_filled else (0, 255, 255)
+                        
+                        # Draw face box
+                        cv2.rectangle(display_frame, (int(left), int(top)), (int(right), int(bottom)), box_color, 3)
+                        
+                        # Auto-capture logic
+                        if self.auto_capture_mode:
+                            now = time.time()
+                            zone_current = self.zone_captures.get(self.current_zone, 0)
+                            zone_target = self.zone_targets.get(self.current_zone, 0)
                             
-                            # Determine pose zone (8 zones like Face ID)
-                            zone = self.get_pose_zone(yaw, pitch)
-                            
-                            # Auto-capture logic
-                            if self.auto_capture_mode:
-                                now = time.time()
-                                if now - self.last_auto_capture >= self.auto_capture_interval:
-                                    if self.captured_count < self.auto_capture_target:
-                                        # Check if this pose angle is sufficiently different
-                                        if self.should_capture_pose(yaw, pitch):
-                                            filepath = self.face_system.save_face_image(frame, self.registration_name)
-                                            self.captured_count += 1
-                                            self.captured_poses.append((yaw, pitch))
-                                            self.pose_zones_captured[zone] = self.pose_zones_captured.get(zone, 0) + 1
-                                            self.last_auto_capture = now
-                                            self.root.after(0, self.update_registration_ui)
-                                    else:
-                                        # Auto-capture complete
-                                        self.root.after(0, self.complete_auto_registration)
-                            
-                            # Draw pose indicator on frame
-                            self.draw_pose_indicator(display_frame, yaw, pitch, zone)
-                            
-                            # Draw face box with pose-based color
-                            color = (0, 255, 0) if zone in self.pose_zones_captured else (0, 255, 255)
-                            cv2.rectangle(display_frame, (int(left), int(top)), (int(right), int(bottom)), color, 3)
-                            
-                            # Guidance text
-                            guidance = self.get_pose_guidance()
-                            cv2.putText(display_frame, guidance, (frame_width // 2 - 150, frame_height - 40),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                        else:
-                            cv2.rectangle(display_frame, (int(left), int(top)), (int(right), int(bottom)), (0, 255, 255), 3)
+                            # Capture if interval passed AND zone needs more photos
+                            if now - self.last_auto_capture >= self.auto_capture_interval:
+                                if self.captured_count < self.auto_capture_target and zone_current < zone_target:
+                                    filepath = self.face_system.save_face_image(frame, self.registration_name)
+                                    self.captured_count += 1
+                                    self.zone_captures[self.current_zone] = zone_current + 1
+                                    self.last_auto_capture = now
+                                    self.root.after(0, self.update_registration_ui)
+                                elif self.captured_count >= self.auto_capture_target:
+                                    self.root.after(0, self.complete_auto_registration)
+                        
+                        # Flash on capture
+                        if self.auto_capture_mode and (time.time() - self.last_auto_capture) < 0.08:
+                            cv2.rectangle(display_frame, (0, 0), (frame_width, frame_height), (0, 255, 0), 12)
                     
                     elif len(faces) == 0:
-                        cv2.putText(display_frame, "No face detected - position your face", (frame_width // 2 - 180, frame_height // 2),
+                        cv2.putText(display_frame, "Position your face in frame", (frame_width // 2 - 150, frame_height // 2),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
                     else:
-                        cv2.putText(display_frame, "Multiple faces detected - only one person", (frame_width // 2 - 200, frame_height // 2),
+                        cv2.putText(display_frame, "Only one face please", (frame_width // 2 - 100, frame_height // 2),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                     
-                    # Show registration info overlay
-                    self.draw_registration_overlay(display_frame)
+                    # Draw Face ID style overlay
+                    self.draw_faceid_overlay(display_frame)
                 
                 # Calculate and display FPS
                 self.fps_counter += 1
@@ -2257,8 +2264,7 @@ class DoorEntryKiosk:
         self.registration_name = name
         self.captured_count = 0
         self.auto_capture_mode = False
-        self.captured_poses = []
-        self.pose_zones_captured = {}
+        self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
         
         self.start_reg_btn.config(state=tk.DISABLED)
         self.capture_btn.config(state=tk.NORMAL)
@@ -2284,12 +2290,11 @@ class DoorEntryKiosk:
         self.registration_mode = False
         self.registration_name = ""
         self.auto_capture_mode = False
-        self.captured_poses = []
-        self.pose_zones_captured = {}
+        self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
         
         self.start_reg_btn.config(state=tk.NORMAL)
         self.capture_btn.config(state=tk.DISABLED)
-        self.auto_capture_btn.config(state=tk.DISABLED)
+        self.auto_capture_btn.config(state=tk.DISABLED, text="⟳ Auto Capture (100 photos)", bg="#5856D6")
         self.stop_reg_btn.config(state=tk.DISABLED)
         self.reg_name_entry.config(state=tk.NORMAL)
         self.reg_name_entry.delete(0, tk.END)
@@ -2309,13 +2314,12 @@ class DoorEntryKiosk:
         
         self.auto_capture_mode = True
         self.last_auto_capture = time.time()
-        self.captured_poses = []
-        self.pose_zones_captured = {}
+        self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
         
         # Update UI
         self.capture_btn.config(state=tk.DISABLED)
-        self.auto_capture_btn.config(text="⏹ Stop Auto Capture", bg=Config.COLOR_DENIED, command=self.stop_auto_capture)
-        self.reg_count_label.config(text="Move your head slowly in a circle...")
+        self.auto_capture_btn.config(text="⏹ Stop", bg=Config.COLOR_DENIED, command=self.stop_auto_capture)
+        self.reg_count_label.config(text="Move face to fill all zones...")
     
     def stop_auto_capture(self):
         """Stop automatic capture"""
@@ -2444,26 +2448,112 @@ class DoorEntryKiosk:
         cv2.putText(frame, progress_text, (bar_x + bar_width + 10, bar_y + 8),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     
-    def draw_registration_overlay(self, frame):
-        """Draw registration mode overlay"""
+    def draw_faceid_overlay(self, frame):
+        """Draw Face ID style visual guide with zone indicators"""
         frame_height, frame_width = frame.shape[:2]
+        center_x, center_y = frame_width // 2, frame_height // 2
         
-        # Mode indicator
-        mode_text = "AUTO CAPTURE" if self.auto_capture_mode else "REGISTRATION"
-        mode_color = (200, 100, 200) if self.auto_capture_mode else (0, 255, 255)
+        # Draw circular Face ID style guide in center
+        guide_radius = min(frame_width, frame_height) // 4
+        
+        # Outer circle (face positioning guide)
+        cv2.circle(frame, (center_x, center_y), guide_radius, (100, 100, 100), 2)
+        
+        # Zone indicator positions (around the circle)
+        zone_positions = {
+            'up': (center_x, center_y - guide_radius - 30),
+            'down': (center_x, center_y + guide_radius + 30),
+            'left': (center_x - guide_radius - 30, center_y),
+            'right': (center_x + guide_radius + 30, center_y),
+            'center': (center_x, center_y)
+        }
+        
+        # Draw zone indicators
+        for zone, (zx, zy) in zone_positions.items():
+            current = self.zone_captures.get(zone, 0)
+            target = self.zone_targets.get(zone, 0)
+            
+            # Calculate fill percentage
+            fill_pct = min(1.0, current / target) if target > 0 else 1.0
+            
+            # Colors: gray unfilled, yellow partial, green complete
+            if fill_pct >= 1.0:
+                color = (0, 255, 0)  # Green - complete
+            elif fill_pct > 0:
+                color = (0, 255, 255)  # Yellow - partial
+            else:
+                color = (80, 80, 80)  # Gray - empty
+            
+            # Highlight current zone
+            radius = 18 if zone == self.current_zone else 12
+            thickness = -1 if fill_pct >= 1.0 else 2
+            
+            if zone == 'center':
+                # Center is a ring, not a dot
+                cv2.circle(frame, (zx, zy), radius + 5, color, 2)
+            else:
+                cv2.circle(frame, (zx, zy), radius, color, thickness)
+                # Show count
+                if fill_pct < 1.0:
+                    cv2.putText(frame, str(current), (zx - 8, zy + 5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
+        # Header
+        mode_text = "FACE ID CAPTURE" if self.auto_capture_mode else "REGISTRATION"
         cv2.putText(frame, mode_text, (15, 35),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, mode_color, 2)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 100, 200), 2)
+        cv2.putText(frame, self.registration_name, (15, 65),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
-        # Person name
-        cv2.putText(frame, f"Name: {self.registration_name}", (15, 70),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        # Progress bar at bottom
+        if self.auto_capture_mode:
+            bar_width = 350
+            bar_height = 14
+            bar_x = center_x - bar_width // 2
+            bar_y = frame_height - 45
+            
+            progress = self.captured_count / self.auto_capture_target
+            
+            # Background
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (40, 40, 40), -1)
+            # Fill
+            fill_width = int(bar_width * progress)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), (0, 200, 0), -1)
+            # Border
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (100, 100, 100), 1)
+            
+            # Count text
+            count_text = f"{self.captured_count}/{self.auto_capture_target}"
+            cv2.putText(frame, count_text, (bar_x + bar_width + 10, bar_y + 12),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # Guidance text
+            zones_complete = sum(1 for z in self.zone_captures if self.zone_captures[z] >= self.zone_targets.get(z, 0))
+            if zones_complete < 5:
+                # Find which zone needs photos
+                for zone in ['center', 'left', 'right', 'up', 'down']:
+                    if self.zone_captures.get(zone, 0) < self.zone_targets.get(zone, 0):
+                        guidance = {
+                            'center': "Look at the center",
+                            'left': "Move face LEFT",
+                            'right': "Move face RIGHT", 
+                            'up': "Move face UP",
+                            'down': "Move face DOWN"
+                        }
+                        cv2.putText(frame, guidance.get(zone, ""), (center_x - 80, bar_y - 15),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                        break
+            else:
+                cv2.putText(frame, "All angles captured!", (center_x - 90, bar_y - 15),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
     
     def update_registration_ui(self):
         """Update the registration UI with current progress"""
-        zones_filled = len(self.pose_zones_captured)
         if self.auto_capture_mode:
+            zones_done = sum(1 for z in self.zone_captures 
+                           if self.zone_captures[z] >= self.zone_targets.get(z, 0))
             self.reg_count_label.config(
-                text=f"{self.captured_count}/{self.auto_capture_target} photos • {zones_filled}/5 angles"
+                text=f"{self.captured_count} photos • {zones_done}/5 zones"
             )
         else:
             self.reg_count_label.config(text=f"{self.captured_count} photos captured")
@@ -2472,17 +2562,19 @@ class DoorEntryKiosk:
         """Called when auto-capture reaches target"""
         self.auto_capture_mode = False
         self.capture_btn.config(state=tk.NORMAL)
-        self.auto_capture_btn.config(text="✓ Complete!", bg=Config.COLOR_GRANTED, state=tk.DISABLED)
+        self.auto_capture_btn.config(text="✓ Done!", bg=Config.COLOR_GRANTED, state=tk.DISABLED)
         
-        zones_filled = len(self.pose_zones_captured)
+        zones_done = sum(1 for z in self.zone_captures 
+                        if self.zone_captures[z] >= self.zone_targets.get(z, 0))
+        
         self.reg_count_label.config(
-            text=f"✓ {self.captured_count} photos from {zones_filled}/5 angles"
+            text=f"✓ {self.captured_count} photos from {zones_done} angles"
         )
         
         messagebox.showinfo(
-            "Auto Capture Complete", 
-            f"Successfully captured {self.captured_count} photos covering {zones_filled}/5 head pose angles.\n\n"
-            "Click 'Stop' to finish and train the model."
+            "Capture Complete", 
+            f"Captured {self.captured_count} photos from {zones_done}/5 angles.\n\n"
+            "Click 'Stop' to finish and train."
         )
     
     # ==================== END AUTO-CAPTURE ====================
