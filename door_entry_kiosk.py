@@ -1119,7 +1119,7 @@ class DoorEntryKiosk:
         # Center - Company/Building name
         self.title_label = tk.Label(
             bottom_bar,
-            text="SECURE ENTRY",
+            text="EDUWEL",
             font=(Config.FONT_FAMILY, 10, "bold"),
             fg=Config.COLOR_TEXT_TERTIARY,
             bg=Config.COLOR_BG,
@@ -1130,7 +1130,7 @@ class DoorEntryKiosk:
         # Right side - User count
         self.info_label = tk.Label(
             bottom_bar,
-            text=f"{len(self.face_system.get_trained_persons())} users",
+            text=f"{len(self.face_system.get_trained_persons())} Users",
             font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_TEXT_TERTIARY,
             bg=Config.COLOR_BG
@@ -1861,7 +1861,7 @@ class DoorEntryKiosk:
         
         tk.Label(
             header,
-            text="Registered Users",
+            text="Users",
             font=(Config.FONT_FAMILY, 10, "bold"),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_BG
