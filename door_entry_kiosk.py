@@ -786,7 +786,7 @@ class DoorEntryKiosk:
             self.root.attributes('-fullscreen', True)
             self.root.bind('<Escape>', lambda e: self.toggle_fullscreen())
         else:
-            self.root.geometry("1280x800")
+            self.root.geometry("480x800")
             self.root.resizable(False, False)
         
         self.root.configure(bg=Config.COLOR_BG)
@@ -1423,7 +1423,7 @@ class DoorEntryKiosk:
         if Config.FULLSCREEN:
             self.root.attributes('-fullscreen', True)
         else:
-            self.root.geometry("1280x800")
+            self.root.geometry("480x800")
         
         # Create admin frame in the same window
         self.admin_frame = tk.Frame(self.root, bg=Config.COLOR_BG)
@@ -2653,7 +2653,7 @@ class DoorEntryKiosk:
         if Config.FULLSCREEN:
             self.root.attributes('-fullscreen', True)
         else:
-            self.root.geometry("1280x800")
+            self.root.geometry("480x800")
         
         self.main_frame.pack(fill=tk.BOTH, expand=True)
         
