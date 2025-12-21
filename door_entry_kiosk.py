@@ -1901,7 +1901,7 @@ class DoorEntryKiosk:
         
         tk.Label(
             header,
-            text="Users",
+            text="Registered Users",
             font=(Config.FONT_FAMILY, 10, "bold"),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_BG
