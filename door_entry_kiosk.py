@@ -2369,7 +2369,10 @@ class DoorEntryKiosk:
         self.refresh_manage_list()
         
         # Auto-train the new person if option is enabled and photos were captured
-        if hasattr(self, 'auto_train_var') and self.auto_train_var.get() and captured > 0 and person_name:
+        # Skip if already trained via auto-capture flow
+        already_trained = getattr(self, 'already_trained', False)
+        self.already_trained = False  # Reset for next registration
+        if not already_trained and hasattr(self, 'auto_train_var') and self.auto_train_var.get() and captured > 0 and person_name:
             self.train_single_person(person_name)
     
     # ==================== AUTO-CAPTURE FACE ID STYLE ====================
@@ -2713,6 +2716,8 @@ class DoorEntryKiosk:
                 self.stop_reg_btn.config(state=tk.NORMAL)
             
             if success:
+                # Set flag to prevent double-training in stop_registration
+                self.already_trained = True
                 # Auto-close registration after short delay
                 self.root.after(1500, self.stop_registration)
         except tk.TclError:
