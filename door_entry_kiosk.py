@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 import pickle
 import numpy as np
-from PIL import Image, ImageTk, ImageDraw, ImageFont
+from PIL import Image, ImageTk
 import json
 
 # Try to import face_recognition - required for this application
@@ -382,10 +382,6 @@ class CameraManager:
                 return self.current_frame.copy()
         return None
     
-    def capture_latest_frame(self):
-        """Get the latest captured frame - same as capture_frame with threaded capture"""
-        return self.capture_frame()
-    
     def stop(self):
         """Stop capture thread and release the camera"""
         self.is_running = False
@@ -675,73 +671,6 @@ class FaceRecognitionSystem:
             faces = self.detect_faces_robust(frame)
         
         return faces
-    
-    def estimate_head_pose(self, frame, face_location):
-        """
-        Estimate head pose (yaw, pitch) using facial landmarks.
-        Returns (yaw, pitch) in degrees, or None if landmarks not detected.
-        Yaw: negative = looking left, positive = looking right
-        Pitch: negative = looking down, positive = looking up
-        """
-        top, right, bottom, left = face_location
-        
-        # Get facial landmarks for this face
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        face_locations = [(int(top), int(right), int(bottom), int(left))]
-        
-        try:
-            landmarks_list = face_recognition.face_landmarks(rgb_frame, face_locations)
-            if not landmarks_list:
-                return None
-            
-            landmarks = landmarks_list[0]
-            
-            # Get key points for pose estimation
-            nose_bridge = landmarks.get('nose_bridge', [])
-            nose_tip = landmarks.get('nose_tip', [])
-            left_eye = landmarks.get('left_eye', [])
-            right_eye = landmarks.get('right_eye', [])
-            
-            if not all([nose_bridge, nose_tip, left_eye, right_eye]):
-                return None
-            
-            # Calculate center points
-            left_eye_center = np.mean(left_eye, axis=0)
-            right_eye_center = np.mean(right_eye, axis=0)
-            nose_bridge_top = np.array(nose_bridge[0])
-            nose_tip_center = np.mean(nose_tip, axis=0)
-            
-            # Eye center
-            eye_center = (left_eye_center + right_eye_center) / 2
-            
-            # Estimate yaw (left-right rotation)
-            # Compare nose tip horizontal position relative to eye center
-            face_width = right_eye_center[0] - left_eye_center[0]
-            if face_width > 0:
-                nose_offset = (nose_tip_center[0] - eye_center[0]) / face_width
-                yaw = nose_offset * 60  # Scale to approximate degrees
-            else:
-                yaw = 0
-            
-            # Estimate pitch (up-down rotation)
-            # Compare nose tip vertical position relative to nose bridge
-            face_height = bottom - top
-            if face_height > 0:
-                # Vertical distance from nose bridge to nose tip
-                nose_length = nose_tip_center[1] - nose_bridge_top[1]
-                expected_nose_length = face_height * 0.25
-                if expected_nose_length > 0:
-                    pitch_ratio = (nose_length - expected_nose_length) / expected_nose_length
-                    pitch = -pitch_ratio * 45  # Scale to approximate degrees
-                else:
-                    pitch = 0
-            else:
-                pitch = 0
-            
-            return (float(yaw), float(pitch))
-            
-        except Exception as e:
-            return None
     
     def recognize_faces(self, frame, force_recognition=False):
         """Detect and recognize faces in a frame with caching and optimization"""
@@ -1161,8 +1090,8 @@ class DoorEntryKiosk:
             while self.is_running:
                 loop_start = time.time()
                 
-                # Use capture_latest_frame to get the newest frame and reduce latency
-                frame = self.camera.capture_latest_frame()
+                # Get the newest frame from the camera
+                frame = self.camera.capture_frame()
                 if frame is None:
                     continue
                 
@@ -2405,126 +2334,6 @@ class DoorEntryKiosk:
         self.capture_btn.config(state=tk.NORMAL)
         self.auto_capture_btn.config(text="⟳ Auto Capture (100 photos)", bg="#5856D6", command=self.start_auto_capture)
         self.update_registration_ui()
-    
-    def get_pose_zone(self, yaw, pitch):
-        """
-        Determine which of 5 pose zones the current head pose falls into.
-        Simplified zones for more reliable detection.
-        Returns zone name: 'center', 'up', 'down', 'left', 'right'
-        """
-        # Much more forgiving thresholds
-        yaw_threshold = 6  # Reduced from 12
-        pitch_threshold = 5  # Reduced from 10
-        
-        # Determine primary direction based on which angle is larger
-        if abs(yaw) < yaw_threshold and abs(pitch) < pitch_threshold:
-            return 'center'
-        elif abs(pitch) > abs(yaw):  # Pitch is dominant
-            if pitch > 0:
-                return 'up'
-            else:
-                return 'down'
-        else:  # Yaw is dominant
-            if yaw < 0:
-                return 'left'
-            else:
-                return 'right'
-    
-    def should_capture_pose(self, yaw, pitch):
-        """
-        Determine if we should capture at this pose.
-        Ensures variety in captured angles.
-        """
-        min_angle_diff = 3  # Reduced from 5 - more forgiving
-        
-        # Always capture first several photos
-        if len(self.captured_poses) < 20:
-            return True
-        
-        # Check if this pose is different enough from recent captures
-        for prev_yaw, prev_pitch in self.captured_poses[-10:]:  # Check fewer recent captures
-            if abs(yaw - prev_yaw) < min_angle_diff and abs(pitch - prev_pitch) < min_angle_diff:
-                return False
-        
-        return True
-    
-    def get_pose_guidance(self):
-        """Get guidance text based on which zones need more coverage"""
-        # Simplified 5-zone targets
-        zone_targets = {
-            'center': 25, 'up': 20, 'down': 20, 'left': 20, 'right': 20
-        }
-        
-        # Find zones that need more photos
-        needed_zones = []
-        for zone, target in zone_targets.items():
-            captured = self.pose_zones_captured.get(zone, 0)
-            if captured < target:
-                needed_zones.append(zone)
-        
-        if not needed_zones:
-            return "Great coverage! Keep moving for more variety"
-        
-        # Prioritize guidance
-        zone_guidance = {
-            'center': "Look straight at camera",
-            'up': "Tilt chin up slightly",
-            'down': "Tilt chin down slightly", 
-            'left': "Turn head left",
-            'right': "Turn head right"
-        }
-        
-        # Return guidance for first needed zone
-        return zone_guidance.get(needed_zones[0], "Move your head slowly")
-    
-    def draw_pose_indicator(self, frame, yaw, pitch, zone):
-        """Draw a visual indicator showing current head pose and progress"""
-        frame_height, frame_width = frame.shape[:2]
-        
-        # Draw pose compass in top-right corner
-        compass_size = 80
-        compass_x = frame_width - compass_size - 20
-        compass_y = 60
-        
-        # Draw compass background circle
-        cv2.circle(frame, (compass_x, compass_y), compass_size // 2, (50, 50, 50), -1)
-        cv2.circle(frame, (compass_x, compass_y), compass_size // 2, (100, 100, 100), 2)
-        
-        # Draw zone indicators (5 simplified zones)
-        zones_pos = {
-            'up': (0, -22),
-            'left': (-22, 0), 'center': (0, 0), 'right': (22, 0),
-            'down': (0, 22)
-        }
-        
-        for z, (dx, dy) in zones_pos.items():
-            color = (0, 255, 0) if z in self.pose_zones_captured else (80, 80, 80)
-            pos = (compass_x + dx, compass_y + dy)
-            radius = 8 if z == 'center' else 5
-            cv2.circle(frame, pos, radius, color, -1)
-        
-        # Draw current pose position (red dot)
-        pose_x = int(compass_x + (yaw / 30) * 30)  # Scale yaw to compass
-        pose_y = int(compass_y - (pitch / 20) * 25)  # Scale pitch to compass
-        cv2.circle(frame, (pose_x, pose_y), 6, (0, 0, 255), -1)
-        cv2.circle(frame, (pose_x, pose_y), 6, (255, 255, 255), 2)
-        
-        # Draw progress bar
-        progress = min(1.0, self.captured_count / self.auto_capture_target)
-        bar_width = 200
-        bar_height = 8
-        bar_x = frame_width // 2 - bar_width // 2
-        bar_y = 25
-        
-        # Background
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
-        # Progress
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + int(bar_width * progress), bar_y + bar_height), (0, 255, 0), -1)
-        
-        # Progress text
-        progress_text = f"{self.captured_count}/{self.auto_capture_target}"
-        cv2.putText(frame, progress_text, (bar_x + bar_width + 10, bar_y + 8),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     
     def draw_faceid_overlay(self, frame):
         """Draw Face ID style visual guide with zone indicators"""
