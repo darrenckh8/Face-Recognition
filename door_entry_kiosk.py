@@ -893,6 +893,9 @@ class DoorEntryKiosk:
         self.current_zone = 'center'
         self.zone_targets = {'center': 30, 'left': 18, 'right': 18, 'up': 17, 'down': 17}  # = 100 total
         
+        # Training state - prevents concurrent face_recognition access
+        self.is_training = False
+        
         # Performance tracking
         self.fps_counter = 0
         self.fps_start_time = time.time()
@@ -1166,53 +1169,58 @@ class DoorEntryKiosk:
                 display_frame = frame.copy()
                 
                 if self.is_scanning and not self.registration_mode:
-                    # Perform optimized face recognition
-                    _, results = self.face_system.recognize_faces(frame)
-                    
-                    # Track performance metrics
-                    self.faces_detected = len(results)
-                    cache_hits_this_frame = sum(1 for r in results if r.get('from_cache', False))
-                    cache_misses_this_frame = len(results) - cache_hits_this_frame
-                    self.cache_hits += cache_hits_this_frame
-                    self.cache_misses += cache_misses_this_frame
-                    
-                    for result in results:
-                        top, right, bottom, left = result['location']
-                        name = result['name']
-                        confidence = result['confidence']
-                        from_cache = result.get('from_cache', False)
+                    # Skip recognition if training is in progress (prevents segfault)
+                    if self.is_training:
+                        cv2.putText(display_frame, "Training in progress...", (50, 50),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+                    else:
+                        # Perform optimized face recognition
+                        _, results = self.face_system.recognize_faces(frame)
                         
-                        # Determine access
-                        if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
-                            # Check cooldown
-                            now = time.time()
-                            if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
-                                self.last_access[name] = now
-                                
-                                # Grant access
-                                self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
+                        # Track performance metrics
+                        self.faces_detected = len(results)
+                        cache_hits_this_frame = sum(1 for r in results if r.get('from_cache', False))
+                        cache_misses_this_frame = len(results) - cache_hits_this_frame
+                        self.cache_hits += cache_hits_this_frame
+                        self.cache_misses += cache_misses_this_frame
+                        
+                        for result in results:
+                            top, right, bottom, left = result['location']
+                            name = result['name']
+                            confidence = result['confidence']
+                            from_cache = result.get('from_cache', False)
                             
-                            color = (0, 200, 80)  # Green
-                        else:
-                            # Check if we should log denied access (only for non-cached results)
-                            if name == "Unknown" and self.current_status == "scanning" and not from_cache:
+                            # Determine access
+                            if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
+                                # Check cooldown
                                 now = time.time()
-                                if "Unknown" not in self.last_access or (now - self.last_access["Unknown"]) > Config.COOLDOWN_SECONDS:
-                                    self.last_access["Unknown"] = now
-                                    self.root.after(0, self.deny_access)
+                                if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
+                                    self.last_access[name] = now
+                                    
+                                    # Grant access
+                                    self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
+                                
+                                color = (0, 200, 80)  # Green
+                            else:
+                                # Check if we should log denied access (only for non-cached results)
+                                if name == "Unknown" and self.current_status == "scanning" and not from_cache:
+                                    now = time.time()
+                                    if "Unknown" not in self.last_access or (now - self.last_access["Unknown"]) > Config.COOLDOWN_SECONDS:
+                                        self.last_access["Unknown"] = now
+                                        self.root.after(0, self.deny_access)
+                                
+                                color = (0, 0, 255)  # Red
                             
-                            color = (0, 0, 255)  # Red
-                        
-                        # Draw face box (thinner for cached results)
-                        box_thickness = 2 if from_cache else 3
-                        cv2.rectangle(display_frame, (left, top), (right, bottom), color, box_thickness)
-                        
-                        # Draw label with cache indicator
-                        cache_indicator = " [C]" if from_cache else ""
-                        label = f"{name} ({confidence:.0%}){cache_indicator}" if name != "Unknown" else f"Unknown{cache_indicator}"
-                        cv2.rectangle(display_frame, (left, top - 40), (right, top), color, cv2.FILLED)
-                        cv2.putText(display_frame, label, (left + 10, top - 10),
-                                   cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1)
+                            # Draw face box (thinner for cached results)
+                            box_thickness = 2 if from_cache else 3
+                            cv2.rectangle(display_frame, (left, top), (right, bottom), color, box_thickness)
+                            
+                            # Draw label with cache indicator
+                            cache_indicator = " [C]" if from_cache else ""
+                            label = f"{name} ({confidence:.0%}){cache_indicator}" if name != "Unknown" else f"Unknown{cache_indicator}"
+                            cv2.rectangle(display_frame, (left, top - 40), (right, top), color, cv2.FILLED)
+                            cv2.putText(display_frame, label, (left + 10, top - 10),
+                                       cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1)
                 
                 elif self.registration_mode:
                     # Registration mode - use robust detection
@@ -2582,6 +2590,7 @@ class DoorEntryKiosk:
     def train_single_person(self, person_name):
         """Train only a single person (incremental training)"""
         self.reg_count_label.config(text=f"Training {person_name}...")
+        self.is_training = True  # Pause recognition during training
         
         def training_thread():
             success, message = self.face_system.train_single_person(person_name)
@@ -2592,6 +2601,8 @@ class DoorEntryKiosk:
     
     def single_training_complete(self, success, message):
         """Handle single person training completion"""
+        self.is_training = False  # Resume recognition
+        
         if success:
             self.reg_count_label.config(text=f"✓ {message}")
             messagebox.showinfo("Training Complete", message)
@@ -2607,6 +2618,7 @@ class DoorEntryKiosk:
         self.train_btn.config(state=tk.DISABLED)
         self.train_progress['value'] = 0
         self.train_status_label.config(text="Training in progress...")
+        self.is_training = True  # Pause recognition during training
         
         def training_thread():
             def progress_callback(current, total, filepath):
@@ -2623,6 +2635,7 @@ class DoorEntryKiosk:
     
     def training_complete(self, success, message):
         """Handle training completion"""
+        self.is_training = False  # Resume recognition
         self.train_btn.config(state=tk.NORMAL)
         self.train_progress['value'] = 100 if success else 0
         self.train_status_label.config(text=message)
