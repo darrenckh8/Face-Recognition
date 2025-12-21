@@ -1070,7 +1070,14 @@ class DoorEntryKiosk:
             update_bg(Config.COLOR_DENIED, "#FFFFFF", "#FFFFFF", "#FFEBEE")
             self.root.after(2500, lambda: self.set_status("scanning"))
             
-        else:  # scanning
+        elif status == "active_scanning":
+            self.status_icon_label.config(text="◎")
+            self.status_text_label.config(text="Scanning...")
+            self.status_detail_label.config(text="Please hold still")
+            update_bg(Config.COLOR_CARD, Config.COLOR_SCANNING, Config.COLOR_TEXT, Config.COLOR_TEXT_SECONDARY)
+            self.status_card.config(highlightbackground=Config.COLOR_SCANNING)
+            
+        else:  # scanning (ready state)
             self.status_icon_label.config(text="◉")
             self.status_text_label.config(text="Ready to Scan")
             self.status_detail_label.config(text="Look at the camera")
@@ -1114,8 +1121,13 @@ class DoorEntryKiosk:
                         self.cache_hits += cache_hits_this_frame
                         self.cache_misses += cache_misses_this_frame
                         
+                        # Update status based on whether faces are detected
+                        if len(results) > 0 and self.current_status not in ("granted", "denied"):
+                            self.root.after(0, lambda: self.set_status("active_scanning"))
+                        elif len(results) == 0 and self.current_status == "active_scanning":
+                            self.root.after(0, lambda: self.set_status("scanning"))
+                        
                         for result in results:
-                            top, right, bottom, left = result['location']
                             name = result['name']
                             confidence = result['confidence']
                             from_cache = result.get('from_cache', False)
@@ -1129,28 +1141,13 @@ class DoorEntryKiosk:
                                     
                                     # Grant access
                                     self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
-                                
-                                color = (0, 200, 80)  # Green
                             else:
                                 # Check if we should log denied access (only for non-cached results)
-                                if name == "Unknown" and self.current_status == "scanning" and not from_cache:
+                                if name == "Unknown" and self.current_status in ("scanning", "active_scanning") and not from_cache:
                                     now = time.time()
                                     if "Unknown" not in self.last_access or (now - self.last_access["Unknown"]) > Config.COOLDOWN_SECONDS:
                                         self.last_access["Unknown"] = now
                                         self.root.after(0, self.deny_access)
-                                
-                                color = (0, 0, 255)  # Red
-                            
-                            # Draw face box (thinner for cached results)
-                            box_thickness = 2 if from_cache else 3
-                            cv2.rectangle(display_frame, (left, top), (right, bottom), color, box_thickness)
-                            
-                            # Draw label with cache indicator
-                            cache_indicator = " [C]" if from_cache else ""
-                            label = f"{name} ({confidence:.0%}){cache_indicator}" if name != "Unknown" else f"Unknown{cache_indicator}"
-                            cv2.rectangle(display_frame, (left, top - 40), (right, top), color, cv2.FILLED)
-                            cv2.putText(display_frame, label, (left + 10, top - 10),
-                                       cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1)
                 
                 elif self.registration_mode:
                     # Registration mode - use robust detection only when actively capturing
