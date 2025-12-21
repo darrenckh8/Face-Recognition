@@ -870,34 +870,34 @@ class DoorEntryKiosk:
         self.main_frame.pack(fill=tk.BOTH, expand=True)
         
         # ===== TOP BAR - Minimal status bar =====
-        top_bar = tk.Frame(self.main_frame, bg=Config.COLOR_BG, height=60)
-        top_bar.pack(fill=tk.X, padx=30, pady=(20, 0))
+        top_bar = tk.Frame(self.main_frame, bg=Config.COLOR_BG, height=40)
+        top_bar.pack(fill=tk.X, padx=15, pady=(10, 0))
         top_bar.pack_propagate(False)
         
         # Time display - left side, elegant
         self.time_label = tk.Label(
             top_bar,
             text="",
-            font=(Config.FONT_FAMILY, 16),
+            font=(Config.FONT_FAMILY, 12),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_BG
         )
-        self.time_label.pack(side=tk.LEFT, pady=15)
+        self.time_label.pack(side=tk.LEFT, pady=8)
         self.update_time()
         
         # Live indicator - right side
         self.fps_indicator = tk.Label(
             top_bar,
             text="● LIVE",
-            font=(Config.FONT_FAMILY, 11, "bold"),
+            font=(Config.FONT_FAMILY, 9, "bold"),
             fg=Config.COLOR_GRANTED,
             bg=Config.COLOR_BG
         )
-        self.fps_indicator.pack(side=tk.RIGHT, pady=15)
+        self.fps_indicator.pack(side=tk.RIGHT, pady=8)
         
         # ===== CENTER CONTENT - Camera and Status =====
         center_frame = tk.Frame(self.main_frame, bg=Config.COLOR_BG)
-        center_frame.pack(fill=tk.BOTH, expand=True, padx=30, pady=20)
+        center_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
         
         # Camera feed - large, centered, rounded appearance
         camera_wrapper = tk.Frame(center_frame, bg=Config.COLOR_BG)
@@ -913,9 +913,9 @@ class DoorEntryKiosk:
         self.video_container.pack()
         self.video_container.pack_propagate(False)
         
-        # Fixed video size for consistent UI
-        video_width = 640
-        video_height = 480
+        # Fixed video size for consistent UI (scaled for 480px window)
+        video_width = 440
+        video_height = 330
         self.video_container.config(width=video_width, height=video_height)
         
         self.video_label = tk.Label(self.video_container, bg="#000000")
@@ -924,7 +924,7 @@ class DoorEntryKiosk:
         # ===== STATUS OVERLAY - Floating status badge =====
         # This sits below the camera
         status_frame = tk.Frame(camera_wrapper, bg=Config.COLOR_BG)
-        status_frame.pack(pady=(25, 0))
+        status_frame.pack(pady=(15, 0))
         
         # Status card - pill shaped appearance
         self.status_card = tk.Frame(
@@ -936,18 +936,18 @@ class DoorEntryKiosk:
         self.status_card.pack()
         
         status_inner = tk.Frame(self.status_card, bg=Config.COLOR_CARD)
-        status_inner.pack(padx=40, pady=20)
+        status_inner.pack(padx=20, pady=12)
         self.status_frame = status_inner
         
         # Horizontal status layout
         self.status_icon_label = tk.Label(
             status_inner,
             text="◉",
-            font=(Config.FONT_FAMILY, 36),
+            font=(Config.FONT_FAMILY, 24),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_CARD
         )
-        self.status_icon_label.pack(side=tk.LEFT, padx=(0, 15))
+        self.status_icon_label.pack(side=tk.LEFT, padx=(0, 10))
         
         status_text_frame = tk.Frame(status_inner, bg=Config.COLOR_CARD)
         status_text_frame.pack(side=tk.LEFT)
@@ -955,7 +955,7 @@ class DoorEntryKiosk:
         self.status_text_label = tk.Label(
             status_text_frame,
             text="Ready to Scan",
-            font=(Config.FONT_FAMILY, 20, "bold"),
+            font=(Config.FONT_FAMILY, 14, "bold"),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_CARD,
             anchor="w"
@@ -965,7 +965,7 @@ class DoorEntryKiosk:
         self.status_detail_label = tk.Label(
             status_text_frame,
             text="Look at the camera",
-            font=(Config.FONT_FAMILY, 13),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD,
             anchor="w"
@@ -976,15 +976,15 @@ class DoorEntryKiosk:
         self.status_text_frame = status_text_frame
         
         # ===== BOTTOM BAR =====
-        bottom_bar = tk.Frame(self.main_frame, bg=Config.COLOR_BG, height=80)
-        bottom_bar.pack(fill=tk.X, side=tk.BOTTOM, padx=30, pady=(0, 25))
+        bottom_bar = tk.Frame(self.main_frame, bg=Config.COLOR_BG, height=50)
+        bottom_bar.pack(fill=tk.X, side=tk.BOTTOM, padx=15, pady=(0, 10))
         bottom_bar.pack_propagate(False)
         
         # Left side - Settings button (subtle)
         self.admin_btn = tk.Button(
             bottom_bar,
             text="⚙",
-            font=(Config.FONT_FAMILY, 20),
+            font=(Config.FONT_FAMILY, 16),
             fg=Config.COLOR_TEXT_TERTIARY,
             bg=Config.COLOR_BG,
             activebackground=Config.COLOR_BG,
@@ -993,28 +993,28 @@ class DoorEntryKiosk:
             cursor="hand2",
             command=self.show_admin_login
         )
-        self.admin_btn.pack(side=tk.LEFT, pady=20)
+        self.admin_btn.pack(side=tk.LEFT, pady=10)
         
         # Center - Company/Building name
         self.title_label = tk.Label(
             bottom_bar,
             text="SECURE ENTRY",
-            font=(Config.FONT_FAMILY, 12, "bold"),
+            font=(Config.FONT_FAMILY, 10, "bold"),
             fg=Config.COLOR_TEXT_TERTIARY,
             bg=Config.COLOR_BG,
             anchor="center"
         )
-        self.title_label.pack(side=tk.LEFT, expand=True, pady=20)
+        self.title_label.pack(side=tk.LEFT, expand=True, pady=10)
         
         # Right side - User count
         self.info_label = tk.Label(
             bottom_bar,
             text=f"{len(self.face_system.get_trained_persons())} users",
-            font=(Config.FONT_FAMILY, 11),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_TEXT_TERTIARY,
             bg=Config.COLOR_BG
         )
-        self.info_label.pack(side=tk.RIGHT, pady=20)
+        self.info_label.pack(side=tk.RIGHT, pady=10)
         
         # Hidden activity log for this view (shown in admin panel)
         self.log_listbox = tk.Listbox(self.main_frame)
@@ -1270,10 +1270,10 @@ class DoorEntryKiosk:
         else:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Fixed 640x480 display size for both views
+        # Fixed 440x330 display size for both views (scaled for 480px window)
         frame_h, frame_w = frame_rgb.shape[:2]
-        if frame_w != 640 or frame_h != 480:
-            frame_rgb = cv2.resize(frame_rgb, (640, 480))
+        if frame_w != 440 or frame_h != 330:
+            frame_rgb = cv2.resize(frame_rgb, (440, 330))
         
         img = Image.fromarray(frame_rgb)
         imgtk = ImageTk.PhotoImage(image=img)
@@ -1431,12 +1431,12 @@ class DoorEntryKiosk:
         
         # Title header
         header = tk.Frame(self.admin_frame, bg=Config.COLOR_BG)
-        header.pack(fill=tk.X, padx=30, pady=(25, 15))
+        header.pack(fill=tk.X, padx=15, pady=(15, 8))
         
         tk.Label(
             header,
             text="Settings",
-            font=(Config.FONT_FAMILY, 28, "bold"),
+            font=(Config.FONT_FAMILY, 18, "bold"),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_BG
         ).pack(side=tk.LEFT)
@@ -1445,7 +1445,7 @@ class DoorEntryKiosk:
         close_btn = tk.Button(
             header,
             text="Done",
-            font=(Config.FONT_FAMILY, 14),
+            font=(Config.FONT_FAMILY, 12),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_SCANNING,
@@ -1460,8 +1460,8 @@ class DoorEntryKiosk:
         style = ttk.Style()
         style.configure('TNotebook', background=Config.COLOR_BG, borderwidth=0)
         style.configure('TNotebook.Tab', 
-                       font=(Config.FONT_FAMILY, 11),
-                       padding=[20, 10],
+                       font=(Config.FONT_FAMILY, 9),
+                       padding=[10, 6],
                        background=Config.COLOR_BG,
                        foreground=Config.COLOR_TEXT_SECONDARY)
         style.map('TNotebook.Tab',
@@ -1469,7 +1469,7 @@ class DoorEntryKiosk:
                  foreground=[('selected', Config.COLOR_SCANNING)])
         
         notebook = ttk.Notebook(self.admin_frame)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         self.admin_notebook = notebook  # Store reference for tab locking
         
         # Bind tab change to check if allowed
@@ -1504,13 +1504,13 @@ class DoorEntryKiosk:
         """Create registration tab in admin panel with camera preview"""
         # Main container - vertical layout
         main_container = tk.Frame(parent, bg=Config.COLOR_BG)
-        main_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
         # Camera preview container with FIXED size to prevent expansion
         camera_container = tk.Frame(main_container, bg=Config.COLOR_CARD, 
                                    highlightbackground=Config.COLOR_BORDER, highlightthickness=1,
-                                   width=640, height=480)
-        camera_container.pack(pady=(0, 10))
+                                   width=440, height=330)
+        camera_container.pack(pady=(0, 5))
         camera_container.pack_propagate(False)  # Prevent size changes
         
         # Camera preview label
@@ -1520,10 +1520,10 @@ class DoorEntryKiosk:
         # === SETUP PANEL (shown before starting) ===
         self.reg_setup_panel = tk.Frame(main_container, bg=Config.COLOR_CARD,
                                         highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
-        self.reg_setup_panel.pack(fill=tk.X, pady=5)
+        self.reg_setup_panel.pack(fill=tk.X, pady=3)
         
         setup_inner = tk.Frame(self.reg_setup_panel, bg=Config.COLOR_CARD)
-        setup_inner.pack(fill=tk.X, padx=20, pady=15)
+        setup_inner.pack(fill=tk.X, padx=10, pady=8)
         
         # Name entry row
         name_row = tk.Frame(setup_inner, bg=Config.COLOR_CARD)
@@ -1532,27 +1532,27 @@ class DoorEntryKiosk:
         tk.Label(
             name_row,
             text="Name:",
-            font=(Config.FONT_FAMILY, 13),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_CARD
         ).pack(side=tk.LEFT)
         
         self.reg_name_entry = tk.Entry(
             name_row, 
-            font=(Config.FONT_FAMILY, 13), 
+            font=(Config.FONT_FAMILY, 10), 
             bg=Config.COLOR_CARD_SECONDARY,
             fg=Config.COLOR_TEXT,
             relief=tk.FLAT,
             highlightbackground=Config.COLOR_BORDER,
             highlightthickness=1,
-            width=25
+            width=18
         )
-        self.reg_name_entry.pack(side=tk.LEFT, padx=(10, 15), ipady=5)
+        self.reg_name_entry.pack(side=tk.LEFT, padx=(8, 10), ipady=3)
         
         self.start_reg_btn = tk.Button(
             name_row,
-            text="Start Registration",
-            font=(Config.FONT_FAMILY, 12),
+            text="Start",
+            font=(Config.FONT_FAMILY, 10),
             fg="#FFFFFF",
             bg=Config.COLOR_SCANNING,
             activebackground="#0056b3",
@@ -1561,7 +1561,7 @@ class DoorEntryKiosk:
             cursor="hand2",
             command=self.start_registration
         )
-        self.start_reg_btn.pack(side=tk.LEFT, ipady=5, ipadx=15)
+        self.start_reg_btn.pack(side=tk.LEFT, ipady=3, ipadx=10)
         
         # === CAPTURE PANEL (shown during registration) ===
         self.reg_capture_panel = tk.Frame(main_container, bg=Config.COLOR_CARD,
@@ -1569,16 +1569,16 @@ class DoorEntryKiosk:
         # Don't pack yet - will be shown when registration starts
         
         capture_inner = tk.Frame(self.reg_capture_panel, bg=Config.COLOR_CARD)
-        capture_inner.pack(fill=tk.X, padx=20, pady=15)
+        capture_inner.pack(fill=tk.X, padx=10, pady=8)
         
         # Top row: status and stop button
         top_row = tk.Frame(capture_inner, bg=Config.COLOR_CARD)
-        top_row.pack(fill=tk.X, pady=(0, 10))
+        top_row.pack(fill=tk.X, pady=(0, 5))
         
         self.reg_name_display = tk.Label(
             top_row,
             text="",
-            font=(Config.FONT_FAMILY, 14, "bold"),
+            font=(Config.FONT_FAMILY, 11, "bold"),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_CARD
         )
@@ -1587,16 +1587,16 @@ class DoorEntryKiosk:
         self.reg_count_label = tk.Label(
             top_row,
             text="0 photos",
-            font=(Config.FONT_FAMILY, 12),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD
         )
-        self.reg_count_label.pack(side=tk.LEFT, padx=(15, 0))
+        self.reg_count_label.pack(side=tk.LEFT, padx=(10, 0))
         
         self.stop_reg_btn = tk.Button(
             top_row,
-            text="Stop & Train",
-            font=(Config.FONT_FAMILY, 12),
+            text="Stop",
+            font=(Config.FONT_FAMILY, 9),
             fg="#FFFFFF",
             bg=Config.COLOR_DENIED,
             activeforeground="#FFFFFF",
@@ -1605,7 +1605,7 @@ class DoorEntryKiosk:
             cursor="hand2",
             command=self.stop_registration
         )
-        self.stop_reg_btn.pack(side=tk.RIGHT, ipady=4, ipadx=10)
+        self.stop_reg_btn.pack(side=tk.RIGHT, ipady=2, ipadx=8)
         
         # Bottom row: capture buttons
         btn_row = tk.Frame(capture_inner, bg=Config.COLOR_CARD)
@@ -1613,8 +1613,8 @@ class DoorEntryKiosk:
         
         self.capture_btn = tk.Button(
             btn_row,
-            text="📷 Capture Photo",
-            font=(Config.FONT_FAMILY, 12),
+            text="📷 Capture",
+            font=(Config.FONT_FAMILY, 9),
             fg="#FFFFFF",
             bg=Config.COLOR_GRANTED,
             activebackground="#28a745",
@@ -1623,12 +1623,12 @@ class DoorEntryKiosk:
             cursor="hand2",
             command=self.capture_photo
         )
-        self.capture_btn.pack(side=tk.LEFT, ipady=5, ipadx=15)
+        self.capture_btn.pack(side=tk.LEFT, ipady=2, ipadx=8)
         
         self.auto_capture_btn = tk.Button(
             btn_row,
-            text="⟳ Auto Capture (100 photos)",
-            font=(Config.FONT_FAMILY, 12),
+            text="⟳ Auto (100)",
+            font=(Config.FONT_FAMILY, 9),
             fg="#FFFFFF",
             bg="#5856D6",
             activebackground="#4744c4",
@@ -1637,7 +1637,7 @@ class DoorEntryKiosk:
             cursor="hand2",
             command=self.start_auto_capture
         )
-        self.auto_capture_btn.pack(side=tk.LEFT, padx=(10, 0), ipady=5, ipadx=15)
+        self.auto_capture_btn.pack(side=tk.LEFT, padx=(5, 0), ipady=2, ipadx=8)
         
         # Auto-train checkbox (smaller, right side)
         self.auto_train_var = tk.BooleanVar(value=True)
@@ -1645,7 +1645,7 @@ class DoorEntryKiosk:
             btn_row,
             text="Auto-train",
             variable=self.auto_train_var,
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 8),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD,
             activebackground=Config.COLOR_CARD,
@@ -1657,41 +1657,41 @@ class DoorEntryKiosk:
         """Create training tab in admin panel with Apple styling"""
         # Card container
         card = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
-        card.pack(fill=tk.X, padx=20, pady=20)
+        card.pack(fill=tk.X, padx=10, pady=10)
         
         inner = tk.Frame(card, bg=Config.COLOR_CARD)
-        inner.pack(fill=tk.X, padx=25, pady=25)
+        inner.pack(fill=tk.X, padx=15, pady=15)
         
         tk.Label(
             inner,
             text="Train Model",
-            font=(Config.FONT_FAMILY, 17, "bold"),
+            font=(Config.FONT_FAMILY, 13, "bold"),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_CARD
         ).pack(anchor=tk.W)
         
         tk.Label(
             inner,
-            text="Process captured photos to train the recognition model",
-            font=(Config.FONT_FAMILY, 12),
+            text="Process photos to train recognition",
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD
-        ).pack(anchor=tk.W, pady=(5, 25))
+        ).pack(anchor=tk.W, pady=(3, 15))
         
         # Dataset info
         persons = self.face_system.get_registered_persons()
         total_images = sum(count for _, count in persons)
         
         info_card = tk.Frame(inner, bg=Config.COLOR_CARD_SECONDARY)
-        info_card.pack(fill=tk.X, pady=(0, 20))
+        info_card.pack(fill=tk.X, pady=(0, 10))
         
         self.dataset_info_label = tk.Label(
             info_card,
             text=f"{len(persons)} people  •  {total_images} photos",
-            font=(Config.FONT_FAMILY, 14),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_CARD_SECONDARY,
-            pady=15
+            pady=8
         )
         self.dataset_info_label.pack()
         
@@ -1704,25 +1704,25 @@ class DoorEntryKiosk:
         self.train_progress = ttk.Progressbar(
             inner, 
             mode='determinate', 
-            length=400,
+            length=300,
             style="Custom.Horizontal.TProgressbar"
         )
-        self.train_progress.pack(fill=tk.X, pady=(0, 10))
+        self.train_progress.pack(fill=tk.X, pady=(0, 5))
         
         self.train_status_label = tk.Label(
             inner,
             text="Ready to train",
-            font=(Config.FONT_FAMILY, 11),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD
         )
-        self.train_status_label.pack(pady=(0, 20))
+        self.train_status_label.pack(pady=(0, 10))
         
         # Train button
         self.train_btn = tk.Button(
             inner,
             text="Start Training",
-            font=(Config.FONT_FAMILY, 14),
+            font=(Config.FONT_FAMILY, 10),
             fg="#FFFFFF",
             bg=Config.COLOR_SCANNING,
             activebackground="#0056b3",
@@ -1731,18 +1731,18 @@ class DoorEntryKiosk:
             cursor="hand2",
             command=self.start_training
         )
-        self.train_btn.pack(fill=tk.X, ipady=10)
+        self.train_btn.pack(fill=tk.X, ipady=6)
     
     def create_manage_tab(self, parent):
         """Create user management tab in admin panel with Apple styling"""
         # Header
         header = tk.Frame(parent, bg=Config.COLOR_BG)
-        header.pack(fill=tk.X, padx=20, pady=(20, 10))
+        header.pack(fill=tk.X, padx=10, pady=(10, 5))
         
         tk.Label(
             header,
             text="Registered Users",
-            font=(Config.FONT_FAMILY, 13, "bold"),
+            font=(Config.FONT_FAMILY, 10, "bold"),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_BG
         ).pack(side=tk.LEFT)
@@ -1750,7 +1750,7 @@ class DoorEntryKiosk:
         tk.Button(
             header,
             text="Refresh",
-            font=(Config.FONT_FAMILY, 11),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_SCANNING,
@@ -1761,11 +1761,11 @@ class DoorEntryKiosk:
         
         # List card
         card = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
-        card.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        card.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
         self.manage_listbox = tk.Listbox(
             card,
-            font=(Config.FONT_FAMILY, 13),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_CARD,
             selectbackground=Config.COLOR_CARD_SECONDARY,
@@ -1775,19 +1775,19 @@ class DoorEntryKiosk:
             relief=tk.FLAT,
             activestyle='none'
         )
-        self.manage_listbox.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        self.manage_listbox.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         
         # Populate list
         self.refresh_manage_list()
         
         # Delete button
         btn_frame = tk.Frame(parent, bg=Config.COLOR_BG)
-        btn_frame.pack(fill=tk.X, padx=20, pady=15)
+        btn_frame.pack(fill=tk.X, padx=10, pady=8)
         
         tk.Button(
             btn_frame,
             text="Delete Selected",
-            font=(Config.FONT_FAMILY, 12),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_DENIED,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_DENIED,
@@ -1800,20 +1800,20 @@ class DoorEntryKiosk:
         """Create access log tab in admin panel with Apple styling"""
         # Header
         header = tk.Frame(parent, bg=Config.COLOR_BG)
-        header.pack(fill=tk.X, padx=20, pady=(20, 10))
+        header.pack(fill=tk.X, padx=10, pady=(10, 5))
         
         tk.Label(
             header,
             text="Access History",
-            font=(Config.FONT_FAMILY, 13, "bold"),
+            font=(Config.FONT_FAMILY, 10, "bold"),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_BG
         ).pack(side=tk.LEFT)
         
         tk.Button(
             header,
-            text="Clear All",
-            font=(Config.FONT_FAMILY, 11),
+            text="Clear",
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_DENIED,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_DENIED,
@@ -1822,173 +1822,65 @@ class DoorEntryKiosk:
             command=self.clear_access_log
         ).pack(side=tk.RIGHT)
         
-        # Filter card
-        filter_card = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
-        filter_card.pack(fill=tk.X, padx=20, pady=(0, 10))
-        
-        filter_inner = tk.Frame(filter_card, bg=Config.COLOR_CARD)
-        filter_inner.pack(fill=tk.X, padx=15, pady=15)
-        
-        # Date filter row
-        date_row = tk.Frame(filter_inner, bg=Config.COLOR_CARD)
-        date_row.pack(fill=tk.X, pady=(0, 10))
-        
-        tk.Label(
-            date_row,
-            text="Date Range:",
-            font=(Config.FONT_FAMILY, 11),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_CARD
-        ).pack(side=tk.LEFT)
-        
-        # From date
-        tk.Label(
-            date_row,
-            text="From:",
-            font=(Config.FONT_FAMILY, 11),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_CARD
-        ).pack(side=tk.LEFT, padx=(15, 5))
-        
-        self.log_date_from = tk.Entry(
-            date_row,
-            font=(Config.FONT_FAMILY, 11),
-            width=12,
-            bg=Config.COLOR_CARD_SECONDARY,
-            fg=Config.COLOR_TEXT,
-            relief=tk.FLAT,
-            highlightbackground=Config.COLOR_BORDER,
-            highlightthickness=1
-        )
-        self.log_date_from.pack(side=tk.LEFT, ipady=4)
-        self.log_date_from.insert(0, "YYYY-MM-DD")
-        self.log_date_from.bind("<FocusIn>", lambda e: self._clear_placeholder(e, "YYYY-MM-DD"))
-        self.log_date_from.bind("<FocusOut>", lambda e: self._restore_placeholder(e, "YYYY-MM-DD"))
-        
-        # To date
-        tk.Label(
-            date_row,
-            text="To:",
-            font=(Config.FONT_FAMILY, 11),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_CARD
-        ).pack(side=tk.LEFT, padx=(15, 5))
-        
-        self.log_date_to = tk.Entry(
-            date_row,
-            font=(Config.FONT_FAMILY, 11),
-            width=12,
-            bg=Config.COLOR_CARD_SECONDARY,
-            fg=Config.COLOR_TEXT,
-            relief=tk.FLAT,
-            highlightbackground=Config.COLOR_BORDER,
-            highlightthickness=1
-        )
-        self.log_date_to.pack(side=tk.LEFT, ipady=4)
-        self.log_date_to.insert(0, "YYYY-MM-DD")
-        self.log_date_to.bind("<FocusIn>", lambda e: self._clear_placeholder(e, "YYYY-MM-DD"))
-        self.log_date_to.bind("<FocusOut>", lambda e: self._restore_placeholder(e, "YYYY-MM-DD"))
-        
-        # Name filter row
-        name_row = tk.Frame(filter_inner, bg=Config.COLOR_CARD)
-        name_row.pack(fill=tk.X, pady=(0, 10))
-        
-        tk.Label(
-            name_row,
-            text="Filter by Name:",
-            font=(Config.FONT_FAMILY, 11),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_CARD
-        ).pack(side=tk.LEFT)
-        
-        # Name dropdown with autocomplete
-        self.log_name_var = tk.StringVar(value="All")
-        unique_names = ["All"] + self.access_log.get_unique_names()
-        
-        self.log_name_combo = ttk.Combobox(
-            name_row,
-            textvariable=self.log_name_var,
-            values=unique_names,
-            font=(Config.FONT_FAMILY, 11),
-            width=20,
-            state="readonly"
-        )
-        self.log_name_combo.pack(side=tk.LEFT, padx=(10, 0))
-        
-        # Filter buttons
-        btn_row = tk.Frame(filter_inner, bg=Config.COLOR_CARD)
-        btn_row.pack(fill=tk.X)
+        # Quick filter buttons
+        filter_frame = tk.Frame(parent, bg=Config.COLOR_BG)
+        filter_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
         
         tk.Button(
-            btn_row,
-            text="Apply Filter",
-            font=(Config.FONT_FAMILY, 11),
-            fg="white",
-            bg=Config.COLOR_SCANNING,
-            activeforeground="white",
-            activebackground="#0056b3",
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self.apply_log_filter
-        ).pack(side=tk.LEFT, ipadx=10, ipady=4)
-        
-        tk.Button(
-            btn_row,
-            text="Clear Filter",
-            font=(Config.FONT_FAMILY, 11),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_CARD_SECONDARY,
-            activeforeground=Config.COLOR_TEXT,
-            activebackground=Config.COLOR_CARD_SECONDARY,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self.clear_log_filter
-        ).pack(side=tk.LEFT, padx=(10, 0), ipadx=10, ipady=4)
-        
-        # Quick date buttons
-        tk.Button(
-            btn_row,
+            filter_frame,
             text="Today",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 8),
             fg=Config.COLOR_SCANNING,
-            bg=Config.COLOR_CARD,
+            bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_SCANNING,
             bd=0,
             cursor="hand2",
             command=lambda: self.set_log_date_range(0)
-        ).pack(side=tk.RIGHT, padx=5)
+        ).pack(side=tk.LEFT, padx=2)
         
         tk.Button(
-            btn_row,
+            filter_frame,
             text="7 Days",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 8),
             fg=Config.COLOR_SCANNING,
-            bg=Config.COLOR_CARD,
+            bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_SCANNING,
             bd=0,
             cursor="hand2",
             command=lambda: self.set_log_date_range(7)
-        ).pack(side=tk.RIGHT, padx=5)
+        ).pack(side=tk.LEFT, padx=2)
         
         tk.Button(
-            btn_row,
+            filter_frame,
             text="30 Days",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 8),
             fg=Config.COLOR_SCANNING,
-            bg=Config.COLOR_CARD,
+            bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_SCANNING,
             bd=0,
             cursor="hand2",
             command=lambda: self.set_log_date_range(30)
-        ).pack(side=tk.RIGHT, padx=5)
+        ).pack(side=tk.LEFT, padx=2)
+        
+        tk.Button(
+            filter_frame,
+            text="All",
+            font=(Config.FONT_FAMILY, 8),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_BG,
+            activeforeground=Config.COLOR_TEXT,
+            bd=0,
+            cursor="hand2",
+            command=self.clear_log_filter
+        ).pack(side=tk.LEFT, padx=2)
         
         # Log card
         card = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
-        card.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        card.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
         self.admin_log_listbox = tk.Listbox(
             card,
-            font=(Config.FONT_FAMILY_MONO, 11),
+            font=(Config.FONT_FAMILY_MONO, 9),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_CARD,
             selectbackground=Config.COLOR_CARD_SECONDARY,
@@ -1998,90 +1890,33 @@ class DoorEntryKiosk:
             relief=tk.FLAT,
             activestyle='none'
         )
-        self.admin_log_listbox.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        self.admin_log_listbox.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        
+        # Initialize filter variables (needed by filter methods)
+        self.log_date_from = None
+        self.log_date_to = None
+        self.log_name_var = tk.StringVar(value="All")
         
         # Populate with all entries initially
         self.populate_log_listbox(self.access_log.get_recent(100))
     
-    def _clear_placeholder(self, event, placeholder):
-        """Clear placeholder text on focus"""
-        if event.widget.get() == placeholder:
-            event.widget.delete(0, tk.END)
-            event.widget.config(fg=Config.COLOR_TEXT)
-    
-    def _restore_placeholder(self, event, placeholder):
-        """Restore placeholder text if empty"""
-        if not event.widget.get():
-            event.widget.insert(0, placeholder)
-            event.widget.config(fg=Config.COLOR_TEXT_SECONDARY)
-    
     def set_log_date_range(self, days_back):
         """Set date range for quick filters"""
-        from datetime import timedelta
+        from datetime import timedelta, date
         today = datetime.now().date()
         
-        self.log_date_to.delete(0, tk.END)
-        self.log_date_to.insert(0, today.isoformat())
-        self.log_date_to.config(fg=Config.COLOR_TEXT)
-        
         if days_back == 0:
-            # Today only
-            self.log_date_from.delete(0, tk.END)
-            self.log_date_from.insert(0, today.isoformat())
+            date_from = today
         else:
-            from_date = today - timedelta(days=days_back)
-            self.log_date_from.delete(0, tk.END)
-            self.log_date_from.insert(0, from_date.isoformat())
-        
-        self.log_date_from.config(fg=Config.COLOR_TEXT)
-        self.apply_log_filter()
-    
-    def apply_log_filter(self):
-        """Apply filters and refresh log display"""
-        from datetime import date
-        
-        # Parse date from
-        date_from = None
-        date_from_str = self.log_date_from.get()
-        if date_from_str and date_from_str != "YYYY-MM-DD":
-            try:
-                date_from = date.fromisoformat(date_from_str)
-            except ValueError:
-                messagebox.showerror("Invalid Date", "From date must be in YYYY-MM-DD format")
-                return
-        
-        # Parse date to
-        date_to = None
-        date_to_str = self.log_date_to.get()
-        if date_to_str and date_to_str != "YYYY-MM-DD":
-            try:
-                date_to = date.fromisoformat(date_to_str)
-            except ValueError:
-                messagebox.showerror("Invalid Date", "To date must be in YYYY-MM-DD format")
-                return
-        
-        # Get name filter
-        name_filter = None
-        selected_name = self.log_name_var.get()
-        if selected_name and selected_name != "All":
-            name_filter = selected_name
+            date_from = today - timedelta(days=days_back)
         
         # Get filtered entries
-        entries = self.access_log.get_filtered(date_from, date_to, name_filter, count=100)
+        entries = self.access_log.get_filtered(date_from, today, None, count=100)
         self.populate_log_listbox(entries)
     
     def clear_log_filter(self):
         """Clear all filters and show all entries"""
-        self.log_date_from.delete(0, tk.END)
-        self.log_date_from.insert(0, "YYYY-MM-DD")
-        self.log_date_from.config(fg=Config.COLOR_TEXT_SECONDARY)
-        
-        self.log_date_to.delete(0, tk.END)
-        self.log_date_to.insert(0, "YYYY-MM-DD")
-        self.log_date_to.config(fg=Config.COLOR_TEXT_SECONDARY)
-        
         self.log_name_var.set("All")
-        
         self.populate_log_listbox(self.access_log.get_recent(100))
     
     def populate_log_listbox(self, entries):
@@ -2096,93 +1931,93 @@ class DoorEntryKiosk:
         """Create settings tab in admin panel with Apple styling"""
         # Recognition Settings Card
         card1 = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
-        card1.pack(fill=tk.X, padx=20, pady=(20, 10))
+        card1.pack(fill=tk.X, padx=10, pady=(10, 5))
         
         inner1 = tk.Frame(card1, bg=Config.COLOR_CARD)
-        inner1.pack(fill=tk.X, padx=20, pady=20)
+        inner1.pack(fill=tk.X, padx=10, pady=10)
         
         tk.Label(
             inner1,
             text="Recognition",
-            font=(Config.FONT_FAMILY, 15, "bold"),
+            font=(Config.FONT_FAMILY, 12, "bold"),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_CARD
         ).pack(anchor=tk.W)
         
         settings_items = [
-            ("Confidence Threshold", f"{int(Config.RECOGNITION_THRESHOLD * 100)}%"),
-            ("Access Cooldown", f"{Config.COOLDOWN_SECONDS} seconds"),
-            ("Door Unlock Duration", f"{Config.DOOR_UNLOCK_DURATION} seconds"),
+            ("Confidence", f"{int(Config.RECOGNITION_THRESHOLD * 100)}%"),
+            ("Cooldown", f"{Config.COOLDOWN_SECONDS}s"),
+            ("Unlock Duration", f"{Config.DOOR_UNLOCK_DURATION}s"),
         ]
         
         for label, value in settings_items:
             row = tk.Frame(inner1, bg=Config.COLOR_CARD)
-            row.pack(fill=tk.X, pady=8)
+            row.pack(fill=tk.X, pady=4)
             tk.Label(
                 row,
                 text=label,
-                font=(Config.FONT_FAMILY, 13),
+                font=(Config.FONT_FAMILY, 10),
                 fg=Config.COLOR_TEXT,
                 bg=Config.COLOR_CARD
             ).pack(side=tk.LEFT)
             tk.Label(
                 row,
                 text=value,
-                font=(Config.FONT_FAMILY, 13),
+                font=(Config.FONT_FAMILY, 10),
                 fg=Config.COLOR_TEXT_SECONDARY,
                 bg=Config.COLOR_CARD
             ).pack(side=tk.RIGHT)
         
         # System Info Card
         card2 = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
-        card2.pack(fill=tk.X, padx=20, pady=10)
+        card2.pack(fill=tk.X, padx=10, pady=5)
         
         inner2 = tk.Frame(card2, bg=Config.COLOR_CARD)
-        inner2.pack(fill=tk.X, padx=20, pady=20)
+        inner2.pack(fill=tk.X, padx=10, pady=10)
         
         tk.Label(
             inner2,
             text="System",
-            font=(Config.FONT_FAMILY, 15, "bold"),
+            font=(Config.FONT_FAMILY, 12, "bold"),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_CARD
         ).pack(anchor=tk.W)
         
-        camera_type = "Raspberry Pi Camera" if USE_PICAMERA else "USB Webcam"
+        camera_type = "Pi Camera" if USE_PICAMERA else "USB Webcam"
         gpio_status = "Hardware" if USE_GPIO else "Simulated"
         
         system_items = [
             ("Camera", camera_type),
             ("Door Control", gpio_status),
-            ("Performance Mode", "Optimized" if Config.USE_FAST_DETECTION else "Standard"),
+            ("Performance", "Optimized" if Config.USE_FAST_DETECTION else "Standard"),
         ]
         
         for label, value in system_items:
             row = tk.Frame(inner2, bg=Config.COLOR_CARD)
-            row.pack(fill=tk.X, pady=8)
+            row.pack(fill=tk.X, pady=4)
             tk.Label(
                 row,
                 text=label,
-                font=(Config.FONT_FAMILY, 13),
+                font=(Config.FONT_FAMILY, 10),
                 fg=Config.COLOR_TEXT,
                 bg=Config.COLOR_CARD
             ).pack(side=tk.LEFT)
             tk.Label(
                 row,
                 text=value,
-                font=(Config.FONT_FAMILY, 13),
+                font=(Config.FONT_FAMILY, 10),
                 fg=Config.COLOR_TEXT_SECONDARY,
                 bg=Config.COLOR_CARD
             ).pack(side=tk.RIGHT)
         
         # Exit button
         exit_frame = tk.Frame(parent, bg=Config.COLOR_BG)
-        exit_frame.pack(fill=tk.X, padx=20, pady=30)
+        exit_frame.pack(fill=tk.X, padx=10, pady=15)
         
         tk.Button(
             exit_frame,
             text="Exit Kiosk Mode",
-            font=(Config.FONT_FAMILY, 13),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_DENIED,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_DENIED,
