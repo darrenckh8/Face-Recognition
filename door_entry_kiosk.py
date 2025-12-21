@@ -896,6 +896,7 @@ class DoorEntryKiosk:
         # Training state - prevents concurrent face_recognition access
         self.is_training = False
         self.reg_training_in_progress = False  # Lock admin panel during training
+        self.reg_capture_in_progress = False  # Lock during auto-capture
         
         # Performance tracking
         self.fps_counter = 0
@@ -983,10 +984,9 @@ class DoorEntryKiosk:
         self.video_container.pack(padx=2, pady=2)
         self.video_container.pack_propagate(False)
         
-        # Calculate video size based on screen
-        screen_height = self.root.winfo_screenheight()
-        video_height = int(screen_height * 0.55)
-        video_width = int(video_height * 4 / 3)
+        # Fixed video size for consistent UI
+        video_width = 640
+        video_height = 480
         self.video_container.config(width=video_width, height=video_height)
         
         self.video_label = tk.Label(self.video_container, bg="#000000")
@@ -2344,6 +2344,11 @@ class DoorEntryKiosk:
     
     def stop_registration(self):
         """Stop face registration mode and optionally auto-train"""
+        # Prevent stopping during capture or training
+        if self.reg_capture_in_progress or self.reg_training_in_progress:
+            messagebox.showwarning("Please Wait", "Capture or training in progress. Please wait for completion.")
+            return
+        
         person_name = self.registration_name
         captured = self.captured_count
         
@@ -2377,6 +2382,7 @@ class DoorEntryKiosk:
             return
         
         self.auto_capture_mode = True
+        self.reg_capture_in_progress = True  # Lock navigation
         self.last_auto_capture = time.time()
         self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
         
@@ -2386,8 +2392,15 @@ class DoorEntryKiosk:
         self.reg_count_label.config(text="Move face to fill all zones...")
     
     def stop_auto_capture(self):
-        """Stop automatic capture"""
+        """Stop automatic capture - requires confirmation"""
+        if self.reg_capture_in_progress:
+            # Ask for confirmation to cancel
+            if not messagebox.askyesno("Cancel Capture?", 
+                "Are you sure you want to cancel?\nPhotos already captured will be kept but training won't start."):
+                return
+        
         self.auto_capture_mode = False
+        self.reg_capture_in_progress = False
         self.capture_btn.config(state=tk.NORMAL)
         self.auto_capture_btn.config(text="⟳ Auto Capture (100 photos)", bg="#5856D6", command=self.start_auto_capture)
         self.update_registration_ui()
@@ -2625,6 +2638,7 @@ class DoorEntryKiosk:
     def complete_auto_registration(self):
         """Called when auto-capture reaches target - automatically start training"""
         self.auto_capture_mode = False
+        self.reg_capture_in_progress = False  # Capture done, but training starts
         zones_done = sum(1 for z in self.zone_captures 
                         if self.zone_captures[z] >= self.zone_targets.get(z, 0))
         
@@ -2792,17 +2806,23 @@ class DoorEntryKiosk:
         self.info_label.config(text=f"{count} registered users")
     
     def on_tab_changed(self, event):
-        """Handle notebook tab change - prevent if training in progress"""
-        if self.reg_training_in_progress:
+        """Handle notebook tab change - prevent if capture or training in progress"""
+        if self.reg_capture_in_progress or self.reg_training_in_progress:
             # Force back to register tab
             self.admin_notebook.select(0)
-            messagebox.showwarning("Training in Progress", "Please wait for training to complete.")
+            if self.reg_capture_in_progress:
+                messagebox.showwarning("Capture in Progress", "Please wait for photo capture to complete.")
+            else:
+                messagebox.showwarning("Training in Progress", "Please wait for training to complete.")
     
     def close_admin_panel(self):
         """Close the admin panel and restore kiosk UI"""
-        # Prevent closing during training
-        if self.reg_training_in_progress:
-            messagebox.showwarning("Training in Progress", "Please wait for training to complete.")
+        # Prevent closing during capture or training
+        if self.reg_capture_in_progress or self.reg_training_in_progress:
+            if self.reg_capture_in_progress:
+                messagebox.showwarning("Capture in Progress", "Please wait for photo capture to complete.")
+            else:
+                messagebox.showwarning("Training in Progress", "Please wait for training to complete.")
             return
         
         if self.registration_mode:
