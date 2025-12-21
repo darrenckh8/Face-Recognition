@@ -895,6 +895,7 @@ class DoorEntryKiosk:
         
         # Training state - prevents concurrent face_recognition access
         self.is_training = False
+        self.reg_training_in_progress = False  # Lock admin panel during training
         
         # Performance tracking
         self.fps_counter = 0
@@ -1223,48 +1224,47 @@ class DoorEntryKiosk:
                                        cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1)
                 
                 elif self.registration_mode:
-                    # Registration mode - use robust detection
-                    faces = self.face_system.detect_faces_combined(frame)
-                    
+                    # Registration mode - use robust detection only when actively capturing
                     frame_height, frame_width = display_frame.shape[:2]
-                    frame_center_x = frame_width // 2
-                    frame_center_y = frame_height // 2
                     
-                    if len(faces) == 1:
-                        top, right, bottom, left = faces[0]
+                    if self.auto_capture_mode:
+                        # Active capture mode - show Face ID overlay
+                        faces = self.face_system.detect_faces_combined(frame)
+                        frame_center_x = frame_width // 2
+                        frame_center_y = frame_height // 2
                         
-                        # Calculate face center
-                        face_center_x = (left + right) / 2
-                        face_center_y = (top + bottom) / 2
-                        
-                        # Determine zone based on face position in frame (very simple & reliable)
-                        # This works by where the user positions their face, not head pose
-                        offset_x = (face_center_x - frame_center_x) / (frame_width / 2)  # -1 to 1
-                        offset_y = (face_center_y - frame_center_y) / (frame_height / 2)  # -1 to 1
-                        
-                        # Determine zone with generous thresholds
-                        zone_threshold = 0.15  # Very forgiving
-                        if abs(offset_x) < zone_threshold and abs(offset_y) < zone_threshold:
-                            self.current_zone = 'center'
-                        elif abs(offset_x) > abs(offset_y):  # Horizontal dominant
-                            self.current_zone = 'left' if offset_x < 0 else 'right'
-                        else:  # Vertical dominant
-                            self.current_zone = 'up' if offset_y < 0 else 'down'
-                        
-                        # Get zone color based on fill status
-                        zone_filled = self.zone_captures.get(self.current_zone, 0) >= self.zone_targets.get(self.current_zone, 0)
-                        box_color = (0, 255, 0) if zone_filled else (0, 255, 255)
-                        
-                        # Draw face box
-                        cv2.rectangle(display_frame, (int(left), int(top)), (int(right), int(bottom)), box_color, 3)
-                        
-                        # Auto-capture logic
-                        if self.auto_capture_mode:
+                        if len(faces) == 1:
+                            top, right, bottom, left = faces[0]
+                            
+                            # Calculate face center
+                            face_center_x = (left + right) / 2
+                            face_center_y = (top + bottom) / 2
+                            
+                            # Determine zone based on face position in frame
+                            offset_x = (face_center_x - frame_center_x) / (frame_width / 2)
+                            offset_y = (face_center_y - frame_center_y) / (frame_height / 2)
+                            
+                            # Determine zone with generous thresholds
+                            zone_threshold = 0.15
+                            if abs(offset_x) < zone_threshold and abs(offset_y) < zone_threshold:
+                                self.current_zone = 'center'
+                            elif abs(offset_x) > abs(offset_y):
+                                self.current_zone = 'left' if offset_x < 0 else 'right'
+                            else:
+                                self.current_zone = 'up' if offset_y < 0 else 'down'
+                            
+                            # Get zone color based on fill status
+                            zone_filled = self.zone_captures.get(self.current_zone, 0) >= self.zone_targets.get(self.current_zone, 0)
+                            box_color = (0, 255, 0) if zone_filled else (0, 255, 255)
+                            
+                            # Draw face box
+                            cv2.rectangle(display_frame, (int(left), int(top)), (int(right), int(bottom)), box_color, 3)
+                            
+                            # Auto-capture logic
                             now = time.time()
                             zone_current = self.zone_captures.get(self.current_zone, 0)
                             zone_target = self.zone_targets.get(self.current_zone, 0)
                             
-                            # Capture if interval passed AND zone needs more photos
                             if now - self.last_auto_capture >= self.auto_capture_interval:
                                 if self.captured_count < self.auto_capture_target and zone_current < zone_target:
                                     filepath = self.face_system.save_face_image(frame, self.registration_name)
@@ -1274,20 +1274,42 @@ class DoorEntryKiosk:
                                     self.root.after(0, self.update_registration_ui)
                                 elif self.captured_count >= self.auto_capture_target:
                                     self.root.after(0, self.complete_auto_registration)
+                            
+                            # Flash on capture
+                            if (time.time() - self.last_auto_capture) < 0.08:
+                                cv2.rectangle(display_frame, (0, 0), (frame_width, frame_height), (0, 255, 0), 12)
                         
-                        # Flash on capture
-                        if self.auto_capture_mode and (time.time() - self.last_auto_capture) < 0.08:
-                            cv2.rectangle(display_frame, (0, 0), (frame_width, frame_height), (0, 255, 0), 12)
+                        elif len(faces) == 0:
+                            cv2.putText(display_frame, "Position your face in frame", (frame_width // 2 - 150, frame_height // 2),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+                        else:
+                            cv2.putText(display_frame, "Only one face please", (frame_width // 2 - 100, frame_height // 2),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        
+                        # Draw Face ID style overlay
+                        self.draw_faceid_overlay(display_frame)
                     
-                    elif len(faces) == 0:
-                        cv2.putText(display_frame, "Position your face in frame", (frame_width // 2 - 150, frame_height // 2),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+                    elif self.is_training:
+                        # Training in progress - show training message
+                        cv2.putText(display_frame, "Training model...", (frame_width // 2 - 100, frame_height // 2),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
                     else:
-                        cv2.putText(display_frame, "Only one face please", (frame_width // 2 - 100, frame_height // 2),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                    
-                    # Draw Face ID style overlay
-                    self.draw_faceid_overlay(display_frame)
+                        # Idle/manual capture mode - just show simple face detection
+                        faces = self.face_system.detect_faces_combined(frame)
+                        if len(faces) == 1:
+                            top, right, bottom, left = faces[0]
+                            cv2.rectangle(display_frame, (int(left), int(top)), (int(right), int(bottom)), (0, 255, 0), 2)
+                        elif len(faces) == 0:
+                            cv2.putText(display_frame, "Position face in frame", (frame_width // 2 - 120, frame_height // 2),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 1)
+                        else:
+                            cv2.putText(display_frame, "Only one face please", (frame_width // 2 - 100, frame_height // 2),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
+                
+                elif self.admin_mode:
+                    # Admin mode but not in registration - show clean camera feed
+                    # Just display the frame without overlays
+                    pass
                 
                 # Calculate and display FPS
                 self.fps_counter += 1
@@ -1327,28 +1349,29 @@ class DoorEntryKiosk:
             self.camera.stop()
     
     def display_frame(self, frame):
-        """Display a frame on the video label (and admin preview if in registration mode)"""
+        """Display a frame on the video label (and admin preview if in admin mode)"""
         if USE_PICAMERA:
             frame_rgb = frame
         else:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Display on admin video label if in registration mode
-        if self.registration_mode and hasattr(self, 'admin_video_label') and self.admin_video_label.winfo_exists():
+        # Display on admin video label if admin panel is open and widget exists
+        if self.admin_mode and hasattr(self, 'admin_video_label'):
             try:
-                # Use fixed size to prevent expansion feedback loop
-                target_w, target_h = getattr(self, 'admin_video_size', (496, 376))
-                
-                frame_h, frame_w = frame_rgb.shape[:2]
-                scale = min(target_w / frame_w, target_h / frame_h)
-                new_w = int(frame_w * scale)
-                new_h = int(frame_h * scale)
-                admin_frame = cv2.resize(frame_rgb, (new_w, new_h))
-                
-                admin_img = Image.fromarray(admin_frame)
-                admin_imgtk = ImageTk.PhotoImage(image=admin_img)
-                self.admin_video_label.imgtk = admin_imgtk
-                self.admin_video_label.configure(image=admin_imgtk)
+                if self.admin_video_label.winfo_exists():
+                    # Use fixed size to prevent expansion feedback loop
+                    target_w, target_h = getattr(self, 'admin_video_size', (496, 376))
+                    
+                    frame_h, frame_w = frame_rgb.shape[:2]
+                    scale = min(target_w / frame_w, target_h / frame_h)
+                    new_w = int(frame_w * scale)
+                    new_h = int(frame_h * scale)
+                    admin_frame = cv2.resize(frame_rgb, (new_w, new_h))
+                    
+                    admin_img = Image.fromarray(admin_frame)
+                    admin_imgtk = ImageTk.PhotoImage(image=admin_img)
+                    self.admin_video_label.imgtk = admin_imgtk
+                    self.admin_video_label.configure(image=admin_imgtk)
             except tk.TclError:
                 pass  # Widget was destroyed
         
@@ -1556,6 +1579,10 @@ class DoorEntryKiosk:
         
         notebook = ttk.Notebook(self.admin_frame)
         notebook.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        self.admin_notebook = notebook  # Store reference for tab locking
+        
+        # Bind tab change to check if allowed
+        notebook.bind('<<NotebookTabChanged>>', self.on_tab_changed)
         
         # Tab 1: Register New Face
         register_tab = tk.Frame(notebook, bg=Config.COLOR_BG)
@@ -1586,13 +1613,13 @@ class DoorEntryKiosk:
         """Create registration tab in admin panel with camera preview"""
         # Main container - vertical layout
         main_container = tk.Frame(parent, bg=Config.COLOR_BG)
-        main_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=15)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
         
         # Camera preview container with FIXED size to prevent expansion
         camera_container = tk.Frame(main_container, bg=Config.COLOR_CARD, 
                                    highlightbackground=Config.COLOR_BORDER, highlightthickness=1,
-                                   width=500, height=380)
-        camera_container.pack(pady=(0, 15))
+                                   width=640, height=480)
+        camera_container.pack(pady=(0, 10))
         camera_container.pack_propagate(False)  # Prevent size changes
         
         # Camera preview label
@@ -1600,7 +1627,7 @@ class DoorEntryKiosk:
         self.admin_video_label.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         
         # Store fixed size for scaling calculations
-        self.admin_video_size = (496, 376)
+        self.admin_video_size = (636, 476)
         
         # === SETUP PANEL (shown before starting) ===
         self.reg_setup_panel = tk.Frame(main_container, bg=Config.COLOR_CARD,
@@ -2596,25 +2623,66 @@ class DoorEntryKiosk:
             self.reg_count_label.config(text=f"{self.captured_count} photos")
     
     def complete_auto_registration(self):
-        """Called when auto-capture reaches target"""
+        """Called when auto-capture reaches target - automatically start training"""
         self.auto_capture_mode = False
-        self.capture_btn.config(state=tk.NORMAL)
-        self.auto_capture_btn.config(text="✓ Done!", bg=Config.COLOR_GRANTED, state=tk.DISABLED)
-        
         zones_done = sum(1 for z in self.zone_captures 
                         if self.zone_captures[z] >= self.zone_targets.get(z, 0))
         
         self.reg_count_label.config(
-            text=f"✓ {self.captured_count} photos from {zones_done} angles"
+            text=f"✓ {self.captured_count} photos • Training..."
         )
         
-        messagebox.showinfo(
-            "Capture Complete", 
-            f"Captured {self.captured_count} photos from {zones_done}/5 angles.\n\n"
-            "Click 'Stop' to finish and train."
-        )
+        # Disable buttons during training
+        self.capture_btn.config(state=tk.DISABLED)
+        self.auto_capture_btn.config(text="Training...", bg="#888888", state=tk.DISABLED)
+        self.stop_reg_btn.config(state=tk.DISABLED)
+        
+        # Lock tab switching
+        self.reg_training_in_progress = True
+        
+        # Start training with progress
+        self.train_single_person_with_progress(self.registration_name)
     
     # ==================== END AUTO-CAPTURE ====================
+    
+    def train_single_person_with_progress(self, person_name):
+        """Train a single person with progress updates in the UI"""
+        self.is_training = True
+        total_images = 0
+        
+        def training_thread():
+            nonlocal total_images
+            # Count images first
+            from imutils import paths
+            person_folder = os.path.join(self.face_system.dataset_path, person_name)
+            if os.path.exists(person_folder):
+                total_images = len(list(paths.list_images(person_folder)))
+            
+            def progress_callback(current, total, filepath):
+                self.root.after(0, lambda: self.reg_count_label.config(
+                    text=f"Training... {current}/{total}"
+                ))
+            
+            success, message = self.face_system.train_single_person(person_name, progress_callback)
+            self.root.after(0, lambda: self.training_with_progress_complete(success, message))
+        
+        thread = threading.Thread(target=training_thread, daemon=True)
+        thread.start()
+    
+    def training_with_progress_complete(self, success, message):
+        """Handle training completion from auto-capture flow"""
+        self.is_training = False
+        self.reg_training_in_progress = False
+        
+        if success:
+            self.reg_count_label.config(text=f"✓ {message}")
+            self.auto_capture_btn.config(text="✓ Complete", bg=Config.COLOR_GRANTED)
+            # Auto-close registration after short delay
+            self.root.after(1500, self.stop_registration)
+        else:
+            self.reg_count_label.config(text=f"✗ {message}")
+            self.auto_capture_btn.config(text="✗ Failed", bg=Config.COLOR_DENIED)
+            self.stop_reg_btn.config(state=tk.NORMAL)
     
     def train_single_person(self, person_name):
         """Train only a single person (incremental training)"""
@@ -2723,8 +2791,20 @@ class DoorEntryKiosk:
         count = len(self.face_system.get_trained_persons())
         self.info_label.config(text=f"{count} registered users")
     
+    def on_tab_changed(self, event):
+        """Handle notebook tab change - prevent if training in progress"""
+        if self.reg_training_in_progress:
+            # Force back to register tab
+            self.admin_notebook.select(0)
+            messagebox.showwarning("Training in Progress", "Please wait for training to complete.")
+    
     def close_admin_panel(self):
         """Close the admin panel and restore kiosk UI"""
+        # Prevent closing during training
+        if self.reg_training_in_progress:
+            messagebox.showwarning("Training in Progress", "Please wait for training to complete.")
+            return
+        
         if self.registration_mode:
             self.stop_registration()
         
