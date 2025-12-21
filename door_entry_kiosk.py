@@ -583,6 +583,40 @@ class FaceRecognitionSystem:
         
         return True, f"Added {len(new_encodings)} encodings for {person_name}"
     
+    def remove_person_from_model(self, person_name):
+        """Remove a person's encodings from the trained model"""
+        if not self.known_names:
+            return False, "No trained model exists"
+        
+        # Check if person exists in model
+        if person_name not in self.known_names:
+            return True, f"{person_name} not found in model (already removed or never trained)"
+        
+        # Count encodings to remove
+        count_before = len(self.known_encodings)
+        
+        # Remove all encodings for this person
+        indices_to_keep = [i for i, name in enumerate(self.known_names) if name != person_name]
+        self.known_encodings = [self.known_encodings[i] for i in indices_to_keep]
+        self.known_names = [self.known_names[i] for i in indices_to_keep]
+        
+        count_removed = count_before - len(self.known_encodings)
+        
+        # Save updated model
+        if self.known_encodings:
+            data = {"encodings": self.known_encodings, "names": self.known_names}
+            with open(self.encodings_path, "wb") as f:
+                f.write(pickle.dumps(data))
+        else:
+            # No encodings left, remove the file
+            if os.path.exists(self.encodings_path):
+                os.remove(self.encodings_path)
+        
+        # Clear cache
+        self.face_cache.clear()
+        
+        return True, f"Removed {count_removed} encodings for {person_name}"
+    
     def detect_faces_fast(self, frame):
         """Fast face detection using Haar cascade (no recognition)"""
         small_frame = cv2.resize(frame, (0, 0), fx=1/self.cv_scaler, fy=1/self.cv_scaler)
@@ -2484,7 +2518,7 @@ class DoorEntryKiosk:
             messagebox.showerror("Training Failed", message)
     
     def delete_person(self):
-        """Delete selected person from dataset"""
+        """Delete selected person from dataset and model"""
         selection = self.manage_listbox.curselection()
         if not selection:
             messagebox.showwarning("Warning", "Please select a person to delete")
@@ -2498,12 +2532,26 @@ class DoorEntryKiosk:
             messagebox.showerror("Error", "Could not identify selected person. Please refresh and try again.")
             return
         
-        if messagebox.askyesno("Confirm Delete", f"Delete all photos for '{name}'?"):
+        if messagebox.askyesno("Confirm Delete", f"Delete '{name}' from dataset and recognition model?"):
             import shutil
+            
+            # Delete from dataset folder
             person_folder = os.path.join(self.face_system.dataset_path, name)
             if os.path.exists(person_folder):
                 shutil.rmtree(person_folder)
-                self.refresh_manage_list()
+            
+            # Remove from trained model
+            success, message = self.face_system.remove_person_from_model(name)
+            if success:
+                print(f"[DELETE] {message}")
+            else:
+                print(f"[DELETE] Warning: {message}")
+            
+            # Update UI
+            self.refresh_manage_list()
+            self.update_info_label()
+            
+            messagebox.showinfo("Deleted", f"'{name}' has been removed from the system.")
     
     def clear_access_log(self):
         """Clear the access log"""
