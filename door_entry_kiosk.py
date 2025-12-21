@@ -791,68 +791,97 @@ class OnScreenKeyboard:
         self.entry = entry_widget
         self.is_password = is_password
         self.shift_on = False
-        self.caps_on = False
         
         # Create keyboard window
         self.keyboard_window = tk.Toplevel(parent)
         self.keyboard_window.title("")
         self.keyboard_window.overrideredirect(True)
         self.keyboard_window.attributes('-topmost', True)
-        self.keyboard_window.configure(bg=Config.COLOR_BG)
+        self.keyboard_window.configure(bg=Config.COLOR_BORDER)
         
-        # Position keyboard at bottom of parent window
+        # Position keyboard at bottom of parent window - sized for 480px width
         parent.update_idletasks()
         x = parent.winfo_rootx()
-        y = parent.winfo_rooty() + parent.winfo_height() - 220
-        self.keyboard_window.geometry(f"480x220+{x}+{y}")
+        y = parent.winfo_rooty() + parent.winfo_height() - 185
+        self.keyboard_window.geometry(f"480x185+{x}+{y}")
         
         self._create_keyboard()
         
-        # Handle window close
+        # Handle window close and focus loss
         self.keyboard_window.protocol("WM_DELETE_WINDOW", self.close)
+        self.entry.bind('<FocusOut>', self._on_focus_out)
+        self.entry.bind('<Return>', lambda e: self.close())
         OnScreenKeyboard._active_keyboard = self
     
+    def _on_focus_out(self, event):
+        """Close keyboard when entry loses focus (with delay to allow button clicks)"""
+        self.keyboard_window.after(100, self._check_focus)
+    
+    def _check_focus(self):
+        """Check if focus is still on entry or keyboard, close if not"""
+        try:
+            focused = self.parent.focus_get()
+            # If focus went to keyboard buttons, don't close
+            if focused and str(focused).startswith(str(self.keyboard_window)):
+                return
+            # If focus is still on entry, don't close
+            if focused == self.entry:
+                return
+            self.close()
+        except:
+            pass
+    
     def _create_keyboard(self):
-        """Create the keyboard layout"""
+        """Create the keyboard layout - compact for 480px width"""
         main_frame = tk.Frame(self.keyboard_window, bg=Config.COLOR_BG)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         
-        # Keyboard rows
+        # Keyboard rows - compact layout
         rows = [
             ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
             ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'],
-            ['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l'],
+            ['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', '@'],
             ['⇧', 'z', 'x', 'c', 'v', 'b', 'n', 'm', '⌫'],
-            ['Done', ' ', '.']
+            ['Cancel', ' ', '.', 'Done']
         ]
         
         for row_idx, row in enumerate(rows):
             row_frame = tk.Frame(main_frame, bg=Config.COLOR_BG)
-            row_frame.pack(fill=tk.X, pady=2)
+            row_frame.pack(fill=tk.X, pady=1)
             
             for key in row:
                 if key == ' ':
-                    btn_width = 20
-                elif key in ('Done', '⇧', '⌫'):
-                    btn_width = 5
+                    btn_width = 12
+                elif key in ('Done', 'Cancel'):
+                    btn_width = 6
+                elif key in ('⇧', '⌫'):
+                    btn_width = 4
                 else:
                     btn_width = 3
+                
+                bg_color = Config.COLOR_CARD
+                fg_color = Config.COLOR_TEXT
+                if key == 'Done':
+                    bg_color = Config.COLOR_SCANNING
+                    fg_color = "#FFFFFF"
+                elif key == 'Cancel':
+                    bg_color = Config.COLOR_CARD_SECONDARY
+                    fg_color = Config.COLOR_TEXT_SECONDARY
                 
                 btn = tk.Button(
                     row_frame,
                     text=key,
-                    font=(Config.FONT_FAMILY, 14),
+                    font=(Config.FONT_FAMILY, 11),
                     width=btn_width,
                     height=1,
-                    bg=Config.COLOR_CARD,
-                    fg=Config.COLOR_TEXT,
+                    bg=bg_color,
+                    fg=fg_color,
                     activebackground=Config.COLOR_CARD_SECONDARY,
                     relief=tk.FLAT,
-                    highlightthickness=1,
-                    highlightbackground=Config.COLOR_BORDER,
+                    highlightthickness=0,
                     command=lambda k=key: self._on_key_press(k)
                 )
-                btn.pack(side=tk.LEFT, padx=1, ipady=8)
+                btn.pack(side=tk.LEFT, padx=1, ipady=4)
                 
                 # Store shift button reference
                 if key == '⇧':
@@ -861,6 +890,9 @@ class OnScreenKeyboard:
     def _on_key_press(self, key):
         """Handle key press"""
         if key == 'Done':
+            self.close()
+        elif key == 'Cancel':
+            self.entry.delete(0, tk.END)
             self.close()
         elif key == '⌫':
             # Backspace
@@ -885,8 +917,16 @@ class OnScreenKeyboard:
     
     def close(self):
         """Close the keyboard"""
+        try:
+            self.entry.unbind('<FocusOut>')
+            self.entry.unbind('<Return>')
+        except:
+            pass
         OnScreenKeyboard._active_keyboard = None
-        self.keyboard_window.destroy()
+        try:
+            self.keyboard_window.destroy()
+        except:
+            pass
 
 
 def show_keyboard(parent, entry_widget, is_password=False):
