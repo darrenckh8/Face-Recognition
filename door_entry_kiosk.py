@@ -646,52 +646,21 @@ class FaceRecognitionSystem:
         """
         Robust face detection using dlib (via face_recognition library).
         Better at detecting faces at various angles - ideal for registration.
-        Uses minimal downscaling for better detection at extreme angles.
+        Slower than Haar cascade but more reliable.
         """
-        # Use less aggressive downscaling for better angle detection
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Downscale for faster processing
+        small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+        rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
         
-        # Use face_recognition's HOG-based detector with number_of_times_to_upsample=1
-        # for better small/angled face detection
-        face_locations = face_recognition.face_locations(rgb_frame, model="hog", number_of_times_to_upsample=1)
+        # Use face_recognition's HOG-based detector (more robust to angles)
+        face_locations = face_recognition.face_locations(rgb_small, model="hog")
         
-        return face_locations
-    
-    def detect_faces_for_registration(self, frame):
-        """
-        Optimized face detection specifically for registration mode.
-        Prioritizes detection reliability over speed.
-        Uses multiple detection attempts with different parameters.
-        """
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Scale back to original size
+        scaled_locations = []
+        for (top, right, bottom, left) in face_locations:
+            scaled_locations.append((top * 2, right * 2, bottom * 2, left * 2))
         
-        # Try standard HOG detection first (faster)
-        face_locations = face_recognition.face_locations(rgb_frame, model="hog", number_of_times_to_upsample=1)
-        
-        if face_locations:
-            return face_locations
-        
-        # If no face found, try with upsampling for smaller/distant faces
-        face_locations = face_recognition.face_locations(rgb_frame, model="hog", number_of_times_to_upsample=2)
-        
-        if face_locations:
-            return face_locations
-        
-        # Last resort: try Haar cascade with relaxed parameters
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self.face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.05,  # More thorough scanning
-            minNeighbors=3,    # More permissive
-            minSize=(20, 20),
-            flags=cv2.CASCADE_SCALE_IMAGE
-        )
-        
-        locations = []
-        for (x, y, w, h) in faces:
-            locations.append((y, x + w, y + h, x))
-        
-        return locations
+        return scaled_locations
     
     def detect_faces_combined(self, frame):
         """
@@ -1245,8 +1214,9 @@ class DoorEntryKiosk:
                                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1)
                 
                 elif self.registration_mode:
-                    # Registration mode - use optimized detection for best angle coverage
-                    faces = self.face_system.detect_faces_for_registration(frame)
+                    # Registration mode - use robust detection for better angle coverage
+                    # Combined detection tries fast Haar first, then robust dlib
+                    faces = self.face_system.detect_faces_combined(frame)
                     
                     frame_height, frame_width = display_frame.shape[:2]
                     
@@ -1292,24 +1262,7 @@ class DoorEntryKiosk:
                             cv2.putText(display_frame, guidance, (frame_width // 2 - 150, frame_height - 40),
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                         else:
-                            # Pose estimation failed but face detected - still capture in auto mode
-                            # This happens at extreme angles where landmarks aren't visible
-                            cv2.rectangle(display_frame, (int(left), int(top)), (int(right), int(bottom)), (255, 165, 0), 3)
-                            
-                            if self.auto_capture_mode:
-                                now = time.time()
-                                # Capture at extreme angles with slightly longer interval
-                                if now - self.last_auto_capture >= self.auto_capture_interval * 1.5:
-                                    if self.captured_count < self.auto_capture_target:
-                                        filepath = self.face_system.save_face_image(frame, self.registration_name)
-                                        self.captured_count += 1
-                                        # Mark as 'extreme' zone for tracking
-                                        self.pose_zones_captured['extreme'] = self.pose_zones_captured.get('extreme', 0) + 1
-                                        self.last_auto_capture = now
-                                        self.root.after(0, self.update_registration_ui)
-                            
-                            cv2.putText(display_frame, "Extreme angle - keep moving slowly", (frame_width // 2 - 160, frame_height - 40),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
+                            cv2.rectangle(display_frame, (int(left), int(top)), (int(right), int(bottom)), (0, 255, 255), 3)
                     
                     elif len(faces) == 0:
                         cv2.putText(display_frame, "No face detected - position your face", (frame_width // 2 - 180, frame_height // 2),
@@ -2373,31 +2326,24 @@ class DoorEntryKiosk:
     
     def get_pose_zone(self, yaw, pitch):
         """
-        Determine which of 9 pose zones the current head pose falls into.
-        Returns zone name: 'center', 'up', 'down', 'left', 'right', 
-                          'up_left', 'up_right', 'down_left', 'down_right'
+        Determine which of 5 pose zones the current head pose falls into.
+        Simplified zones for more reliable detection.
+        Returns zone name: 'center', 'up', 'down', 'left', 'right'
         """
-        yaw_threshold = 12
-        pitch_threshold = 10
+        # Much more forgiving thresholds
+        yaw_threshold = 6  # Reduced from 12
+        pitch_threshold = 5  # Reduced from 10
         
+        # Determine primary direction based on which angle is larger
         if abs(yaw) < yaw_threshold and abs(pitch) < pitch_threshold:
             return 'center'
-        elif pitch > pitch_threshold:
-            if yaw < -yaw_threshold:
-                return 'up_left'
-            elif yaw > yaw_threshold:
-                return 'up_right'
-            else:
+        elif abs(pitch) > abs(yaw):  # Pitch is dominant
+            if pitch > 0:
                 return 'up'
-        elif pitch < -pitch_threshold:
-            if yaw < -yaw_threshold:
-                return 'down_left'
-            elif yaw > yaw_threshold:
-                return 'down_right'
             else:
                 return 'down'
-        else:
-            if yaw < -yaw_threshold:
+        else:  # Yaw is dominant
+            if yaw < 0:
                 return 'left'
             else:
                 return 'right'
@@ -2407,14 +2353,14 @@ class DoorEntryKiosk:
         Determine if we should capture at this pose.
         Ensures variety in captured angles.
         """
-        min_angle_diff = 5  # Minimum angle difference from previous captures
+        min_angle_diff = 3  # Reduced from 5 - more forgiving
         
-        # Always capture first few photos
-        if len(self.captured_poses) < 10:
+        # Always capture first several photos
+        if len(self.captured_poses) < 20:
             return True
         
         # Check if this pose is different enough from recent captures
-        for prev_yaw, prev_pitch in self.captured_poses[-15:]:
+        for prev_yaw, prev_pitch in self.captured_poses[-10:]:  # Check fewer recent captures
             if abs(yaw - prev_yaw) < min_angle_diff and abs(pitch - prev_pitch) < min_angle_diff:
                 return False
         
@@ -2422,9 +2368,9 @@ class DoorEntryKiosk:
     
     def get_pose_guidance(self):
         """Get guidance text based on which zones need more coverage"""
+        # Simplified 5-zone targets
         zone_targets = {
-            'center': 15, 'up': 12, 'down': 12, 'left': 12, 'right': 12,
-            'up_left': 10, 'up_right': 10, 'down_left': 10, 'down_right': 10
+            'center': 25, 'up': 20, 'down': 20, 'left': 20, 'right': 20
         }
         
         # Find zones that need more photos
@@ -2440,14 +2386,10 @@ class DoorEntryKiosk:
         # Prioritize guidance
         zone_guidance = {
             'center': "Look straight at camera",
-            'up': "Look up slightly",
-            'down': "Look down slightly", 
+            'up': "Tilt chin up slightly",
+            'down': "Tilt chin down slightly", 
             'left': "Turn head left",
-            'right': "Turn head right",
-            'up_left': "Look up and left",
-            'up_right': "Look up and right",
-            'down_left': "Look down and left",
-            'down_right': "Look down and right"
+            'right': "Turn head right"
         }
         
         # Return guidance for first needed zone
@@ -2466,11 +2408,11 @@ class DoorEntryKiosk:
         cv2.circle(frame, (compass_x, compass_y), compass_size // 2, (50, 50, 50), -1)
         cv2.circle(frame, (compass_x, compass_y), compass_size // 2, (100, 100, 100), 2)
         
-        # Draw zone indicators (9 zones)
+        # Draw zone indicators (5 simplified zones)
         zones_pos = {
-            'up_left': (-20, -20), 'up': (0, -25), 'up_right': (20, -20),
-            'left': (-25, 0), 'center': (0, 0), 'right': (25, 0),
-            'down_left': (-20, 20), 'down': (0, 25), 'down_right': (20, 20)
+            'up': (0, -22),
+            'left': (-22, 0), 'center': (0, 0), 'right': (22, 0),
+            'down': (0, 22)
         }
         
         for z, (dx, dy) in zones_pos.items():
@@ -2521,7 +2463,7 @@ class DoorEntryKiosk:
         zones_filled = len(self.pose_zones_captured)
         if self.auto_capture_mode:
             self.reg_count_label.config(
-                text=f"{self.captured_count}/{self.auto_capture_target} photos • {zones_filled}/9 angles"
+                text=f"{self.captured_count}/{self.auto_capture_target} photos • {zones_filled}/5 angles"
             )
         else:
             self.reg_count_label.config(text=f"{self.captured_count} photos captured")
@@ -2534,12 +2476,12 @@ class DoorEntryKiosk:
         
         zones_filled = len(self.pose_zones_captured)
         self.reg_count_label.config(
-            text=f"✓ {self.captured_count} photos from {zones_filled} angles"
+            text=f"✓ {self.captured_count} photos from {zones_filled}/5 angles"
         )
         
         messagebox.showinfo(
             "Auto Capture Complete", 
-            f"Successfully captured {self.captured_count} photos covering {zones_filled} head pose angles.\\n\\n"
+            f"Successfully captured {self.captured_count} photos covering {zones_filled}/5 head pose angles.\n\n"
             "Click 'Stop' to finish and train the model."
         )
     
