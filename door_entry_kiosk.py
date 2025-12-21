@@ -792,34 +792,30 @@ class OnScreenKeyboard:
         self.root_window = root_window
         self.shift_on = False
         self.keyboard_frame = None
+        self.all_buttons = []  # Track all keyboard buttons
         
         self._create_keyboard()
         
         # Bind events for auto-close
         self.entry.bind('<Return>', lambda e: self.close())
-        self.root_window.bind('<Button-1>', self._on_click_outside, add='+')
-        self.root_window.bind('<FocusOut>', lambda e: self.close(), add='+')
         
         OnScreenKeyboard._active_keyboard = self
     
-    def _on_click_outside(self, event):
-        """Close keyboard if click is outside keyboard and entry"""
-        widget = event.widget
-        # Check if click is on keyboard or entry
-        if self.keyboard_frame:
-            try:
-                # Get all keyboard children
-                kb_widgets = [self.keyboard_frame]
-                kb_widgets.extend(self.keyboard_frame.winfo_children())
-                for child in self.keyboard_frame.winfo_children():
-                    kb_widgets.extend(child.winfo_children())
-                
-                if widget in kb_widgets or widget == self.entry:
-                    return  # Don't close
-                
-                self.close()
-            except:
-                pass
+    def _is_keyboard_widget(self, widget):
+        """Check if widget is part of keyboard"""
+        if widget == self.keyboard_frame or widget == self.entry:
+            return True
+        if widget in self.all_buttons:
+            return True
+        try:
+            parent = widget.master
+            while parent:
+                if parent == self.keyboard_frame:
+                    return True
+                parent = parent.master
+        except:
+            pass
+        return False
     
     def _create_keyboard(self):
         """Create the keyboard layout embedded in container"""
@@ -830,12 +826,12 @@ class OnScreenKeyboard:
         main_frame = tk.Frame(self.keyboard_frame, bg=Config.COLOR_BG)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         
-        # Keyboard rows - compact layout for 480px
+        # Keyboard rows - all keys same size except space bar
         rows = [
             ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
             ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'],
             ['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', '@'],
-            ['⇧', 'z', 'x', 'c', 'v', 'b', 'n', 'm', '⌫'],
+            ['⇧', 'z', 'x', 'c', 'v', 'b', 'n', 'm', '-', '⌫'],
             ['✕', ' ', '.', '✓']
         ]
         
@@ -844,15 +840,6 @@ class OnScreenKeyboard:
             row_frame.pack(fill=tk.X, pady=1)
             
             for key in row:
-                if key == ' ':
-                    btn_width = 14
-                elif key in ('✓', '✕'):
-                    btn_width = 5
-                elif key in ('⇧', '⌫'):
-                    btn_width = 4
-                else:
-                    btn_width = 3
-                
                 bg_color = Config.COLOR_CARD
                 fg_color = Config.COLOR_TEXT
                 if key == '✓':
@@ -862,12 +849,13 @@ class OnScreenKeyboard:
                     bg_color = Config.COLOR_DENIED
                     fg_color = "#FFFFFF"
                 
+                # Use expand for equal sizing, space bar gets more expand weight
+                expand_weight = 3 if key == ' ' else 1
+                
                 btn = tk.Button(
                     row_frame,
-                    text=key,
-                    font=(Config.FONT_FAMILY, 12),
-                    width=btn_width,
-                    height=1,
+                    text=key if key != ' ' else '␣',
+                    font=(Config.FONT_FAMILY, 13),
                     bg=bg_color,
                     fg=fg_color,
                     activebackground=Config.COLOR_CARD_SECONDARY,
@@ -875,7 +863,8 @@ class OnScreenKeyboard:
                     highlightthickness=0,
                     command=lambda k=key: self._on_key_press(k)
                 )
-                btn.pack(side=tk.LEFT, padx=1, ipady=5)
+                btn.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=1, ipady=8)
+                self.all_buttons.append(btn)
                 
                 if key == '⇧':
                     self.shift_btn = btn
@@ -911,11 +900,10 @@ class OnScreenKeyboard:
         """Close the keyboard"""
         try:
             self.entry.unbind('<Return>')
-            self.root_window.unbind('<Button-1>')
-            self.root_window.unbind('<FocusOut>')
         except:
             pass
         OnScreenKeyboard._active_keyboard = None
+        self.all_buttons = []
         if self.keyboard_frame:
             try:
                 self.keyboard_frame.destroy()
@@ -1553,6 +1541,9 @@ class DoorEntryKiosk:
         # Bind Enter and Escape keys
         password_entry.bind('<Return>', on_ok)
         login_dialog.bind('<Escape>', on_cancel)
+        
+        # Show keyboard immediately
+        login_dialog.after(100, lambda: self._show_password_keyboard(login_dialog, content, password_entry))
         
         # Wait for dialog to close
         self.root.wait_window(login_dialog)
@@ -2631,7 +2622,7 @@ class DoorEntryKiosk:
     def update_info_label(self):
         """Update the info label"""
         count = len(self.face_system.get_trained_persons())
-        self.info_label.config(text=f"{count} Users")
+        self.info_label.config(text=f"{count} registered users")
     
     def on_tab_changed(self, event):
         """Handle notebook tab change - prevent if capture or training in progress"""
