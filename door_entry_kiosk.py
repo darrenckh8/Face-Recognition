@@ -775,11 +775,11 @@ class FaceRecognitionSystem:
 
 # ==================== ON-SCREEN KEYBOARD ====================
 class OnScreenKeyboard:
-    """Touch-friendly on-screen keyboard for text entry"""
+    """Touch-friendly on-screen keyboard embedded in parent container"""
     
     _active_keyboard = None  # Track active keyboard to prevent duplicates
     
-    def __init__(self, parent, entry_widget, is_password=False):
+    def __init__(self, container, entry_widget, root_window):
         # Close any existing keyboard first
         if OnScreenKeyboard._active_keyboard is not None:
             try:
@@ -787,73 +787,67 @@ class OnScreenKeyboard:
             except:
                 pass
         
-        self.parent = parent
+        self.container = container
         self.entry = entry_widget
-        self.is_password = is_password
+        self.root_window = root_window
         self.shift_on = False
-        
-        # Create keyboard window
-        self.keyboard_window = tk.Toplevel(parent)
-        self.keyboard_window.title("")
-        self.keyboard_window.overrideredirect(True)
-        self.keyboard_window.attributes('-topmost', True)
-        self.keyboard_window.configure(bg=Config.COLOR_BORDER)
-        
-        # Position keyboard at bottom of parent window - sized for 480px width
-        parent.update_idletasks()
-        x = parent.winfo_rootx()
-        y = parent.winfo_rooty() + parent.winfo_height() - 185
-        self.keyboard_window.geometry(f"480x185+{x}+{y}")
+        self.keyboard_frame = None
         
         self._create_keyboard()
         
-        # Handle window close and focus loss
-        self.keyboard_window.protocol("WM_DELETE_WINDOW", self.close)
-        self.entry.bind('<FocusOut>', self._on_focus_out)
+        # Bind events for auto-close
         self.entry.bind('<Return>', lambda e: self.close())
+        self.root_window.bind('<Button-1>', self._on_click_outside, add='+')
+        self.root_window.bind('<FocusOut>', lambda e: self.close(), add='+')
+        
         OnScreenKeyboard._active_keyboard = self
     
-    def _on_focus_out(self, event):
-        """Close keyboard when entry loses focus (with delay to allow button clicks)"""
-        self.keyboard_window.after(100, self._check_focus)
-    
-    def _check_focus(self):
-        """Check if focus is still on entry or keyboard, close if not"""
-        try:
-            focused = self.parent.focus_get()
-            # If focus went to keyboard buttons, don't close
-            if focused and str(focused).startswith(str(self.keyboard_window)):
-                return
-            # If focus is still on entry, don't close
-            if focused == self.entry:
-                return
-            self.close()
-        except:
-            pass
+    def _on_click_outside(self, event):
+        """Close keyboard if click is outside keyboard and entry"""
+        widget = event.widget
+        # Check if click is on keyboard or entry
+        if self.keyboard_frame:
+            try:
+                # Get all keyboard children
+                kb_widgets = [self.keyboard_frame]
+                kb_widgets.extend(self.keyboard_frame.winfo_children())
+                for child in self.keyboard_frame.winfo_children():
+                    kb_widgets.extend(child.winfo_children())
+                
+                if widget in kb_widgets or widget == self.entry:
+                    return  # Don't close
+                
+                self.close()
+            except:
+                pass
     
     def _create_keyboard(self):
-        """Create the keyboard layout - compact for 480px width"""
-        main_frame = tk.Frame(self.keyboard_window, bg=Config.COLOR_BG)
+        """Create the keyboard layout embedded in container"""
+        # Create keyboard frame at bottom of container
+        self.keyboard_frame = tk.Frame(self.container, bg=Config.COLOR_BORDER)
+        self.keyboard_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        main_frame = tk.Frame(self.keyboard_frame, bg=Config.COLOR_BG)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         
-        # Keyboard rows - compact layout
+        # Keyboard rows - compact layout for 480px
         rows = [
             ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
             ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'],
             ['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', '@'],
             ['⇧', 'z', 'x', 'c', 'v', 'b', 'n', 'm', '⌫'],
-            ['Cancel', ' ', '.', 'Done']
+            ['✕', ' ', '.', '✓']
         ]
         
-        for row_idx, row in enumerate(rows):
+        for row in rows:
             row_frame = tk.Frame(main_frame, bg=Config.COLOR_BG)
             row_frame.pack(fill=tk.X, pady=1)
             
             for key in row:
                 if key == ' ':
-                    btn_width = 12
-                elif key in ('Done', 'Cancel'):
-                    btn_width = 6
+                    btn_width = 14
+                elif key in ('✓', '✕'):
+                    btn_width = 5
                 elif key in ('⇧', '⌫'):
                     btn_width = 4
                 else:
@@ -861,17 +855,17 @@ class OnScreenKeyboard:
                 
                 bg_color = Config.COLOR_CARD
                 fg_color = Config.COLOR_TEXT
-                if key == 'Done':
-                    bg_color = Config.COLOR_SCANNING
+                if key == '✓':
+                    bg_color = Config.COLOR_GRANTED
                     fg_color = "#FFFFFF"
-                elif key == 'Cancel':
-                    bg_color = Config.COLOR_CARD_SECONDARY
-                    fg_color = Config.COLOR_TEXT_SECONDARY
+                elif key == '✕':
+                    bg_color = Config.COLOR_DENIED
+                    fg_color = "#FFFFFF"
                 
                 btn = tk.Button(
                     row_frame,
                     text=key,
-                    font=(Config.FONT_FAMILY, 11),
+                    font=(Config.FONT_FAMILY, 12),
                     width=btn_width,
                     height=1,
                     bg=bg_color,
@@ -881,57 +875,60 @@ class OnScreenKeyboard:
                     highlightthickness=0,
                     command=lambda k=key: self._on_key_press(k)
                 )
-                btn.pack(side=tk.LEFT, padx=1, ipady=4)
+                btn.pack(side=tk.LEFT, padx=1, ipady=5)
                 
-                # Store shift button reference
                 if key == '⇧':
                     self.shift_btn = btn
     
     def _on_key_press(self, key):
         """Handle key press"""
-        if key == 'Done':
+        if key == '✓':
             self.close()
-        elif key == 'Cancel':
+        elif key == '✕':
             self.entry.delete(0, tk.END)
             self.close()
         elif key == '⌫':
-            # Backspace
             current = self.entry.get()
             self.entry.delete(0, tk.END)
             self.entry.insert(0, current[:-1])
         elif key == '⇧':
-            # Toggle shift
             self.shift_on = not self.shift_on
             self.shift_btn.config(bg=Config.COLOR_SCANNING if self.shift_on else Config.COLOR_CARD,
                                   fg="#FFFFFF" if self.shift_on else Config.COLOR_TEXT)
         elif key == ' ':
             self.entry.insert(tk.END, ' ')
         else:
-            # Regular character
             char = key.upper() if self.shift_on else key
             self.entry.insert(tk.END, char)
-            # Turn off shift after one character
             if self.shift_on:
                 self.shift_on = False
                 self.shift_btn.config(bg=Config.COLOR_CARD, fg=Config.COLOR_TEXT)
+        
+        # Keep focus on entry
+        self.entry.focus_set()
     
     def close(self):
         """Close the keyboard"""
         try:
-            self.entry.unbind('<FocusOut>')
             self.entry.unbind('<Return>')
+            self.root_window.unbind('<Button-1>')
+            self.root_window.unbind('<FocusOut>')
         except:
             pass
         OnScreenKeyboard._active_keyboard = None
-        try:
-            self.keyboard_window.destroy()
-        except:
-            pass
+        if self.keyboard_frame:
+            try:
+                self.keyboard_frame.destroy()
+            except:
+                pass
+        self.keyboard_frame = None
 
 
-def show_keyboard(parent, entry_widget, is_password=False):
-    """Show the on-screen keyboard for an entry widget"""
-    OnScreenKeyboard(parent, entry_widget, is_password)
+def show_keyboard(container, entry_widget, root_window=None):
+    """Show the on-screen keyboard embedded in container"""
+    if root_window is None:
+        root_window = container
+    OnScreenKeyboard(container, entry_widget, root_window)
 
 
 # ==================== KIOSK GUI ====================
@@ -1509,7 +1506,7 @@ class DoorEntryKiosk:
             insertbackground=Config.COLOR_TEXT
         )
         password_entry.pack(fill=tk.X, ipady=8)
-        password_entry.bind('<Button-1>', lambda e: show_keyboard(login_dialog, password_entry, is_password=True))
+        password_entry.bind('<Button-1>', lambda e: self._show_password_keyboard(login_dialog, content, password_entry))
         password_entry.focus_set()
         
         # Button frame
@@ -1566,6 +1563,18 @@ class DoorEntryKiosk:
             self.show_admin_panel()
         elif password is not None:
             messagebox.showerror("Error", "Invalid password")
+    
+    def _show_password_keyboard(self, dialog, content, entry):
+        """Show keyboard in password dialog with expanded size"""
+        # Expand dialog to fit keyboard
+        dialog.geometry("480x400")
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() - 480) // 2
+        y = (dialog.winfo_screenheight() - 400) // 2
+        dialog.geometry(f"480x400+{x}+{y}")
+        
+        # Show keyboard
+        show_keyboard(content, entry, dialog)
     
     def show_admin_panel(self):
         """Show the admin control panel - replaces kiosk UI in same window"""
@@ -1662,11 +1671,11 @@ class DoorEntryKiosk:
     def create_register_tab(self, parent):
         """Create registration tab in admin panel with camera preview"""
         # Main container - vertical layout
-        main_container = tk.Frame(parent, bg=Config.COLOR_BG)
-        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.reg_main_container = tk.Frame(parent, bg=Config.COLOR_BG)
+        self.reg_main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
         # Camera preview container with FIXED size to prevent expansion
-        camera_container = tk.Frame(main_container, bg=Config.COLOR_CARD, 
+        camera_container = tk.Frame(self.reg_main_container, bg=Config.COLOR_CARD, 
                                    highlightbackground=Config.COLOR_BORDER, highlightthickness=1,
                                    width=440, height=330)
         camera_container.pack(pady=(0, 5))
@@ -1677,7 +1686,7 @@ class DoorEntryKiosk:
         self.admin_video_label.pack(fill=tk.BOTH, expand=True)
         
         # === SETUP PANEL (shown before starting) ===
-        self.reg_setup_panel = tk.Frame(main_container, bg=Config.COLOR_CARD,
+        self.reg_setup_panel = tk.Frame(self.reg_main_container, bg=Config.COLOR_CARD,
                                         highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
         self.reg_setup_panel.pack(fill=tk.X, pady=3)
         
@@ -1707,7 +1716,7 @@ class DoorEntryKiosk:
             width=30
         )
         self.reg_name_entry.pack(side=tk.LEFT, padx=(8, 10), ipady=3)
-        self.reg_name_entry.bind('<Button-1>', lambda e: show_keyboard(self.root, self.reg_name_entry))
+        self.reg_name_entry.bind('<Button-1>', lambda e: show_keyboard(self.reg_main_container, self.reg_name_entry, self.root))
         
         self.start_reg_btn = tk.Button(
             name_row,
@@ -1724,7 +1733,7 @@ class DoorEntryKiosk:
         self.start_reg_btn.pack(side=tk.RIGHT, ipady=3, ipadx=10)
         
         # === CAPTURE PANEL (shown during registration) ===
-        self.reg_capture_panel = tk.Frame(main_container, bg=Config.COLOR_CARD,
+        self.reg_capture_panel = tk.Frame(self.reg_main_container, bg=Config.COLOR_CARD,
                                           highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
         # Don't pack yet - will be shown when registration starts
         
