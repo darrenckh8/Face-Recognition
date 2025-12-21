@@ -1168,7 +1168,7 @@ class DoorEntryKiosk:
                 
                 display_frame = frame.copy()
                 
-                if self.is_scanning and not self.registration_mode:
+                if self.is_scanning and not self.registration_mode and not self.admin_mode:
                     # Skip recognition if training is in progress (prevents segfault)
                     if self.is_training:
                         cv2.putText(display_frame, "Training in progress...", (50, 50),
@@ -1289,9 +1289,8 @@ class DoorEntryKiosk:
                         self.draw_faceid_overlay(display_frame)
                     
                     elif self.is_training:
-                        # Training in progress - show training message
-                        cv2.putText(display_frame, "Training model...", (frame_width // 2 - 100, frame_height // 2),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+                        # Training in progress - just show clean feed, progress is in UI label
+                        pass
                     else:
                         # Idle/manual capture mode - just show simple face detection
                         faces = self.face_system.detect_faces_combined(frame)
