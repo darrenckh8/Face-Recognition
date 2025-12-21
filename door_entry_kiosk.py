@@ -37,7 +37,7 @@ except ImportError:
 # ==================== CONFIGURATION ====================
 class Config:
     # Kiosk Settings
-    FULLSCREEN = True
+    FULLSCREEN = False
     WINDOW_TITLE = "Door Entry System"
     
     # Admin Settings
@@ -1420,7 +1420,9 @@ class DoorEntryKiosk:
         self.main_frame.pack_forget()
         
         # Force window size to stay consistent
-        if not Config.FULLSCREEN:
+        if Config.FULLSCREEN:
+            self.root.attributes('-fullscreen', True)
+        else:
             self.root.geometry("1280x800")
         
         # Create admin frame in the same window
@@ -2648,7 +2650,9 @@ class DoorEntryKiosk:
         self.admin_frame.destroy()
         
         # Force window size to stay consistent
-        if not Config.FULLSCREEN:
+        if Config.FULLSCREEN:
+            self.root.attributes('-fullscreen', True)
+        else:
             self.root.geometry("1280x800")
         
         self.main_frame.pack(fill=tk.BOTH, expand=True)
