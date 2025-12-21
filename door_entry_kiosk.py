@@ -1454,15 +1454,15 @@ class DoorEntryKiosk:
         # Create custom dialog (simpledialog has issues with fullscreen on macOS)
         login_dialog = tk.Toplevel(self.root)
         login_dialog.title("Admin Login")
-        login_dialog.geometry("350x180")
+        login_dialog.geometry("350x280")
         login_dialog.configure(bg=Config.COLOR_BG)
         login_dialog.resizable(False, False)
         
         # Center on screen
         login_dialog.update_idletasks()
         x = (login_dialog.winfo_screenwidth() - 350) // 2
-        y = (login_dialog.winfo_screenheight() - 180) // 2
-        login_dialog.geometry(f"350x180+{x}+{y}")
+        y = (login_dialog.winfo_screenheight() - 280) // 2
+        login_dialog.geometry(f"350x280+{x}+{y}")
         
         # Make modal
         login_dialog.transient(self.root)
@@ -1558,11 +1558,11 @@ class DoorEntryKiosk:
     def _show_password_keyboard(self, dialog, content, entry):
         """Show keyboard in password dialog with expanded size"""
         # Expand dialog to fit keyboard
-        dialog.geometry("480x400")
+        dialog.geometry("480x450")
         dialog.update_idletasks()
         x = (dialog.winfo_screenwidth() - 480) // 2
-        y = (dialog.winfo_screenheight() - 400) // 2
-        dialog.geometry(f"480x400+{x}+{y}")
+        y = (dialog.winfo_screenheight() - 450) // 2
+        dialog.geometry(f"480x450+{x}+{y}")
         
         # Show keyboard
         show_keyboard(content, entry, dialog)
@@ -2622,7 +2622,7 @@ class DoorEntryKiosk:
     def update_info_label(self):
         """Update the info label"""
         count = len(self.face_system.get_trained_persons())
-        self.info_label.config(text=f"{count} registered users")
+        self.info_label.config(text=f"{count} Users")
     
     def on_tab_changed(self, event):
         """Handle notebook tab change - prevent if capture or training in progress"""
