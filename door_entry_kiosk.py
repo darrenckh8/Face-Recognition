@@ -642,6 +642,49 @@ class FaceRecognitionSystem:
         
         return locations
     
+    def detect_faces_robust(self, frame):
+        """
+        More robust face detection for registration mode.
+        Uses face_recognition's HOG detector which handles angles better than Haar cascade.
+        Falls back to a more lenient Haar cascade if HOG fails.
+        """
+        # Try face_recognition's HOG detector first (more robust at angles)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Scale down for speed
+        small_frame = cv2.resize(rgb_frame, (0, 0), fx=0.5, fy=0.5)
+        
+        locations = face_recognition.face_locations(small_frame, model="hog")
+        
+        if locations:
+            # Scale back up
+            scaled_locations = []
+            for (top, right, bottom, left) in locations:
+                scaled_locations.append((top * 2, right * 2, bottom * 2, left * 2))
+            return scaled_locations
+        
+        # Fallback: Try Haar cascade with more lenient settings
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # More lenient detection parameters for angled faces
+        faces = self.face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.05,  # Smaller scale factor = more thorough
+            minNeighbors=3,    # Fewer neighbors = more detections
+            minSize=(50, 50),
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
+        
+        locations = []
+        for (x, y, w, h) in faces:
+            top = y
+            right = x + w
+            bottom = y + h
+            left = x
+            locations.append((top, right, bottom, left))
+        
+        return locations
+    
     def estimate_head_pose(self, frame, face_location):
         """
         Estimate head pose (yaw, pitch) using facial landmarks.
@@ -1180,8 +1223,8 @@ class DoorEntryKiosk:
                                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1)
                 
                 elif self.registration_mode:
-                    # Registration mode - detect face and estimate pose
-                    faces = self.face_system.detect_faces_fast(frame)
+                    # Registration mode - use robust detection for better angle coverage
+                    faces = self.face_system.detect_faces_robust(frame)
                     
                     frame_height, frame_width = display_frame.shape[:2]
                     
