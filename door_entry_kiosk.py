@@ -2631,7 +2631,7 @@ class DoorEntryKiosk:
     def update_info_label(self):
         """Update the info label"""
         count = len(self.face_system.get_trained_persons())
-        self.info_label.config(text=f"{count} Users")
+        self.info_label.config(text=f"{count} registered users")
     
     def on_tab_changed(self, event):
         """Handle notebook tab change - prevent if capture or training in progress"""
