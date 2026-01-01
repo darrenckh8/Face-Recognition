@@ -306,10 +306,16 @@ class CameraManager:
         self.camera = None
         self.is_running = False
         
-        # Thread-safe frame storage
+        # Thread-safe frame storage with double buffering
         self.current_frame = None
         self.frame_lock = threading.Lock()
         self.capture_thread = None
+        
+        # Pre-allocated frame buffers for zero-copy operation
+        self._frame_buffer_a = None
+        self._frame_buffer_b = None
+        self._active_buffer = 'a'  # Which buffer is currently being written to
+        self._frame_id = 0  # Increments on each new frame
     
     def start(self):
         """Initialize and start the camera with background capture thread"""
@@ -356,7 +362,10 @@ class CameraManager:
         time.sleep(0.3)
     
     def _capture_loop(self):
-        """Background thread that continuously captures frames"""
+        """Background thread that continuously captures frames with buffer reuse"""
+        # Pre-allocate buffers on first frame
+        buffers_initialized = False
+        
         while self.is_running:
             try:
                 if self.use_picamera:
@@ -367,23 +376,55 @@ class CameraManager:
                     if not ret:
                         continue
                 
-                # Store the latest frame thread-safely
+                # Initialize buffers on first valid frame
+                if not buffers_initialized:
+                    h, w = frame.shape[:2]
+                    self._frame_buffer_a = np.empty((h, w, 3), dtype=np.uint8)
+                    self._frame_buffer_b = np.empty((h, w, 3), dtype=np.uint8)
+                    buffers_initialized = True
+                
+                # Copy to inactive buffer (swap on next iteration)
                 with self.frame_lock:
-                    self.current_frame = frame
+                    if self._active_buffer == 'a':
+                        np.copyto(self._frame_buffer_b, frame)
+                        self.current_frame = self._frame_buffer_b
+                        self._active_buffer = 'b'
+                    else:
+                        np.copyto(self._frame_buffer_a, frame)
+                        self.current_frame = self._frame_buffer_a
+                        self._active_buffer = 'a'
+                    self._frame_id += 1
                     
             except Exception as e:
                 print(f"[CAMERA] Capture error: {e}")
                 time.sleep(0.1)
     
-    def capture_frame(self):
-        """Get the latest captured frame (non-blocking)"""
+    def capture_frame(self, copy=True):
+        """Get the latest captured frame (non-blocking)
+        
+        Args:
+            copy: If True, returns a copy (safe for modification).
+                  If False, returns direct reference (faster, read-only use).
+        
+        Returns:
+            Frame array or None if no frame available
+        """
         if not self.is_running:
             return None
         
         with self.frame_lock:
             if self.current_frame is not None:
-                return self.current_frame.copy()
+                if copy:
+                    return self.current_frame.copy()
+                else:
+                    # Return direct reference - caller must not modify
+                    return self.current_frame
         return None
+    
+    def get_frame_id(self):
+        """Get current frame ID for change detection"""
+        with self.frame_lock:
+            return self._frame_id
     
     def stop(self):
         """Stop capture thread and release the camera"""
@@ -1198,6 +1239,12 @@ class DoorEntryKiosk:
         self.latest_recognition_results = []
         self.recognition_results_lock = threading.Lock()
         
+        # Frame processing optimization - pre-allocated buffers
+        self._display_buffer = np.empty((330, 440, 3), dtype=np.uint8)  # Pre-allocated display buffer
+        self._display_buffer_rgb = np.empty((330, 440, 3), dtype=np.uint8)  # Pre-allocated RGB buffer
+        self._last_displayed_frame_id = -1  # Track which frame was last displayed
+        self._cached_imgtk = None  # Cached PhotoImage to avoid recreation
+        
         # Create GUI
         self.create_kiosk_interface()
         
@@ -1455,15 +1502,23 @@ class DoorEntryKiosk:
             frame_time = time.time()
             frame_counter = 0
             
+            # Pre-allocated buffer for display frame modifications
+            display_frame = None
+            
             while self.is_running:
                 loop_start = time.time()
                 
-                # Get the newest frame from the camera
-                frame = self.camera.capture_frame()
+                # Get the newest frame from the camera (zero-copy for read-only use)
+                frame = self.camera.capture_frame(copy=False)
                 if frame is None:
                     continue
                 
-                display_frame = frame.copy()
+                # Only copy when we need to modify (draw overlays)
+                # Reuse display_frame buffer if same size
+                if display_frame is None or display_frame.shape != frame.shape:
+                    display_frame = np.empty_like(frame)
+                np.copyto(display_frame, frame)
+                
                 frame_counter += 1
                 
                 if self.is_scanning and not self.registration_mode and not self.admin_mode:
@@ -1617,11 +1672,15 @@ class DoorEntryKiosk:
                         print(f"Cache cleanup: removed {expired_count} expired entries")
                     self.last_cache_cleanup = now
                 
-                # Store current frame
-                self.current_frame = frame.copy()
+                # Store current frame reference (for registration capture)
+                # Only copy if registration mode needs to save images
+                if self.registration_mode:
+                    self.current_frame = frame.copy() if self.auto_capture_mode else frame
+                else:
+                    self.current_frame = frame  # Reference only, no copy needed
                 
-                # Update display
-                self.root.after(0, lambda f=display_frame: self.display_frame(f))
+                # Update display - pass display_frame which already has overlays drawn
+                self.root.after(0, lambda f=display_frame.copy(): self.display_frame(f))
                 
                 # Adaptive frame rate - aim for ~30 FPS
                 loop_time = time.time() - loop_start
@@ -1634,17 +1693,34 @@ class DoorEntryKiosk:
             self.camera.stop()
     
     def display_frame(self, frame):
-        """Display a frame on the video label (and admin preview if in admin mode)"""
-        if USE_PICAMERA:
-            frame_rgb = frame
+        """Display a frame on the video label (and admin preview if in admin mode)
+        
+        Optimized with:
+        - Lazy BGR→RGB conversion (only when needed)
+        - Pre-allocated resize buffer
+        - Minimal object creation
+        """
+        frame_h, frame_w = frame.shape[:2]
+        target_w, target_h = 440, 330
+        
+        # Resize to display size using pre-allocated buffer if needed
+        if frame_w != target_w or frame_h != target_h:
+            # Resize directly into pre-allocated buffer
+            cv2.resize(frame, (target_w, target_h), dst=self._display_buffer)
+            resized = self._display_buffer
         else:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            resized = frame
         
-        # Fixed 440x330 display size for both views (scaled for 480px window)
-        frame_h, frame_w = frame_rgb.shape[:2]
-        if frame_w != 440 or frame_h != 330:
-            frame_rgb = cv2.resize(frame_rgb, (440, 330))
+        # Lazy color conversion: BGR→RGB only for display
+        if USE_PICAMERA:
+            # Picamera already provides RGB
+            frame_rgb = resized
+        else:
+            # Convert BGR to RGB using pre-allocated buffer
+            cv2.cvtColor(resized, cv2.COLOR_BGR2RGB, dst=self._display_buffer_rgb)
+            frame_rgb = self._display_buffer_rgb
         
+        # Create PIL Image and PhotoImage
         img = Image.fromarray(frame_rgb)
         imgtk = ImageTk.PhotoImage(image=img)
         
