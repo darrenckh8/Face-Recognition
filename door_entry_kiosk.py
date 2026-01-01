@@ -11,7 +11,6 @@ from PIL import Image, ImageTk
 import json
 import queue
 from concurrent.futures import ThreadPoolExecutor
-import gc
 
 # Try to import insightface - required for this application
 try:
@@ -57,7 +56,6 @@ class Config:
     # Performance Settings
     RECOGNITION_INTERVAL_FRAMES = 3  # Only run recognition every N frames
     FACE_CACHE_TTL = 5  # Seconds to cache a recognized face
-    FACE_CACHE_MAX_SIZE = 50  # Maximum cache entries before LRU eviction
     FACE_POSITION_TOLERANCE = 80  # Pixels tolerance for face position matching
     DETECTION_SCALE_FACTOR = 2  # Scale down factor for faster processing
     USE_FAST_DETECTION = False  # Disabled - InsightFace handles detection efficiently
@@ -94,21 +92,13 @@ class Config:
 
 # ==================== FACE CACHE ====================
 class FaceCache:
-    """Caches recognized faces with LRU eviction and memory limits.
+    """Caches recognized faces to avoid repeated recognition of the same face"""
     
-    Memory optimizations:
-    - Max size limit with LRU eviction
-    - Stores only person name reference, not full 512D embedding
-    - Periodic cleanup of expired entries
-    """
-    
-    def __init__(self, ttl=None, position_tolerance=None, max_size=None):
+    def __init__(self, ttl=None, position_tolerance=None):
         self.ttl = ttl or Config.FACE_CACHE_TTL
         self.position_tolerance = position_tolerance or Config.FACE_POSITION_TOLERANCE
-        self.max_size = max_size or Config.FACE_CACHE_MAX_SIZE
-        self.cache = {}  # {cache_key: {name, confidence, location, timestamp, last_access}}
+        self.cache = {}  # {cache_key: {name, confidence, location, timestamp, encoding}}
         self.lock = threading.Lock()
-        self._access_order = []  # Track access order for LRU eviction
     
     def _get_position_key(self, location):
         """Generate a grid-based position key for face location"""
@@ -120,19 +110,6 @@ class FaceCache:
         grid_y = center_y // self.position_tolerance
         return (grid_x, grid_y)
     
-    def _evict_lru(self):
-        """Evict least recently used entries if cache exceeds max size"""
-        while len(self.cache) >= self.max_size and self._access_order:
-            oldest_key = self._access_order.pop(0)
-            if oldest_key in self.cache:
-                del self.cache[oldest_key]
-    
-    def _update_access_order(self, key):
-        """Update LRU access order for a key"""
-        if key in self._access_order:
-            self._access_order.remove(key)
-        self._access_order.append(key)
-    
     def _find_nearby_cache(self, location):
         """Find a cached face near the given location"""
         top, right, bottom, left = location
@@ -142,7 +119,6 @@ class FaceCache:
         now = time.time()
         best_match = None
         best_distance = float('inf')
-        best_key = None
         
         with self.lock:
             # Clean expired entries and find closest match
@@ -161,17 +137,10 @@ class FaceCache:
                 if distance < self.position_tolerance and distance < best_distance:
                     best_distance = distance
                     best_match = entry
-                    best_key = key
             
             # Remove expired entries
             for key in expired_keys:
                 del self.cache[key]
-                if key in self._access_order:
-                    self._access_order.remove(key)
-            
-            # Update access order for found entry
-            if best_key is not None:
-                self._update_access_order(best_key)
         
         return best_match
     
@@ -180,27 +149,21 @@ class FaceCache:
         return self._find_nearby_cache(location)
     
     def put(self, location, name, confidence, encoding=None):
-        """Cache a recognition result (encoding parameter kept for API compatibility but not stored)"""
+        """Cache a recognition result"""
         key = self._get_position_key(location)
         with self.lock:
-            # Evict if at capacity
-            if key not in self.cache:
-                self._evict_lru()
-            
             self.cache[key] = {
                 'name': name,
                 'confidence': confidence,
                 'location': location,
-                'timestamp': time.time()
-                # Note: encoding is NOT stored to save memory
+                'timestamp': time.time(),
+                'encoding': encoding
             }
-            self._update_access_order(key)
     
     def clear(self):
         """Clear all cached entries"""
         with self.lock:
             self.cache.clear()
-            self._access_order.clear()
     
     def cleanup_expired(self):
         """Remove expired entries from cache, returns count of removed entries"""
@@ -209,13 +172,7 @@ class FaceCache:
             expired_keys = [k for k, v in self.cache.items() if now - v['timestamp'] > self.ttl]
             for key in expired_keys:
                 del self.cache[key]
-                if key in self._access_order:
-                    self._access_order.remove(key)
             return len(expired_keys)
-    
-    def size(self):
-        """Return current cache size"""
-        return len(self.cache)
 
 
 # ==================== DOOR CONTROLLER ====================
@@ -492,16 +449,10 @@ class FaceRecognitionSystem:
     def __init__(self, dataset_path=None, encodings_path=None):
         self.dataset_path = dataset_path or Config.DATASET_PATH
         self.encodings_path = encodings_path or Config.ENCODINGS_PATH
-        # Also support compressed numpy format
-        self.encodings_path_npz = self.encodings_path.replace('.pickle', '.npz')
-        
         self.known_encodings = []
         self.known_names = []
         self.known_encodings_normalized = None  # Pre-normalized matrix for fast comparison
         self.cv_scaler = Config.DETECTION_SCALE_FACTOR
-        
-        # Pre-allocated similarity array for memory efficiency
-        self._similarity_buffer = None
         
         # Initialize InsightFace model (buffalo_s is lighter for Raspberry Pi)
         try:
@@ -536,20 +487,7 @@ class FaceRecognitionSystem:
         self.load_encodings()
     
     def load_encodings(self):
-        """Load face encodings with support for compressed numpy format (faster) or pickle fallback"""
-        # Try compressed numpy format first (3-5x faster loading)
-        if os.path.exists(self.encodings_path_npz):
-            try:
-                data = np.load(self.encodings_path_npz, allow_pickle=True)
-                self.known_encodings = list(data['encodings'])
-                self.known_names = list(data['names'])
-                self._update_normalized_encodings()
-                print(f"[INFO] Loaded {len(self.known_encodings)} encodings from compressed format")
-                return True
-            except Exception as e:
-                print(f"Error loading compressed encodings: {e}")
-        
-        # Fallback to pickle format
+        """Load face encodings from pickle file and pre-normalize for fast comparison"""
         if os.path.exists(self.encodings_path):
             try:
                 with open(self.encodings_path, "rb") as f:
@@ -559,40 +497,20 @@ class FaceRecognitionSystem:
                 self.known_names = data["names"]
                 # Pre-normalize encodings for vectorized cosine similarity
                 self._update_normalized_encodings()
-                
-                # Convert to compressed format for faster future loads
-                self._save_compressed_encodings()
                 return True
             except Exception as e:
                 print(f"Error loading encodings: {e}")
                 return False
         return False
     
-    def _save_compressed_encodings(self):
-        """Save encodings in compressed numpy format for faster loading"""
-        if self.known_encodings:
-            try:
-                np.savez_compressed(
-                    self.encodings_path_npz,
-                    encodings=np.array(self.known_encodings),
-                    names=np.array(self.known_names)
-                )
-                print(f"[INFO] Saved compressed encodings to {self.encodings_path_npz}")
-            except Exception as e:
-                print(f"Error saving compressed encodings: {e}")
-    
     def _update_normalized_encodings(self):
         """Pre-normalize all known encodings for fast vectorized comparison"""
         if len(self.known_encodings) > 0:
-            # Use float32 for memory efficiency and InsightFace compatibility
-            encodings_matrix = np.array(self.known_encodings, dtype=np.float32)
+            encodings_matrix = np.array(self.known_encodings)
             norms = np.linalg.norm(encodings_matrix, axis=1, keepdims=True)
             self.known_encodings_normalized = encodings_matrix / norms
-            # Pre-allocate similarity buffer matching the dtype of normalized encodings
-            self._similarity_buffer = np.empty(len(self.known_encodings), dtype=np.float32)
         else:
             self.known_encodings_normalized = None
-            self._similarity_buffer = None
     
     def get_registered_persons(self):
         """Get list of registered persons from dataset folder"""
@@ -658,7 +576,7 @@ class FaceRecognitionSystem:
         if not known_encodings:
             return False, "No faces detected in any images"
         
-        # Save in both formats: pickle for backward compatibility, compressed for speed
+        # Convert to numpy arrays for efficient storage and comparison
         data = {"encodings": [enc.tolist() for enc in known_encodings], "names": known_names}
         with open(self.encodings_path, "wb") as f:
             f.write(pickle.dumps(data))
@@ -668,9 +586,6 @@ class FaceRecognitionSystem:
         
         # Pre-normalize for fast comparison
         self._update_normalized_encodings()
-        
-        # Also save compressed format for faster loading
-        self._save_compressed_encodings()
         
         return True, f"Training complete! {len(known_encodings)} encodings from {len(set(known_names))} persons"
     
@@ -725,9 +640,6 @@ class FaceRecognitionSystem:
         # Pre-normalize for fast comparison
         self._update_normalized_encodings()
         
-        # Also save compressed format for faster loading
-        self._save_compressed_encodings()
-        
         # Clear cache since we have new encodings
         self.face_cache.clear()
         
@@ -759,16 +671,11 @@ class FaceRecognitionSystem:
                 f.write(pickle.dumps(data))
             # Pre-normalize for fast comparison
             self._update_normalized_encodings()
-            # Also save compressed format
-            self._save_compressed_encodings()
         else:
-            # No encodings left, remove both files
+            # No encodings left, remove the file
             if os.path.exists(self.encodings_path):
                 os.remove(self.encodings_path)
-            if os.path.exists(self.encodings_path_npz):
-                os.remove(self.encodings_path_npz)
             self.known_encodings_normalized = None
-            self._similarity_buffer = None
         
         # Clear cache
         self.face_cache.clear()
@@ -877,17 +784,11 @@ class FaceRecognitionSystem:
             name = "Unknown"
             confidence = 0.0
             
-            # Normalize current face encoding (ensure float32 for consistency)
-            face_norm = (face_encoding / np.linalg.norm(face_encoding)).astype(np.float32)
+            # Normalize current face encoding
+            face_norm = face_encoding / np.linalg.norm(face_encoding)
             
-            # Use pre-allocated buffer for similarity computation (avoids allocation per face)
-            if (self._similarity_buffer is not None and 
-                self._similarity_buffer.shape[0] == self.known_encodings_normalized.shape[0]):
-                np.dot(self.known_encodings_normalized, face_norm, out=self._similarity_buffer)
-                similarities = self._similarity_buffer
-            else:
-                # Fallback if buffer size mismatch
-                similarities = np.dot(self.known_encodings_normalized, face_norm)
+            # Single matrix multiplication for all comparisons
+            similarities = np.dot(self.known_encodings_normalized, face_norm)
             
             best_match_index = np.argmax(similarities)
             best_similarity = similarities[best_match_index]
@@ -897,8 +798,8 @@ class FaceRecognitionSystem:
                 name = self.known_names[best_match_index]
                 confidence = float(best_similarity)
             
-            # Cache this result (encoding not stored to save memory)
-            self.face_cache.put(location, name, confidence)
+            # Cache this result
+            self.face_cache.put(location, name, confidence, face_encoding)
             
             results.append({
                 'name': name,
@@ -1872,9 +1773,7 @@ class DoorEntryKiosk:
                 if now - self.last_cache_cleanup > self.cache_cleanup_interval:
                     expired_count = self.face_system.face_cache.cleanup_expired()
                     if expired_count and expired_count > 0:
-                        print(f"Cache cleanup: removed {expired_count} expired entries (cache size: {self.face_system.face_cache.size()})")
-                    # Periodic garbage collection to reclaim memory from large frame arrays
-                    gc.collect()
+                        print(f"Cache cleanup: removed {expired_count} expired entries")
                     self.last_cache_cleanup = now
                 
                 # Store current frame reference (for registration capture)
