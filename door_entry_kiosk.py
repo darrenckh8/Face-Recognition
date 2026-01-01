@@ -127,6 +127,7 @@ class Config:
     # File Paths
     DATASET_PATH = "dataset"
     ENCODINGS_PATH = "encodings.pickle"
+    DISABLED_ENCODINGS_PATH = "disabled_encodings.pickle"  # Revoked users stored here
     ACCESS_LOG_PATH = "access_log.json"
     
     # Apple-like Clean Design Colors
@@ -998,9 +999,11 @@ class FaceRecognitionSystem:
         """
         self.dataset_path = dataset_path or Config.DATASET_PATH
         self.encodings_path = encodings_path or Config.ENCODINGS_PATH
+        self.disabled_encodings_path = Config.DISABLED_ENCODINGS_PATH
         self.known_encodings = []
         self.known_names = []
         self.known_encodings_normalized = None  # Pre-computed for fast matching
+        self.disabled_encodings = {}  # {name: [encodings]} for revoked users
         self.cv_scaler = Config.DETECTION_SCALE_FACTOR
         
         # Face stability tracking - wait for face to settle before recognizing
@@ -1051,6 +1054,28 @@ class FaceRecognitionSystem:
             os.makedirs(self.dataset_path)
         
         self.load_encodings()
+        self.load_disabled_encodings()
+    
+    def load_disabled_encodings(self):
+        """Load revoked user encodings from disk."""
+        if os.path.exists(self.disabled_encodings_path):
+            try:
+                with open(self.disabled_encodings_path, "rb") as f:
+                    self.disabled_encodings = pickle.loads(f.read())
+                logger.info(f"Loaded {len(self.disabled_encodings)} disabled users")
+            except Exception as e:
+                logger.warning(f"Could not load disabled encodings: {e}")
+                self.disabled_encodings = {}
+        else:
+            self.disabled_encodings = {}
+    
+    def save_disabled_encodings(self):
+        """Save revoked user encodings to disk."""
+        try:
+            with open(self.disabled_encodings_path, "wb") as f:
+                f.write(pickle.dumps(self.disabled_encodings))
+        except IOError as e:
+            logger.error(f"Failed to save disabled encodings: {e}")
     
     def load_encodings(self):
         """
@@ -1308,6 +1333,96 @@ class FaceRecognitionSystem:
         self.face_cache.clear()
         
         return True, f"Removed {count_removed} encodings for {person_name}"
+    
+    def revoke_person_access(self, person_name):
+        """
+        Revoke access for a person by moving their encodings to disabled list.
+        Encodings are preserved and can be restored later without retraining.
+        
+        Args:
+            person_name: Name of person to revoke
+            
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        if not self.known_names:
+            return False, "No trained model exists"
+        
+        if person_name not in self.known_names:
+            return False, f"{person_name} not found in model"
+        
+        # Extract encodings for this person
+        person_encodings = [self.known_encodings[i] for i, name in enumerate(self.known_names) if name == person_name]
+        
+        # Store in disabled list
+        self.disabled_encodings[person_name] = [enc.tolist() if hasattr(enc, 'tolist') else enc for enc in person_encodings]
+        self.save_disabled_encodings()
+        
+        # Remove from active model
+        indices_to_keep = [i for i, name in enumerate(self.known_names) if name != person_name]
+        self.known_encodings = [self.known_encodings[i] for i in indices_to_keep]
+        self.known_names = [self.known_names[i] for i in indices_to_keep]
+        
+        # Backup and save
+        if Config.BACKUP_ENABLED:
+            BackupManager.create_backup(self.encodings_path, Config.MAX_BACKUPS)
+        
+        if self.known_encodings:
+            data = {"encodings": [enc.tolist() if hasattr(enc, 'tolist') else enc for enc in self.known_encodings], "names": self.known_names}
+            with open(self.encodings_path, "wb") as f:
+                f.write(pickle.dumps(data))
+            self._update_normalized_encodings()
+        else:
+            if os.path.exists(self.encodings_path):
+                os.remove(self.encodings_path)
+            self.known_encodings_normalized = None
+        
+        self.face_cache.clear()
+        
+        return True, f"Revoked access for {person_name} ({len(person_encodings)} encodings preserved)"
+    
+    def restore_person_access(self, person_name):
+        """
+        Restore access for a previously revoked person.
+        Moves their encodings back from disabled list to active model.
+        
+        Args:
+            person_name: Name of person to restore
+            
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        if person_name not in self.disabled_encodings:
+            return False, f"{person_name} not found in revoked users"
+        
+        # Retrieve stored encodings
+        person_encodings = [np.array(enc, dtype=np.float32) for enc in self.disabled_encodings[person_name]]
+        count = len(person_encodings)
+        
+        # Add back to active model
+        self.known_encodings.extend(person_encodings)
+        self.known_names.extend([person_name] * count)
+        
+        # Remove from disabled list
+        del self.disabled_encodings[person_name]
+        self.save_disabled_encodings()
+        
+        # Backup and save active model
+        if Config.BACKUP_ENABLED:
+            BackupManager.create_backup(self.encodings_path, Config.MAX_BACKUPS)
+        
+        data = {"encodings": [enc.tolist() if hasattr(enc, 'tolist') else enc for enc in self.known_encodings], "names": self.known_names}
+        with open(self.encodings_path, "wb") as f:
+            f.write(pickle.dumps(data))
+        
+        self._update_normalized_encodings()
+        self.face_cache.clear()
+        
+        return True, f"Restored access for {person_name} ({count} encodings)"
+    
+    def get_disabled_persons(self):
+        """Get list of revoked users with their encoding counts."""
+        return [(name, len(encodings)) for name, encodings in self.disabled_encodings.items()]
     
     def detect_faces_fast(self, frame):
         """
@@ -2937,21 +3052,49 @@ class DoorEntryKiosk:
         
         self.refresh_manage_list()
         
-        # Action buttons
-        btn_frame = tk.Frame(parent, bg=Config.COLOR_BG)
-        btn_frame.pack(fill=tk.X, padx=10, pady=8)
+        # Action buttons row 1 - for active users
+        btn_frame1 = tk.Frame(parent, bg=Config.COLOR_BG)
+        btn_frame1.pack(fill=tk.X, padx=10, pady=(8, 2))
         
         tk.Button(
-            btn_frame,
-            text="Delete Selected",
+            btn_frame1,
+            text="Revoke Access",
+            font=(Config.FONT_FAMILY, 9),
+            fg=Config.COLOR_SCANNING,
+            bg=Config.COLOR_BG,
+            activeforeground=Config.COLOR_SCANNING,
+            bd=0,
+            cursor="hand2",
+            command=self.revoke_person_access
+        ).pack(side=tk.LEFT)
+        
+        tk.Button(
+            btn_frame1,
+            text="Delete + Photos",
             font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_DENIED,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_DENIED,
             bd=0,
             cursor="hand2",
-            command=self.delete_person
+            command=self.delete_person_and_photos
         ).pack(side=tk.RIGHT)
+        
+        # Action buttons row 2 - restore revoked users
+        btn_frame2 = tk.Frame(parent, bg=Config.COLOR_BG)
+        btn_frame2.pack(fill=tk.X, padx=10, pady=(2, 8))
+        
+        tk.Button(
+            btn_frame2,
+            text="Restore Access",
+            font=(Config.FONT_FAMILY, 9),
+            fg=Config.COLOR_GRANTED,
+            bg=Config.COLOR_BG,
+            activeforeground=Config.COLOR_GRANTED,
+            bd=0,
+            cursor="hand2",
+            command=self.restore_person_access
+        ).pack(side=tk.LEFT)
     
     def create_log_tab(self, parent):
         """Build the access log tab with filtering capabilities."""
@@ -3198,26 +3341,37 @@ class DoorEntryKiosk:
     # ==================== USER MANAGEMENT METHODS ====================
     
     def refresh_manage_list(self):
-        """Refresh the registered users list in the manage tab.
+        """Refresh the users list showing both active and revoked users.
         
-        Shows users from the trained model (pickle file), not the dataset folder.
-        Maintains an index-to-name mapping for deletion operations.
+        Active users are shown normally, revoked users are shown with
+        a [REVOKED] prefix. Maintains index-to-name mapping for operations.
         """
         self.manage_listbox.delete(0, tk.END)
         self.person_map = {}
+        self.person_status = {}  # Track if user is active or revoked
         
-        # Get trained persons from pickle file (not dataset folder)
+        idx = 0
+        
+        # Get active users from trained model
         trained_names = self.face_system.get_trained_persons()
-        
-        # Count encodings per person for display
         name_counts = {}
         for name in self.face_system.known_names:
             name_counts[name] = name_counts.get(name, 0) + 1
         
-        for idx, name in enumerate(sorted(trained_names)):
+        for name in sorted(trained_names):
             self.person_map[idx] = name
+            self.person_status[idx] = 'active'
             count = name_counts.get(name, 0)
-            self.manage_listbox.insert(tk.END, f"  {name}   •   {count} encodings")
+            self.manage_listbox.insert(tk.END, f"  ✓  {name}   •   {count} encodings")
+            idx += 1
+        
+        # Get revoked users
+        revoked_users = self.face_system.get_disabled_persons()
+        for name, count in sorted(revoked_users):
+            self.person_map[idx] = name
+            self.person_status[idx] = 'revoked'
+            self.manage_listbox.insert(tk.END, f"  ✗  {name}   •   {count} encodings [REVOKED]")
+            idx += 1
     
     def refresh_train_tab(self):
         """Update the training tab's dataset statistics display."""
@@ -3687,39 +3841,120 @@ class DoorEntryKiosk:
     
     # ==================== USER DELETION ====================
     
-    def delete_person(self):
-        """Delete the selected person from the trained model.
+    def revoke_person_access(self):
+        """Revoke access for the selected active user.
         
-        Removes the person's encodings from the saved model but keeps
-        the original photos in the dataset folder. Uses person_map for 
-        robust name lookup to avoid string parsing issues with display text.
+        Moves the person's encodings to the disabled list. They can be
+        restored later without needing to retrain.
         """
         selection = self.manage_listbox.curselection()
         if not selection:
-            messagebox.showwarning("Warning", "Please select a person to delete")
+            messagebox.showwarning("Warning", "Please select a person")
             return
         
         selected_index = selection[0]
-        
-        # Use person_map for robust name lookup
         name = self.person_map.get(selected_index)
+        status = self.person_status.get(selected_index, 'active')
+        
         if name is None:
             messagebox.showerror("Error", "Could not identify selected person. Please refresh and try again.")
             return
         
-        if messagebox.askyesno("Confirm Delete", f"Remove '{name}' from recognition model?\n\n(Photos will be kept in dataset folder)"):
-            # Remove encodings from trained model only (keep photos)
-            success, message = self.face_system.remove_person_from_model(name)
+        if status == 'revoked':
+            messagebox.showinfo("Already Revoked", f"'{name}' is already revoked. Use 'Restore Access' to re-enable.")
+            return
+        
+        if messagebox.askyesno("Revoke Access", f"Revoke access for '{name}'?\n\nEncodings will be preserved for easy restoration."):
+            success, message = self.face_system.revoke_person_access(name)
             if success:
-                logger.info(f"User removed from model: {message}")
+                logger.info(f"Access revoked: {message}")
+                self.refresh_manage_list()
+                self.update_info_label()
+                self.show_toast(f"'{name}' access revoked", "success")
             else:
-                logger.warning(f"Delete warning: {message}")
+                logger.warning(f"Revoke failed: {message}")
+                self.show_toast(f"Failed: {message}", "error")
+    
+    def restore_person_access(self):
+        """Restore access for a previously revoked user.
+        
+        Moves their encodings back from the disabled list to the active model.
+        No retraining required.
+        """
+        selection = self.manage_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("Warning", "Please select a revoked person")
+            return
+        
+        selected_index = selection[0]
+        name = self.person_map.get(selected_index)
+        status = self.person_status.get(selected_index, 'active')
+        
+        if name is None:
+            messagebox.showerror("Error", "Could not identify selected person. Please refresh and try again.")
+            return
+        
+        if status == 'active':
+            messagebox.showinfo("Already Active", f"'{name}' already has access.")
+            return
+        
+        if messagebox.askyesno("Restore Access", f"Restore access for '{name}'?"):
+            success, message = self.face_system.restore_person_access(name)
+            if success:
+                logger.info(f"Access restored: {message}")
+                self.refresh_manage_list()
+                self.update_info_label()
+                self.show_toast(f"'{name}' access restored", "success")
+            else:
+                logger.warning(f"Restore failed: {message}")
+                self.show_toast(f"Failed: {message}", "error")
+    
+    def delete_person_and_photos(self):
+        """Permanently delete a person and all their photos.
+        
+        Removes the person's encodings (from active or disabled list) AND
+        deletes their image folder from the dataset. This action cannot be undone.
+        """
+        selection = self.manage_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("Warning", "Please select a person")
+            return
+        
+        selected_index = selection[0]
+        name = self.person_map.get(selected_index)
+        status = self.person_status.get(selected_index, 'active')
+        
+        if name is None:
+            messagebox.showerror("Error", "Could not identify selected person. Please refresh and try again.")
+            return
+        
+        if messagebox.askyesno("Delete Permanently", f"Permanently delete '{name}' and all their photos?\n\nThis cannot be undone!"):
+            import shutil
             
-            # Refresh UI lists
+            # Delete image folder from dataset
+            person_folder = os.path.join(self.face_system.dataset_path, name)
+            if os.path.exists(person_folder):
+                shutil.rmtree(person_folder)
+                logger.info(f"Deleted photo folder: {person_folder}")
+            
+            # Remove encodings based on current status
+            if status == 'revoked':
+                # Remove from disabled encodings
+                if name in self.face_system.disabled_encodings:
+                    del self.face_system.disabled_encodings[name]
+                    self.face_system.save_disabled_encodings()
+                    logger.info(f"Removed {name} from disabled encodings")
+            else:
+                # Remove from active model
+                success, message = self.face_system.remove_person_from_model(name)
+                if success:
+                    logger.info(f"User deleted: {message}")
+                else:
+                    logger.warning(f"Delete warning: {message}")
+            
             self.refresh_manage_list()
             self.update_info_label()
-            
-            self.show_toast(f"'{name}' removed from recognition", "success")
+            self.show_toast(f"'{name}' permanently deleted", "success")
     
     # ==================== ACCESS LOG MANAGEMENT ====================
     
