@@ -104,7 +104,7 @@ class Config:
     CAMERA_RESOLUTION = (640, 480)        # Camera capture resolution (width, height)
     
     # ----- Face Recognition Settings -----
-    RECOGNITION_THRESHOLD = 0.45          # Minimum cosine similarity for a match (0.4-0.5 recommended)
+    RECOGNITION_THRESHOLD = 0.8          # Minimum cosine similarity for a match
     COOLDOWN_SECONDS = 5                  # Seconds between access logs for same person
     
     # ----- Performance Tuning -----
