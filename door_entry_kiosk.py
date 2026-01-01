@@ -312,7 +312,7 @@ class FaceStabilityTracker:
         stable_frames_required: Number of consecutive stable frames needed
     """
     
-    def __init__(self, stability_threshold: int = 200, stable_frames_required: int = 5):
+    def __init__(self, stability_threshold: int = 300, stable_frames_required: int = 2):
         """
         Initialize the stability tracker.
         
