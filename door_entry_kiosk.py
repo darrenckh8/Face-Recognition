@@ -839,7 +839,13 @@ class AccessLog:
     def clear(self):
         """Delete all log entries from memory and disk."""
         self.entries = []
-        self.save()
+        self._total_entries = 0
+        # Overwrite the JSON file with empty array (don't use save() which merges)
+        try:
+            with open(self.log_path, 'w') as f:
+                json.dump([], f)
+        except IOError as e:
+            logger.error(f"Failed to clear access log file: {e}")
 
 
 # ==================== CAMERA MANAGER ====================
@@ -2771,27 +2777,13 @@ class DoorEntryKiosk:
         )
         self.stop_reg_btn.pack(side=tk.RIGHT, ipady=2, ipadx=8)
         
-        # Bottom row: capture buttons
+        # Bottom row: auto capture button
         btn_row = tk.Frame(capture_inner, bg=Config.COLOR_CARD)
         btn_row.pack(fill=tk.X)
         
-        self.capture_btn = tk.Button(
-            btn_row,
-            text="📷 Capture",
-            font=(Config.FONT_FAMILY, 9),
-            fg="#FFFFFF",
-            bg=Config.COLOR_GRANTED,
-            activebackground="#28a745",
-            activeforeground="#FFFFFF",
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self.capture_photo
-        )
-        self.capture_btn.pack(side=tk.LEFT, ipady=2, ipadx=8)
-        
         self.auto_capture_btn = tk.Button(
             btn_row,
-            text="⟳ Auto (100)",
+            text="⟳ Start Auto Capture (100)",
             font=(Config.FONT_FAMILY, 9),
             fg="#FFFFFF",
             bg="#5856D6",
@@ -2801,21 +2793,7 @@ class DoorEntryKiosk:
             cursor="hand2",
             command=self.start_auto_capture
         )
-        self.auto_capture_btn.pack(side=tk.LEFT, padx=(5, 0), ipady=2, ipadx=8)
-        
-        # Auto-train checkbox (smaller, right side)
-        self.auto_train_var = tk.BooleanVar(value=True)
-        self.auto_train_check = tk.Checkbutton(
-            btn_row,
-            text="Auto-train",
-            variable=self.auto_train_var,
-            font=(Config.FONT_FAMILY, 8),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_CARD,
-            activebackground=Config.COLOR_CARD,
-            selectcolor=Config.COLOR_CARD
-        )
-        self.auto_train_check.pack(side=tk.RIGHT)
+        self.auto_capture_btn.pack(side=tk.LEFT, ipady=2, ipadx=8)
     
     def create_train_tab(self, parent):
         """Build the model training tab with progress indicator.
@@ -3222,16 +3200,24 @@ class DoorEntryKiosk:
     def refresh_manage_list(self):
         """Refresh the registered users list in the manage tab.
         
-        Clears and repopulates the listbox with current registered persons,
-        maintaining an index-to-name mapping for deletion operations.
+        Shows users from the trained model (pickle file), not the dataset folder.
+        Maintains an index-to-name mapping for deletion operations.
         """
         self.manage_listbox.delete(0, tk.END)
         self.person_map = {}
         
-        persons = self.face_system.get_registered_persons()
-        for idx, (name, count) in enumerate(persons):
+        # Get trained persons from pickle file (not dataset folder)
+        trained_names = self.face_system.get_trained_persons()
+        
+        # Count encodings per person for display
+        name_counts = {}
+        for name in self.face_system.known_names:
+            name_counts[name] = name_counts.get(name, 0) + 1
+        
+        for idx, name in enumerate(sorted(trained_names)):
             self.person_map[idx] = name
-            self.manage_listbox.insert(tk.END, f"  {name}   •   {count} photos")
+            count = name_counts.get(name, 0)
+            self.manage_listbox.insert(tk.END, f"  {name}   •   {count} encodings")
     
     def refresh_train_tab(self):
         """Update the training tab's dataset statistics display."""
@@ -3270,6 +3256,7 @@ class DoorEntryKiosk:
         self.captured_count = 0
         self.auto_capture_mode = False
         self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
+        self.reg_process_locked = True  # Lock tab navigation during registration
         
         # Transition UI from setup panel to capture panel
         self.reg_setup_panel.pack_forget()
@@ -3281,38 +3268,16 @@ class DoorEntryKiosk:
         
         self.show_toast(f"Registering {name}", "info")
     
-    def capture_photo(self):
-        """Capture a single photo for registration with face detection validation.
-        
-        Verifies a face is present in the current frame before saving.
-        Provides visual feedback via border pulse on successful capture.
-        """
-        if self.current_frame is not None and self.registration_mode:
-            # Validate face presence before saving
-            faces = self.face_system.detect_faces_fast(self.current_frame)
-            if not faces:
-                self.show_toast("No face detected - position face in frame", "warning")
-                return
-            
-            filepath = self.face_system.save_face_image(self.current_frame, self.registration_name)
-            self.captured_count += 1
-            self.reg_count_label.config(text=f"{self.captured_count} photos")
-            
-            # Visual feedback: green border pulse
-            self._pulse_border(Config.COLOR_GRANTED, 150)
-            
-            logger.debug(f"Registration image saved: {filepath}")
-    
     def stop_registration(self):
         """End the registration session and optionally trigger auto-training.
         
-        Prevents stopping during active capture/training operations.
+        Prevents stopping during active auto-capture/training operations.
         Resets all registration state and transitions UI back to setup mode.
         Triggers single-person training if auto-train option is enabled.
         """
-        # Prevent interruption during capture or encoding
-        if self.reg_process_locked:
-            messagebox.showwarning("Please Wait", "Capture or encoding in progress. Please wait for completion.")
+        # Only block if auto-capture is actively running (not manual capture)
+        if self.auto_capture_mode and self.reg_process_locked:
+            messagebox.showwarning("Please Wait", "Auto-capture or encoding in progress. Please wait for completion.")
             return
         
         # Save registration info before resetting
@@ -3324,14 +3289,14 @@ class DoorEntryKiosk:
         self.registration_name = ""
         self.auto_capture_mode = False
         self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
+        self.reg_process_locked = False  # Unlock tab navigation
         
         # Transition UI back to setup panel
         self.reg_capture_panel.pack_forget()
         self.reg_setup_panel.pack(fill=tk.X, pady=5)
         
-        # Reset capture button states for next registration
-        self.auto_capture_btn.config(text="⟳ Auto (100)", bg="#5856D6", command=self.start_auto_capture)
-        self.capture_btn.config(state=tk.NORMAL)
+        # Reset auto capture button for next registration
+        self.auto_capture_btn.config(text="⟳ Start Auto Capture (100)", bg="#5856D6", command=self.start_auto_capture)
         
         # Clear name entry for next use
         self.reg_name_entry.delete(0, tk.END)
@@ -3344,10 +3309,10 @@ class DoorEntryKiosk:
         if captured > 0:
             self.show_toast(f"Captured {captured} photos for {person_name}", "success")
         
-        # Auto-train if enabled and not already trained via auto-capture flow
+        # Auto-train if not already trained via auto-capture flow
         already_trained = getattr(self, 'already_trained', False)
         self.already_trained = False
-        if not already_trained and hasattr(self, 'auto_train_var') and self.auto_train_var.get() and captured > 0 and person_name:
+        if not already_trained and captured > 0 and person_name:
             self.train_single_person(person_name)
     
     # ==================== AUTO-CAPTURE (FACE ID STYLE) ====================
@@ -3368,8 +3333,7 @@ class DoorEntryKiosk:
         self.last_auto_capture = time.time()
         self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
         
-        # Update button states
-        self.capture_btn.config(state=tk.DISABLED)
+        # Update button state
         self.auto_capture_btn.config(text="⏹ Stop", bg=Config.COLOR_DENIED, command=self.stop_auto_capture)
         self.reg_count_label.config(text="Move face to fill all zones...")
     
@@ -3387,8 +3351,7 @@ class DoorEntryKiosk:
         # Reset auto-capture state
         self.auto_capture_mode = False
         self.reg_process_locked = False
-        self.capture_btn.config(state=tk.NORMAL)
-        self.auto_capture_btn.config(text="⟳ Auto Capture (100 photos)", bg="#5856D6", command=self.start_auto_capture)
+        self.auto_capture_btn.config(text="⟳ Start Auto Capture (100)", bg="#5856D6", command=self.start_auto_capture)
         self.update_registration_ui()
     
     def draw_faceid_overlay(self, frame):
@@ -3527,8 +3490,7 @@ class DoorEntryKiosk:
             text=f"✓ {self.captured_count} photos • Training..."
         )
         
-        # Disable all registration buttons during training
-        self.capture_btn.config(state=tk.DISABLED)
+        # Disable button during training
         self.auto_capture_btn.config(text="Encoding...", bg="#888888", state=tk.DISABLED)
         self.stop_reg_btn.config(state=tk.DISABLED)
         
@@ -3688,6 +3650,7 @@ class DoorEntryKiosk:
         self.train_progress['value'] = 0
         self.train_status_label.config(text="Training in progress...")
         self.is_training = True  # Pause live recognition during training
+        self.reg_process_locked = True  # Lock tab navigation during training
         
         def training_thread():
             def progress_callback(current, total, filepath):
@@ -3711,6 +3674,7 @@ class DoorEntryKiosk:
             message: Status message from the training operation.
         """
         self.is_training = False  # Resume live recognition
+        self.reg_process_locked = False  # Unlock tab navigation
         self.train_btn.config(state=tk.NORMAL)
         self.train_progress['value'] = 100 if success else 0
         self.train_status_label.config(text=message if len(message) < 50 else message[:47] + "...")
@@ -3790,9 +3754,15 @@ class DoorEntryKiosk:
         to ensure data integrity and process completion.
         """
         if self.reg_process_locked:
-            # Force back to register tab
-            self.admin_notebook.select(0)
-            messagebox.showwarning("Process in Progress", "Please wait for capture and encoding to complete.")
+            # Determine which tab to force back to
+            if self.is_training:
+                # Training in progress - force back to train tab (index 1)
+                self.admin_notebook.select(1)
+                messagebox.showwarning("Training in Progress", "Please wait for training to complete.")
+            else:
+                # Registration/capture in progress - force back to register tab (index 0)
+                self.admin_notebook.select(0)
+                messagebox.showwarning("Capture in Progress", "Please wait for capture and encoding to complete.")
     
     def close_admin_panel(self):
         """Close the admin panel and restore the kiosk interface.
