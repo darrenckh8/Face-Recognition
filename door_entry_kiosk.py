@@ -584,10 +584,11 @@ class FaceRecognitionSystem:
     def _update_normalized_encodings(self):
         """Pre-normalize all known encodings for fast vectorized comparison"""
         if len(self.known_encodings) > 0:
-            encodings_matrix = np.array(self.known_encodings)
+            # Use float32 for memory efficiency and InsightFace compatibility
+            encodings_matrix = np.array(self.known_encodings, dtype=np.float32)
             norms = np.linalg.norm(encodings_matrix, axis=1, keepdims=True)
             self.known_encodings_normalized = encodings_matrix / norms
-            # Pre-allocate similarity buffer
+            # Pre-allocate similarity buffer matching the dtype of normalized encodings
             self._similarity_buffer = np.empty(len(self.known_encodings), dtype=np.float32)
         else:
             self.known_encodings_normalized = None
@@ -876,11 +877,12 @@ class FaceRecognitionSystem:
             name = "Unknown"
             confidence = 0.0
             
-            # Normalize current face encoding
-            face_norm = face_encoding / np.linalg.norm(face_encoding)
+            # Normalize current face encoding (ensure float32 for consistency)
+            face_norm = (face_encoding / np.linalg.norm(face_encoding)).astype(np.float32)
             
             # Use pre-allocated buffer for similarity computation (avoids allocation per face)
-            if self._similarity_buffer is not None and len(self._similarity_buffer) == len(self.known_encodings):
+            if (self._similarity_buffer is not None and 
+                self._similarity_buffer.shape[0] == self.known_encodings_normalized.shape[0]):
                 np.dot(self.known_encodings_normalized, face_norm, out=self._similarity_buffer)
                 similarities = self._similarity_buffer
             else:
