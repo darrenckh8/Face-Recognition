@@ -943,14 +943,25 @@ class RecognitionWorker:
                     self._cleanup_futures()
                     continue
                 
-                # Submit to thread pool for processing
-                future = self.executor.submit(
-                    self._process_frame,
-                    frame_data['frame'],
-                    frame_data['frame_id'],
-                    frame_data['force_recognition'],
-                    frame_data['timestamp']
-                )
+                # Check if this is detection-only or full recognition
+                if frame_data.get('detection_only', False):
+                    # Detection only (for registration mode)
+                    future = self.executor.submit(
+                        self._process_detection,
+                        frame_data['frame'],
+                        frame_data['frame_id'],
+                        frame_data.get('detection_method', 'combined'),
+                        frame_data['timestamp']
+                    )
+                else:
+                    # Full recognition
+                    future = self.executor.submit(
+                        self._process_frame,
+                        frame_data['frame'],
+                        frame_data['frame_id'],
+                        frame_data.get('force_recognition', False),
+                        frame_data['timestamp']
+                    )
                 
                 with self.futures_lock:
                     self.pending_futures.append(future)
@@ -1016,6 +1027,82 @@ class RecognitionWorker:
             'frame_queue_size': self.frame_queue.qsize(),
             'result_queue_size': self.result_queue.qsize()
         }
+    
+    # ===== Async Face Detection Methods =====
+    
+    def submit_detection(self, frame, frame_id=None, detection_method='combined'):
+        """
+        Submit a frame for face detection only (no recognition).
+        Used during registration mode.
+        
+        Args:
+            frame: BGR image frame from camera
+            frame_id: Optional frame identifier for tracking
+            detection_method: 'fast', 'robust', or 'combined'
+            
+        Returns:
+            True if frame was accepted, False if dropped
+        """
+        if not self.is_running:
+            return False
+        
+        try:
+            self.frame_queue.put_nowait({
+                'frame': frame.copy(),
+                'frame_id': frame_id or time.time(),
+                'detection_only': True,
+                'detection_method': detection_method,
+                'timestamp': time.time()
+            })
+            return True
+        except queue.Full:
+            self.frames_dropped += 1
+            return False
+    
+    def _process_detection(self, frame, frame_id, detection_method, submit_time):
+        """Process a single frame for detection only (runs in thread pool)"""
+        try:
+            start_time = time.time()
+            
+            # Perform detection based on method
+            if detection_method == 'fast':
+                faces = self.face_system.detect_faces_fast(frame)
+            elif detection_method == 'robust':
+                faces = self.face_system.detect_faces_robust(frame)
+            else:  # combined
+                faces = self.face_system.detect_faces_combined(frame)
+            
+            processing_time = time.time() - start_time
+            latency = time.time() - submit_time
+            
+            # Update metrics
+            self.frames_processed += 1
+            self.avg_processing_time = (self.avg_processing_time * 0.9) + (processing_time * 0.1)
+            
+            # Put results in output queue
+            result_data = {
+                'frame_id': frame_id,
+                'faces': faces,
+                'detection_only': True,
+                'processing_time': processing_time,
+                'latency': latency,
+                'timestamp': time.time()
+            }
+            
+            try:
+                self.result_queue.put_nowait(result_data)
+            except queue.Full:
+                try:
+                    self.result_queue.get_nowait()
+                    self.result_queue.put_nowait(result_data)
+                except queue.Empty:
+                    pass
+            
+            return result_data
+            
+        except Exception as e:
+            print(f"[WORKER] Error processing detection: {e}")
+            return None
 
 # ==================== ON-SCREEN KEYBOARD ====================
 class OnScreenKeyboard:
@@ -1212,6 +1299,10 @@ class DoorEntryKiosk:
         self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
         self.current_zone = 'center'
         self.zone_targets = {'center': 30, 'left': 18, 'right': 18, 'up': 17, 'down': 17}  # = 100 total
+        
+        # Async detection results cache for registration mode
+        self._cached_detection_faces = []
+        self._last_detection_frame_id = -1
         
         # Training state - prevents concurrent InsightFace access
         self.is_training = False
@@ -1578,12 +1669,25 @@ class DoorEntryKiosk:
                                             self.root.after(0, self.deny_access)
                 
                 elif self.registration_mode:
-                    # Registration mode - use robust detection only when actively capturing
+                    # Registration mode - async face detection for non-blocking operation
                     frame_height, frame_width = display_frame.shape[:2]
+                    
+                    # Submit frame for async detection every few frames
+                    if frame_counter % 2 == 0:  # Every 2nd frame
+                        self.recognition_worker.submit_detection(frame, frame_id=frame_counter)
+                    
+                    # Poll for detection results (non-blocking)
+                    detection_results = self.recognition_worker.get_results()
+                    for result_data in detection_results:
+                        if result_data.get('detection_only', False):
+                            self._cached_detection_faces = result_data.get('faces', [])
+                            self._last_detection_frame_id = result_data.get('frame_id', -1)
+                    
+                    # Use cached detection results
+                    faces = self._cached_detection_faces
                     
                     if self.auto_capture_mode:
                         # Active capture mode - show Face ID overlay
-                        faces = self.face_system.detect_faces_combined(frame)
                         frame_center_x = frame_width // 2
                         frame_center_y = frame_height // 2
                         
