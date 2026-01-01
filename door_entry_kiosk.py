@@ -1751,8 +1751,8 @@ class DoorEntryKiosk:
                         # Training in progress - just show clean feed, progress is in UI label
                         pass
                     else:
-                        # Idle/manual capture mode - just show simple face detection
-                        faces = self.face_system.detect_faces_combined(frame)
+                        # Idle/manual capture mode - use cached async detection results
+                        # (detection is already being submitted above for all registration modes)
                         if len(faces) == 1:
                             top, right, bottom, left = faces[0]
                             cv2.rectangle(display_frame, (int(left), int(top)), (int(right), int(bottom)), (0, 255, 0), 2)
