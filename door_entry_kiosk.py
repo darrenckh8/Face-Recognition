@@ -3724,11 +3724,11 @@ class DoorEntryKiosk:
     # ==================== USER DELETION ====================
     
     def delete_person(self):
-        """Delete the selected person from both dataset and trained model.
+        """Delete the selected person from the trained model.
         
-        Removes the person's image folder and their encodings from the
-        saved model. Uses person_map for robust name lookup to avoid
-        string parsing issues with display text.
+        Removes the person's encodings from the saved model but keeps
+        the original photos in the dataset folder. Uses person_map for 
+        robust name lookup to avoid string parsing issues with display text.
         """
         selection = self.manage_listbox.curselection()
         if not selection:
@@ -3743,18 +3743,11 @@ class DoorEntryKiosk:
             messagebox.showerror("Error", "Could not identify selected person. Please refresh and try again.")
             return
         
-        if messagebox.askyesno("Confirm Delete", f"Delete '{name}' from dataset and recognition model?"):
-            import shutil
-            
-            # Delete image folder from dataset
-            person_folder = os.path.join(self.face_system.dataset_path, name)
-            if os.path.exists(person_folder):
-                shutil.rmtree(person_folder)
-            
-            # Remove encodings from trained model
+        if messagebox.askyesno("Confirm Delete", f"Remove '{name}' from recognition model?\n\n(Photos will be kept in dataset folder)"):
+            # Remove encodings from trained model only (keep photos)
             success, message = self.face_system.remove_person_from_model(name)
             if success:
-                logger.info(f"User deleted: {message}")
+                logger.info(f"User removed from model: {message}")
             else:
                 logger.warning(f"Delete warning: {message}")
             
@@ -3762,7 +3755,7 @@ class DoorEntryKiosk:
             self.refresh_manage_list()
             self.update_info_label()
             
-            self.show_toast(f"'{name}' has been removed", "success")
+            self.show_toast(f"'{name}' removed from recognition", "success")
     
     # ==================== ACCESS LOG MANAGEMENT ====================
     
