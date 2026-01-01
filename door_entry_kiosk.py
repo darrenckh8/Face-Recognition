@@ -14,7 +14,7 @@ import gc
 import hashlib
 import logging
 import shutil
-from typing import Optional, List, Tuple, Dict, Any, Callable
+from typing import Optional, List, Tuple, Dict, Any
 
 # Configure logging
 logging.basicConfig(
@@ -233,88 +233,66 @@ class BackupManager:
             return False
 
 
-# ==================== PERFORMANCE METRICS ====================
-class PerformanceMetrics:
-    """Tracks performance statistics for monitoring and optimization"""
+# ==================== FACE STABILITY TRACKER ====================
+class FaceStabilityTracker:
+    """Tracks face position stability to ensure recognition only runs on settled faces"""
     
-    def __init__(self):
-        self.reset()
+    def __init__(self, stability_threshold: int = 200, stable_frames_required: int = 5):
+        self.stability_threshold = stability_threshold  # Max pixel movement to be considered stable
+        self.stable_frames_required = stable_frames_required  # Consecutive stable frames needed
+        self.last_positions: Dict[int, List[Tuple[int, int]]] = {}  # face_id -> list of center positions
+        self.stable_count: Dict[int, int] = {}  # face_id -> consecutive stable frame count
         self.lock = threading.Lock()
     
-    def reset(self):
-        """Reset all metrics"""
-        self._frame_count = 0
-        self._recognition_count = 0
-        self._cache_hits = 0
-        self._cache_misses = 0
-        self._total_recognition_time = 0.0
-        self._last_fps_time = time.time()
-        self._last_fps_frame_count = 0
-        self._current_fps = 0.0
+    def _get_face_center(self, location: Tuple[int, int, int, int]) -> Tuple[int, int]:
+        """Get center point of face bounding box"""
+        top, right, bottom, left = location
+        return ((left + right) // 2, (top + bottom) // 2)
     
-    def record_frame(self):
-        """Record a frame being processed"""
+    def _calculate_movement(self, pos1: Tuple[int, int], pos2: Tuple[int, int]) -> float:
+        """Calculate Euclidean distance between two positions"""
+        return ((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2) ** 0.5
+    
+    def update_and_check_stability(self, face_id: int, location: Tuple[int, int, int, int]) -> bool:
+        """Update face position and return True if face is stable"""
+        center = self._get_face_center(location)
+        
         with self.lock:
-            self._frame_count += 1
+            if face_id not in self.last_positions:
+                self.last_positions[face_id] = [center]
+                self.stable_count[face_id] = 0
+                return False
             
-            # Calculate FPS every second
-            now = time.time()
-            if now - self._last_fps_time >= 1.0:
-                self._current_fps = (self._frame_count - self._last_fps_frame_count) / (now - self._last_fps_time)
-                self._last_fps_time = now
-                self._last_fps_frame_count = self._frame_count
-    
-    def record_recognition(self, duration: float, cache_hit: bool):
-        """Record a recognition operation"""
-        with self.lock:
-            self._recognition_count += 1
-            self._total_recognition_time += duration
-            if cache_hit:
-                self._cache_hits += 1
-            else:
-                self._cache_misses += 1
-    
-    @property
-    def fps(self) -> float:
-        return self._current_fps
-    
-    @property
-    def avg_recognition_time_ms(self) -> float:
-        with self.lock:
-            if self._recognition_count == 0:
-                return 0.0
-            return (self._total_recognition_time / self._recognition_count) * 1000
-    
-    @property
-    def cache_hit_rate(self) -> float:
-        with self.lock:
-            total = self._cache_hits + self._cache_misses
-            if total == 0:
-                return 0.0
-            return self._cache_hits / total
-    
-    def get_summary(self) -> Dict[str, Any]:
-        """Get a summary of all metrics"""
-        with self.lock:
-            # Calculate metrics inline to avoid deadlock from calling properties
-            avg_ms = 0.0
-            if self._recognition_count > 0:
-                avg_ms = (self._total_recognition_time / self._recognition_count) * 1000
+            positions = self.last_positions[face_id]
             
-            total_cache = self._cache_hits + self._cache_misses
-            hit_rate = 0.0
-            if total_cache > 0:
-                hit_rate = self._cache_hits / total_cache
+            # Check movement from last position
+            if positions:
+                movement = self._calculate_movement(center, positions[-1])
+                
+                if movement <= self.stability_threshold:
+                    self.stable_count[face_id] = self.stable_count.get(face_id, 0) + 1
+                else:
+                    # Face moved too much, reset stability count
+                    self.stable_count[face_id] = 0
             
-            return {
-                'fps': round(self._current_fps, 1),
-                'total_frames': self._frame_count,
-                'recognition_count': self._recognition_count,
-                'avg_recognition_ms': round(avg_ms, 1),
-                'cache_hits': self._cache_hits,
-                'cache_misses': self._cache_misses,
-                'cache_hit_rate': round(hit_rate * 100, 1)
-            }
+            # Keep only last few positions
+            positions.append(center)
+            if len(positions) > 10:
+                positions.pop(0)
+            
+            return self.stable_count[face_id] >= self.stable_frames_required
+    
+    def clear(self):
+        """Clear all tracking data"""
+        with self.lock:
+            self.last_positions.clear()
+            self.stable_count.clear()
+    
+    def remove_face(self, face_id: int):
+        """Remove tracking data for a specific face"""
+        with self.lock:
+            self.last_positions.pop(face_id, None)
+            self.stable_count.pop(face_id, None)
 
 
 # ==================== FACE CACHE ====================
@@ -776,8 +754,8 @@ class FaceRecognitionSystem:
         self.known_encodings_normalized = None  # Pre-normalized matrix for fast comparison
         self.cv_scaler = Config.DETECTION_SCALE_FACTOR
         
-        # Performance metrics tracking
-        self.metrics = PerformanceMetrics()
+        # Face stability tracking - only recognize settled faces
+        self.stability_tracker = FaceStabilityTracker()
         
         # Initialize InsightFace model (buffalo_s is lighter for Raspberry Pi)
         try:
@@ -1131,14 +1109,7 @@ class FaceRecognitionSystem:
             with self._recognition_lock:
                 self._recognition_running = True
                 try:
-                    start_time = time.time()
                     results = self._process_recognition(frame)
-                    recognition_time = time.time() - start_time
-                    
-                    # Track metrics (check if any result was from cache)
-                    cache_hit = any(r.get('from_cache', False) for r in results) if results else False
-                    self.metrics.record_recognition(recognition_time, cache_hit)
-                    
                     with self._last_results_lock:
                         self._last_results = results
                 except Exception as e:
@@ -1159,7 +1130,7 @@ class FaceRecognitionSystem:
         faces = self.face_app.get(frame)
         
         # Process each detected face
-        for face in faces:
+        for face_idx, face in enumerate(faces):
             if face.embedding is None:
                 continue
             
@@ -1167,6 +1138,9 @@ class FaceRecognitionSystem:
             bbox = face.bbox.astype(int)
             left, top, right, bottom = bbox[0], bbox[1], bbox[2], bbox[3]
             location = (top, right, bottom, left)
+            
+            # Check if face is stable (not moving) before running recognition
+            is_stable = self.stability_tracker.update_and_check_stability(face_idx, location)
             
             # Check cache first using embedding similarity
             cached = self.face_cache.get_by_embedding(face_encoding)
@@ -1177,7 +1151,8 @@ class FaceRecognitionSystem:
                     'name': cached['name'],
                     'confidence': cached['confidence'],
                     'location': location,
-                    'from_cache': True
+                    'from_cache': True,
+                    'is_stable': is_stable
                 })
                 continue
             
@@ -1188,7 +1163,20 @@ class FaceRecognitionSystem:
                     'name': cached['name'],
                     'confidence': cached['confidence'],
                     'location': location,
-                    'from_cache': True
+                    'from_cache': True,
+                    'is_stable': is_stable
+                })
+                continue
+            
+            # Only perform actual recognition if face is stable
+            if not is_stable:
+                # Face is still moving, return placeholder result
+                results.append({
+                    'name': 'Scanning...',
+                    'confidence': 0.0,
+                    'location': location,
+                    'from_cache': False,
+                    'is_stable': False
                 })
                 continue
             
@@ -1217,7 +1205,8 @@ class FaceRecognitionSystem:
                 'name': name,
                 'confidence': confidence,
                 'location': location,
-                'from_cache': False
+                'from_cache': False,
+                'is_stable': True  # Only reaches here if stable
             })
         
         return results
@@ -1269,13 +1258,10 @@ class FaceRecognitionSystem:
         """Check if recognition is currently processing"""
         return self._recognition_running
     
-    def get_performance_metrics(self) -> Dict[str, Any]:
-        """Get current performance metrics summary"""
-        return self.metrics.get_summary()
-    
     def clear_cache(self):
         """Clear the face recognition cache and pending frames"""
         self.face_cache.clear()
+        self.stability_tracker.clear()
         with self._last_results_lock:
             self._last_results = []
         # Clear pending frames
@@ -1813,9 +1799,6 @@ class DoorEntryKiosk:
                 if frame is None:
                     continue
                 
-                # Record frame for FPS metrics
-                self.face_system.metrics.record_frame()
-                
                 display_frame = frame.copy()
                 
                 if self.is_scanning and not self.registration_mode and not self.admin_mode:
@@ -1827,23 +1810,32 @@ class DoorEntryKiosk:
                         # Perform optimized face recognition
                         _, results = self.face_system.recognize_faces(frame)
                         
-                        # Track performance metrics
+                        # Track faces detected
                         self.faces_detected = len(results)
-                        cache_hits_this_frame = sum(1 for r in results if r.get('from_cache', False))
-                        cache_misses_this_frame = len(results) - cache_hits_this_frame
-                        self.cache_hits += cache_hits_this_frame
-                        self.cache_misses += cache_misses_this_frame
                         
-                        # Update status based on whether faces are detected
+                        # Check if any face is still settling
+                        any_unstable = any(not r.get('is_stable', True) for r in results)
+                        any_stable = any(r.get('is_stable', True) for r in results)
+                        
+                        # Update status based on face detection and stability
                         if len(results) > 0 and self.current_status not in ("granted", "denied"):
-                            self.root.after(0, self._set_status_active_scanning)
-                        elif len(results) == 0 and self.current_status == "active_scanning":
+                            if any_unstable and not any_stable:
+                                # Face detected but still moving - show processing
+                                self.root.after(0, lambda: self.set_status("processing"))
+                            else:
+                                self.root.after(0, self._set_status_active_scanning)
+                        elif len(results) == 0 and self.current_status in ("active_scanning", "processing"):
                             self.root.after(0, self._set_status_scanning)
                         
                         for result in results:
                             name = result['name']
                             confidence = result['confidence']
                             from_cache = result.get('from_cache', False)
+                            is_stable = result.get('is_stable', True)
+                            
+                            # Skip recognition actions for unstable faces
+                            if not is_stable or name == 'Scanning...':
+                                continue
                             
                             # Determine access
                             if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
@@ -2812,67 +2804,6 @@ class DoorEntryKiosk:
                 bg=Config.COLOR_CARD
             ).pack(side=tk.RIGHT)
         
-        # Performance Metrics Card
-        card_perf = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
-        card_perf.pack(fill=tk.X, padx=10, pady=5)
-        
-        inner_perf = tk.Frame(card_perf, bg=Config.COLOR_CARD)
-        inner_perf.pack(fill=tk.X, padx=10, pady=10)
-        
-        tk.Label(
-            inner_perf,
-            text="Performance Metrics",
-            font=(Config.FONT_FAMILY, 12, "bold"),
-            fg=Config.COLOR_TEXT,
-            bg=Config.COLOR_CARD
-        ).pack(anchor=tk.W)
-        
-        # Store labels for dynamic updates
-        self.metrics_labels = {}
-        metric_items = [
-            ("fps", "FPS"),
-            ("avg_recognition_ms", "Avg Recognition"),
-            ("cache_hit_rate", "Cache Hit Rate"),
-            ("recognition_count", "Total Recognitions"),
-        ]
-        
-        for key, label in metric_items:
-            row = tk.Frame(inner_perf, bg=Config.COLOR_CARD)
-            row.pack(fill=tk.X, pady=4)
-            tk.Label(
-                row,
-                text=label,
-                font=(Config.FONT_FAMILY, 10),
-                fg=Config.COLOR_TEXT,
-                bg=Config.COLOR_CARD
-            ).pack(side=tk.LEFT)
-            value_label = tk.Label(
-                row,
-                text="--",
-                font=(Config.FONT_FAMILY, 10),
-                fg=Config.COLOR_TEXT_SECONDARY,
-                bg=Config.COLOR_CARD
-            )
-            value_label.pack(side=tk.RIGHT)
-            self.metrics_labels[key] = value_label
-        
-        # Refresh button for metrics
-        refresh_btn = tk.Button(
-            inner_perf,
-            text="Refresh Metrics",
-            font=(Config.FONT_FAMILY, 9),
-            fg=Config.COLOR_SCANNING,
-            bg=Config.COLOR_CARD,
-            activeforeground=Config.COLOR_SCANNING,
-            bd=0,
-            cursor="hand2",
-            command=self.refresh_metrics_display
-        )
-        refresh_btn.pack(anchor=tk.E, pady=(8, 0))
-        
-        # Initial metrics update
-        self.refresh_metrics_display()
-        
         # System Info Card
         card2 = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
         card2.pack(fill=tk.X, padx=10, pady=5)
@@ -2930,23 +2861,6 @@ class DoorEntryKiosk:
             cursor="hand2",
             command=self.exit_kiosk
         ).pack()
-    
-    def refresh_metrics_display(self):
-        """Update the performance metrics display"""
-        if not hasattr(self, 'metrics_labels'):
-            return
-        
-        metrics = self.face_system.get_performance_metrics()
-        
-        # Update each label
-        if 'fps' in self.metrics_labels:
-            self.metrics_labels['fps'].config(text=f"{metrics['fps']:.1f}")
-        if 'avg_recognition_ms' in self.metrics_labels:
-            self.metrics_labels['avg_recognition_ms'].config(text=f"{metrics['avg_recognition_ms']:.1f} ms")
-        if 'cache_hit_rate' in self.metrics_labels:
-            self.metrics_labels['cache_hit_rate'].config(text=f"{metrics['cache_hit_rate']:.1f}%")
-        if 'recognition_count' in self.metrics_labels:
-            self.metrics_labels['recognition_count'].config(text=f"{metrics['recognition_count']}")
     
     def refresh_manage_list(self):
         """Refresh the manage users list"""
