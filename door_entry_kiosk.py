@@ -946,10 +946,17 @@ class DoorEntryKiosk:
         self.is_running = True
         self.is_scanning = True
         self.camera_thread = None
+        self.recognition_thread = None
         self.current_status = "scanning"  # scanning, granted, denied
         self.status_message = ""
         self.last_access = {}  # Track cooldowns per person
         self.admin_mode = False
+        
+        # Background recognition state
+        self.recognition_frame = None
+        self.recognition_frame_lock = threading.Lock()
+        self.recognition_results = []
+        self.recognition_results_lock = threading.Lock()
         
         # Registration state
         self.registration_mode = False
@@ -1230,9 +1237,41 @@ class DoorEntryKiosk:
             self.status_card.config(highlightbackground=Config.COLOR_BORDER)
     
     def start_camera(self):
-        """Start the camera in a background thread"""
+        """Start the camera and recognition threads"""
         self.camera_thread = threading.Thread(target=self.camera_loop, daemon=True)
         self.camera_thread.start()
+        
+        # Start background recognition thread
+        self.recognition_thread = threading.Thread(target=self.recognition_loop, daemon=True)
+        self.recognition_thread.start()
+    
+    def recognition_loop(self):
+        """Background thread for face recognition processing"""
+        while self.is_running:
+            # Check if there's a frame to process
+            frame_to_process = None
+            with self.recognition_frame_lock:
+                if self.recognition_frame is not None:
+                    frame_to_process = self.recognition_frame.copy()
+                    self.recognition_frame = None
+            
+            if frame_to_process is None:
+                time.sleep(0.01)  # Small sleep to prevent busy-waiting
+                continue
+            
+            # Skip if training or not in scanning mode
+            if self.is_training or self.registration_mode or self.admin_mode:
+                continue
+            
+            try:
+                # Perform face recognition (this is the expensive operation)
+                _, results = self.face_system.recognize_faces(frame_to_process)
+                
+                # Store results thread-safely
+                with self.recognition_results_lock:
+                    self.recognition_results = results
+            except Exception as e:
+                print(f"[Recognition] Error: {e}")
     
     def camera_loop(self):
         """Main camera loop running in a separate thread"""
@@ -1256,8 +1295,13 @@ class DoorEntryKiosk:
                         cv2.putText(display_frame, "Training in progress...", (50, 50),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
                     else:
-                        # Perform optimized face recognition
-                        _, results = self.face_system.recognize_faces(frame)
+                        # Submit frame to background recognition thread (non-blocking)
+                        with self.recognition_frame_lock:
+                            self.recognition_frame = frame.copy()
+                        
+                        # Get latest recognition results from background thread
+                        with self.recognition_results_lock:
+                            results = self.recognition_results.copy()
                         
                         # Track performance metrics
                         self.faces_detected = len(results)
