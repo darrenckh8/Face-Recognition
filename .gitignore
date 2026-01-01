@@ -1,5 +1,5 @@
 .DS_Store
-/face_rec
+.venv
 /dataset
 *.pickle
 *.json
