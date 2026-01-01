@@ -55,8 +55,6 @@ class Config:
     RECOGNITION_INTERVAL_FRAMES = 3  # Only run recognition every N frames
     FACE_CACHE_TTL = 2.0  # Seconds to cache a recognized face
     FACE_POSITION_TOLERANCE = 80  # Pixels tolerance for face position matching
-    DETECTION_SCALE_FACTOR = 4  # Scale down factor for faster processing
-    USE_FAST_DETECTION = False  # Disabled - InsightFace handles detection efficiently
     
     # Door Control (GPIO Pin for Raspberry Pi)
     DOOR_RELAY_PIN = 17
@@ -409,28 +407,18 @@ class FaceRecognitionSystem:
         self.known_encodings = []
         self.known_names = []
         self.known_encodings_normalized = None  # Pre-normalized matrix for fast comparison
-        self.cv_scaler = Config.DETECTION_SCALE_FACTOR
         
         # Initialize InsightFace model (buffalo_s is lighter for Raspberry Pi)
+        # Using det_size=(320, 320) reduces processing load by 75%
         try:
             self.face_app = FaceAnalysis(name='buffalo_s', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-            self.face_app.prepare(ctx_id=0, det_size=(640, 640))
-            print("[INFO] InsightFace model (buffalo_s) loaded successfully")
+            self.face_app.prepare(ctx_id=0, det_size=(320, 320))
+            print("[INFO] InsightFace model (buffalo_s) loaded with det_size=(320, 320)")
         except Exception as e:
             raise RuntimeError(
                 f"Could not load InsightFace model: {e}\n"
                 f"Please ensure insightface is properly installed with: pip install insightface onnxruntime"
             )
-        
-        # Keep Haar cascade for fast detection fallback (optional)
-        try:
-            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-            if os.path.exists(cascade_path):
-                self.face_cascade = cv2.CascadeClassifier(cascade_path)
-            else:
-                self.face_cascade = None
-        except Exception:
-            self.face_cascade = None
         
         # Performance: Face cache to avoid repeated recognition
         self.face_cache = FaceCache()
@@ -639,40 +627,10 @@ class FaceRecognitionSystem:
         
         return True, f"Removed {count_removed} encodings for {person_name}"
     
-    def detect_faces_fast(self, frame):
-        """Fast face detection using Haar cascade (no recognition)"""
-        # Fall back to InsightFace if Haar cascade not available
-        if self.face_cascade is None or self.face_cascade.empty():
-            return self.detect_faces_robust(frame)
-        
-        small_frame = cv2.resize(frame, (0, 0), fx=1/self.cv_scaler, fy=1/self.cv_scaler)
-        gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-        
-        # Detect faces with Haar cascade (fast)
-        faces = self.face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(30, 30)
-        )
-        
-        # Convert to (top, right, bottom, left) format and scale up
-        locations = []
-        for (x, y, w, h) in faces:
-            # Scale back to original frame size
-            top = y * self.cv_scaler
-            right = (x + w) * self.cv_scaler
-            bottom = (y + h) * self.cv_scaler
-            left = x * self.cv_scaler
-            locations.append((top, right, bottom, left))
-        
-        return locations
-    
-    def detect_faces_robust(self, frame):
+    def detect_faces(self, frame):
         """
-        Robust face detection using InsightFace.
-        Better at detecting faces at various angles - ideal for registration.
-        More reliable than Haar cascade.
+        Face detection using InsightFace.
+        Efficient and reliable for both scanning and registration modes.
         """
         # InsightFace expects BGR images (which is what OpenCV provides)
         faces = self.face_app.get(frame)
@@ -686,19 +644,14 @@ class FaceRecognitionSystem:
         
         return face_locations
     
+    # Aliases for backward compatibility
+    def detect_faces_robust(self, frame):
+        """Alias for detect_faces - kept for compatibility"""
+        return self.detect_faces(frame)
+    
     def detect_faces_combined(self, frame):
-        """
-        Combined detection: try fast Haar first, fall back to robust dlib.
-        Best of both worlds for registration mode.
-        """
-        # Try fast detection first
-        faces = self.detect_faces_fast(frame)
-        
-        # If no faces found, try robust detection
-        if not faces:
-            faces = self.detect_faces_robust(frame)
-        
-        return faces
+        """Alias for detect_faces - kept for compatibility"""
+        return self.detect_faces(frame)
     
     def recognize_faces(self, frame, force_recognition=False):
         """Detect and recognize faces in a frame using InsightFace"""
@@ -1303,12 +1256,27 @@ class DoorEntryKiosk:
                         with self.recognition_results_lock:
                             results = self.recognition_results.copy()
                         
+                        # Draw face boxes using cached results (no new detection)
+                        for result in results:
+                            location = result.get('location')
+                            if location:
+                                top, right, bottom, left = location
+                                name = result['name']
+                                confidence = result['confidence']
+                                
+                                # Color based on recognition
+                                if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
+                                    color = (0, 255, 0)  # Green for recognized
+                                else:
+                                    color = (0, 0, 255)  # Red for unknown
+                                
+                                cv2.rectangle(display_frame, (left, top), (right, bottom), color, 2)
+                                label = f"{name} ({confidence:.0%})" if name != "Unknown" else "Unknown"
+                                cv2.putText(display_frame, label, (left, top - 10),
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                        
                         # Track performance metrics
                         self.faces_detected = len(results)
-                        cache_hits_this_frame = sum(1 for r in results if r.get('from_cache', False))
-                        cache_misses_this_frame = len(results) - cache_hits_this_frame
-                        self.cache_hits += cache_hits_this_frame
-                        self.cache_misses += cache_misses_this_frame
                         
                         # Update status based on whether faces are detected
                         if len(results) > 0 and self.current_status not in ("granted", "denied"):
@@ -1439,10 +1407,8 @@ class DoorEntryKiosk:
                 # Update display
                 self.root.after(0, lambda f=display_frame: self.display_frame(f))
                 
-                # Adaptive frame rate - aim for ~30 FPS
-                loop_time = time.time() - loop_start
-                sleep_time = max(0.001, 0.033 - loop_time)
-                time.sleep(sleep_time)
+                # Simple sleep to yield CPU time to recognition worker thread
+                time.sleep(0.01)
             
         except Exception as e:
             print(f"Camera error: {e}")
