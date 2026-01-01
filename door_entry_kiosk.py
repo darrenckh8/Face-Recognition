@@ -9,8 +9,6 @@ import pickle
 import numpy as np
 from PIL import Image, ImageTk
 import json
-import queue
-from concurrent.futures import ThreadPoolExecutor
 
 # Try to import insightface - required for this application
 try:
@@ -54,11 +52,12 @@ class Config:
     COOLDOWN_SECONDS = 5  # Prevent repeated access logs for same person
     
     # Performance Settings
-    RECOGNITION_INTERVAL_FRAMES = 3  # Only run recognition every N frames
-    FACE_CACHE_TTL = 5  # Seconds to cache a recognized face
-    FACE_POSITION_TOLERANCE = 80  # Pixels tolerance for face position matching
-    DETECTION_SCALE_FACTOR = 2  # Scale down factor for faster processing
+    RECOGNITION_INTERVAL_FRAMES = 2  # Only submit frame for recognition every N frames
+    FACE_CACHE_TTL = 5.0  # Seconds to cache a recognized face (longer for embedding-based caching)
+    FACE_POSITION_TOLERANCE = 100  # Pixels tolerance for face position matching
+    DETECTION_SCALE_FACTOR = 4  # Scale down factor for faster processing
     USE_FAST_DETECTION = False  # Disabled - InsightFace handles detection efficiently
+    EMBEDDING_CACHE_THRESHOLD = 0.6  # Cosine similarity for same-face detection in cache
     
     # Door Control (GPIO Pin for Raspberry Pi)
     DOOR_RELAY_PIN = 17
@@ -92,11 +91,13 @@ class Config:
 
 # ==================== FACE CACHE ====================
 class FaceCache:
-    """Caches recognized faces to avoid repeated recognition of the same face"""
+    """Caches recognized faces to avoid repeated recognition of the same face.
+    Uses both position and embedding similarity for robust face tracking."""
     
     def __init__(self, ttl=None, position_tolerance=None):
         self.ttl = ttl or Config.FACE_CACHE_TTL
         self.position_tolerance = position_tolerance or Config.FACE_POSITION_TOLERANCE
+        self.embedding_threshold = getattr(Config, 'EMBEDDING_CACHE_THRESHOLD', 0.6)
         self.cache = {}  # {cache_key: {name, confidence, location, timestamp, encoding}}
         self.lock = threading.Lock()
     
@@ -110,33 +111,60 @@ class FaceCache:
         grid_y = center_y // self.position_tolerance
         return (grid_x, grid_y)
     
-    def _find_nearby_cache(self, location):
-        """Find a cached face near the given location"""
+    def _compute_embedding_similarity(self, enc1, enc2):
+        """Compute cosine similarity between two embeddings"""
+        if enc1 is None or enc2 is None:
+            return 0.0
+        norm1 = np.linalg.norm(enc1)
+        norm2 = np.linalg.norm(enc2)
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        return float(np.dot(enc1, enc2) / (norm1 * norm2))
+    
+    def _find_nearby_cache(self, location, encoding=None):
+        """Find a cached face near the given location or with similar embedding"""
         top, right, bottom, left = location
         center_x = (left + right) // 2
         center_y = (top + bottom) // 2
         
         now = time.time()
         best_match = None
-        best_distance = float('inf')
+        best_score = -1  # Combined score (position + embedding)
         
         with self.lock:
-            # Clean expired entries and find closest match
+            # Clean expired entries and find best match
             expired_keys = []
             for key, entry in self.cache.items():
                 if now - entry['timestamp'] > self.ttl:
                     expired_keys.append(key)
                     continue
                 
+                # Position-based matching
                 cached_top, cached_right, cached_bottom, cached_left = entry['location']
                 cached_center_x = (cached_left + cached_right) // 2
                 cached_center_y = (cached_top + cached_bottom) // 2
                 
                 distance = ((center_x - cached_center_x) ** 2 + (center_y - cached_center_y) ** 2) ** 0.5
+                position_match = distance < self.position_tolerance * 1.5
                 
-                if distance < self.position_tolerance and distance < best_distance:
-                    best_distance = distance
-                    best_match = entry
+                # Embedding-based matching (more reliable for same person)
+                embedding_similarity = 0.0
+                if encoding is not None and entry.get('encoding') is not None:
+                    embedding_similarity = self._compute_embedding_similarity(encoding, entry['encoding'])
+                
+                # Combined scoring: position helps, but embedding is more important
+                if embedding_similarity > self.embedding_threshold:
+                    # Same face based on embedding - strong match
+                    score = embedding_similarity + (0.2 if position_match else 0)
+                    if score > best_score:
+                        best_score = score
+                        best_match = entry
+                elif position_match and distance < self.position_tolerance:
+                    # Position-only match (fallback when no embedding provided)
+                    score = 0.5 - (distance / self.position_tolerance) * 0.3
+                    if encoding is None and score > best_score:
+                        best_score = score
+                        best_match = entry
             
             # Remove expired entries
             for key in expired_keys:
@@ -144,9 +172,32 @@ class FaceCache:
         
         return best_match
     
-    def get(self, location):
-        """Get cached recognition result for a face at given location"""
-        return self._find_nearby_cache(location)
+    def get(self, location, encoding=None):
+        """Get cached recognition result for a face at given location or with similar embedding"""
+        return self._find_nearby_cache(location, encoding)
+    
+    def get_by_embedding(self, encoding):
+        """Get cached recognition result for a face with similar embedding"""
+        if encoding is None:
+            return None
+        
+        now = time.time()
+        best_match = None
+        best_similarity = self.embedding_threshold
+        
+        with self.lock:
+            for key, entry in self.cache.items():
+                if now - entry['timestamp'] > self.ttl:
+                    continue
+                if entry.get('encoding') is None:
+                    continue
+                
+                similarity = self._compute_embedding_similarity(encoding, entry['encoding'])
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_match = entry
+        
+        return best_match
     
     def put(self, location, name, confidence, encoding=None):
         """Cache a recognition result"""
@@ -159,6 +210,19 @@ class FaceCache:
                 'timestamp': time.time(),
                 'encoding': encoding
             }
+    
+    def update_location(self, old_location, new_location):
+        """Update the location of a cached face (for tracking)"""
+        old_key = self._get_position_key(old_location)
+        new_key = self._get_position_key(new_location)
+        with self.lock:
+            if old_key in self.cache:
+                entry = self.cache[old_key]
+                entry['location'] = new_location
+                entry['timestamp'] = time.time()  # Refresh TTL
+                if old_key != new_key:
+                    self.cache[new_key] = entry
+                    del self.cache[old_key]
     
     def clear(self):
         """Clear all cached entries"""
@@ -173,6 +237,13 @@ class FaceCache:
             for key in expired_keys:
                 del self.cache[key]
             return len(expired_keys)
+    
+    def get_all_active(self):
+        """Get all non-expired cached entries"""
+        now = time.time()
+        with self.lock:
+            return [entry.copy() for entry in self.cache.values() 
+                    if now - entry['timestamp'] <= self.ttl]
 
 
 # ==================== DOOR CONTROLLER ====================
@@ -306,16 +377,10 @@ class CameraManager:
         self.camera = None
         self.is_running = False
         
-        # Thread-safe frame storage with double buffering
+        # Thread-safe frame storage
         self.current_frame = None
         self.frame_lock = threading.Lock()
         self.capture_thread = None
-        
-        # Pre-allocated frame buffers for zero-copy operation
-        self._frame_buffer_a = None
-        self._frame_buffer_b = None
-        self._active_buffer = 'a'  # Which buffer is currently being written to
-        self._frame_id = 0  # Increments on each new frame
     
     def start(self):
         """Initialize and start the camera with background capture thread"""
@@ -362,10 +427,7 @@ class CameraManager:
         time.sleep(0.3)
     
     def _capture_loop(self):
-        """Background thread that continuously captures frames with buffer reuse"""
-        # Pre-allocate buffers on first frame
-        buffers_initialized = False
-        
+        """Background thread that continuously captures frames"""
         while self.is_running:
             try:
                 if self.use_picamera:
@@ -376,55 +438,23 @@ class CameraManager:
                     if not ret:
                         continue
                 
-                # Initialize buffers on first valid frame
-                if not buffers_initialized:
-                    h, w = frame.shape[:2]
-                    self._frame_buffer_a = np.empty((h, w, 3), dtype=np.uint8)
-                    self._frame_buffer_b = np.empty((h, w, 3), dtype=np.uint8)
-                    buffers_initialized = True
-                
-                # Copy to inactive buffer (swap on next iteration)
+                # Store the latest frame thread-safely
                 with self.frame_lock:
-                    if self._active_buffer == 'a':
-                        np.copyto(self._frame_buffer_b, frame)
-                        self.current_frame = self._frame_buffer_b
-                        self._active_buffer = 'b'
-                    else:
-                        np.copyto(self._frame_buffer_a, frame)
-                        self.current_frame = self._frame_buffer_a
-                        self._active_buffer = 'a'
-                    self._frame_id += 1
+                    self.current_frame = frame
                     
             except Exception as e:
                 print(f"[CAMERA] Capture error: {e}")
                 time.sleep(0.1)
     
-    def capture_frame(self, copy=True):
-        """Get the latest captured frame (non-blocking)
-        
-        Args:
-            copy: If True, returns a copy (safe for modification).
-                  If False, returns direct reference (faster, read-only use).
-        
-        Returns:
-            Frame array or None if no frame available
-        """
+    def capture_frame(self):
+        """Get the latest captured frame (non-blocking)"""
         if not self.is_running:
             return None
         
         with self.frame_lock:
             if self.current_frame is not None:
-                if copy:
-                    return self.current_frame.copy()
-                else:
-                    # Return direct reference - caller must not modify
-                    return self.current_frame
+                return self.current_frame.copy()
         return None
-    
-    def get_frame_id(self):
-        """Get current frame ID for change detection"""
-        with self.frame_lock:
-            return self._frame_id
     
     def stop(self):
         """Stop capture thread and release the camera"""
@@ -444,7 +474,8 @@ class CameraManager:
 
 # ==================== FACE RECOGNITION SYSTEM ====================
 class FaceRecognitionSystem:
-    """Core face recognition logic with performance optimizations using InsightFace"""
+    """Core face recognition logic with performance optimizations using InsightFace.
+    Uses background threading to avoid blocking the main camera loop."""
     
     def __init__(self, dataset_path=None, encodings_path=None):
         self.dataset_path = dataset_path or Config.DATASET_PATH
@@ -480,6 +511,17 @@ class FaceRecognitionSystem:
         
         # Performance: Frame counter for skipping
         self.frame_count = 0
+        
+        # ========== THREADED RECOGNITION ==========
+        # Background thread for face recognition to prevent UI lag
+        self._recognition_thread = None
+        self._recognition_lock = threading.Lock()
+        self._pending_frame = None  # Frame waiting to be processed
+        self._pending_frame_lock = threading.Lock()
+        self._last_results = []  # Most recent recognition results
+        self._last_results_lock = threading.Lock()
+        self._recognition_running = False
+        self._stop_recognition = False
         
         if not os.path.exists(self.dataset_path):
             os.makedirs(self.dataset_path)
@@ -743,18 +785,58 @@ class FaceRecognitionSystem:
         
         return faces
     
-    def recognize_faces(self, frame, force_recognition=False):
-        """Detect and recognize faces in a frame using InsightFace"""
-        self.frame_count += 1
+    def start_recognition_thread(self):
+        """Start the background recognition thread"""
+        if self._recognition_thread is not None and self._recognition_thread.is_alive():
+            return  # Already running
         
+        self._stop_recognition = False
+        self._recognition_thread = threading.Thread(target=self._recognition_loop, daemon=True)
+        self._recognition_thread.start()
+        print("[INFO] Background recognition thread started")
+    
+    def stop_recognition_thread(self):
+        """Stop the background recognition thread"""
+        self._stop_recognition = True
+        if self._recognition_thread is not None:
+            self._recognition_thread.join(timeout=2.0)
+            self._recognition_thread = None
+        print("[INFO] Background recognition thread stopped")
+    
+    def _recognition_loop(self):
+        """Background thread that processes frames for recognition"""
+        while not self._stop_recognition:
+            frame = None
+            
+            # Get pending frame
+            with self._pending_frame_lock:
+                if self._pending_frame is not None:
+                    frame = self._pending_frame
+                    self._pending_frame = None
+            
+            if frame is None:
+                # No frame to process, wait a bit
+                time.sleep(0.01)
+                continue
+            
+            # Process the frame
+            with self._recognition_lock:
+                self._recognition_running = True
+                try:
+                    results = self._process_recognition(frame)
+                    with self._last_results_lock:
+                        self._last_results = results
+                except Exception as e:
+                    print(f"[ERROR] Recognition error: {e}")
+                finally:
+                    self._recognition_running = False
+    
+    def _process_recognition(self, frame):
+        """Internal method to perform actual recognition (runs in background thread)"""
         if not self.known_encodings or self.known_encodings_normalized is None:
-            return frame, []
+            return []
         
         results = []
-        
-        # Skip frames for performance (unless forced)
-        if not force_recognition and self.frame_count % Config.RECOGNITION_INTERVAL_FRAMES != 0:
-            return frame, []
         
         # Use InsightFace for detection and embedding extraction (BGR input - OpenCV default)
         faces = self.face_app.get(frame)
@@ -769,9 +851,22 @@ class FaceRecognitionSystem:
             left, top, right, bottom = bbox[0], bbox[1], bbox[2], bbox[3]
             location = (top, right, bottom, left)
             
-            # Check cache first
-            cached = self.face_cache.get(location)
-            if cached and not force_recognition:
+            # Check cache first using embedding similarity
+            cached = self.face_cache.get_by_embedding(face_encoding)
+            if cached:
+                # Update location in cache (face may have moved)
+                self.face_cache.update_location(cached['location'], location)
+                results.append({
+                    'name': cached['name'],
+                    'confidence': cached['confidence'],
+                    'location': location,
+                    'from_cache': True
+                })
+                continue
+            
+            # Also check by position as fallback
+            cached = self.face_cache.get(location, face_encoding)
+            if cached:
                 results.append({
                     'name': cached['name'],
                     'confidence': cached['confidence'],
@@ -808,301 +903,52 @@ class FaceRecognitionSystem:
                 'from_cache': False
             })
         
-        return frame, results
+        return results
+    
+    def recognize_faces(self, frame, force_recognition=False):
+        """Non-blocking face recognition using background thread.
+        Submits frame for processing and returns cached/last results immediately."""
+        self.frame_count += 1
+        
+        if not self.known_encodings or self.known_encodings_normalized is None:
+            return frame, []
+        
+        # Skip frames for performance (unless forced)
+        if not force_recognition and self.frame_count % Config.RECOGNITION_INTERVAL_FRAMES != 0:
+            # Return last known results from cache
+            with self._last_results_lock:
+                return frame, self._last_results.copy() if self._last_results else []
+        
+        # Submit frame for background processing (non-blocking)
+        with self._pending_frame_lock:
+            self._pending_frame = frame.copy()
+        
+        # Return last known results immediately (no blocking)
+        with self._last_results_lock:
+            return frame, self._last_results.copy() if self._last_results else []
+    
+    def recognize_faces_sync(self, frame, force_recognition=False):
+        """Synchronous face recognition (blocking) - use for single-frame recognition"""
+        if not self.known_encodings or self.known_encodings_normalized is None:
+            return frame, []
+        
+        return frame, self._process_recognition(frame)
+    
+    def get_last_results(self):
+        """Get the most recent recognition results"""
+        with self._last_results_lock:
+            return self._last_results.copy() if self._last_results else []
+    
+    def is_recognition_busy(self):
+        """Check if recognition is currently processing"""
+        return self._recognition_running
     
     def clear_cache(self):
         """Clear the face recognition cache"""
         self.face_cache.clear()
+        with self._last_results_lock:
+            self._last_results = []
 
-
-# ==================== RECOGNITION WORKER ====================
-class RecognitionWorker:
-    """
-    Handles face recognition in a separate thread pool to prevent blocking the camera feed.
-    Uses queue-based architecture for passing frames and receiving results.
-    """
-    
-    def __init__(self, face_system, max_workers=2):
-        self.face_system = face_system
-        self.max_workers = max_workers
-        
-        # Queues for communication
-        self.frame_queue = queue.Queue(maxsize=2)  # Limit queue size to prevent memory buildup
-        self.result_queue = queue.Queue(maxsize=10)
-        
-        # Thread pool for parallel processing
-        self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="RecognitionWorker")
-        
-        # Control flags
-        self.is_running = False
-        self.worker_thread = None
-        
-        # Track pending futures
-        self.pending_futures = []
-        self.futures_lock = threading.Lock()
-        
-        # Performance metrics
-        self.frames_processed = 0
-        self.frames_dropped = 0
-        self.avg_processing_time = 0.0
-    
-    def start(self):
-        """Start the recognition worker"""
-        self.is_running = True
-        self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
-        self.worker_thread.start()
-        print("[WORKER] Recognition worker started with {} threads".format(self.max_workers))
-    
-    def stop(self):
-        """Stop the recognition worker and cleanup"""
-        self.is_running = False
-        
-        # Clear queues
-        self._clear_queue(self.frame_queue)
-        self._clear_queue(self.result_queue)
-        
-        # Shutdown executor
-        self.executor.shutdown(wait=False, cancel_futures=True)
-        
-        # Wait for worker thread
-        if self.worker_thread and self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=1.0)
-        
-        print("[WORKER] Recognition worker stopped")
-    
-    def _clear_queue(self, q):
-        """Clear all items from a queue"""
-        try:
-            while True:
-                q.get_nowait()
-        except queue.Empty:
-            pass
-    
-    def submit_frame(self, frame, frame_id=None, force_recognition=False):
-        """
-        Submit a frame for recognition processing.
-        Non-blocking - drops frame if queue is full.
-        
-        Args:
-            frame: BGR image frame from camera
-            frame_id: Optional frame identifier for tracking
-            force_recognition: If True, bypasses frame skipping
-            
-        Returns:
-            True if frame was accepted, False if dropped
-        """
-        if not self.is_running:
-            return False
-        
-        try:
-            # Non-blocking put - drop frame if queue is full
-            self.frame_queue.put_nowait({
-                'frame': frame.copy(),
-                'frame_id': frame_id or time.time(),
-                'force_recognition': force_recognition,
-                'timestamp': time.time()
-            })
-            return True
-        except queue.Full:
-            self.frames_dropped += 1
-            return False
-    
-    def get_results(self, timeout=0):
-        """
-        Get recognition results from the result queue.
-        Non-blocking by default.
-        
-        Args:
-            timeout: Maximum time to wait (0 for non-blocking)
-            
-        Returns:
-            List of result dicts, or empty list if none available
-        """
-        results = []
-        try:
-            while True:
-                if timeout > 0:
-                    result = self.result_queue.get(timeout=timeout)
-                    timeout = 0  # Only wait on first get
-                else:
-                    result = self.result_queue.get_nowait()
-                results.append(result)
-        except queue.Empty:
-            pass
-        return results
-    
-    def _worker_loop(self):
-        """Main worker loop that dispatches frames to thread pool"""
-        while self.is_running:
-            try:
-                # Get frame from queue (blocking with timeout)
-                try:
-                    frame_data = self.frame_queue.get(timeout=0.1)
-                except queue.Empty:
-                    # Clean up completed futures
-                    self._cleanup_futures()
-                    continue
-                
-                # Check if this is detection-only or full recognition
-                if frame_data.get('detection_only', False):
-                    # Detection only (for registration mode)
-                    future = self.executor.submit(
-                        self._process_detection,
-                        frame_data['frame'],
-                        frame_data['frame_id'],
-                        frame_data.get('detection_method', 'combined'),
-                        frame_data['timestamp']
-                    )
-                else:
-                    # Full recognition
-                    future = self.executor.submit(
-                        self._process_frame,
-                        frame_data['frame'],
-                        frame_data['frame_id'],
-                        frame_data.get('force_recognition', False),
-                        frame_data['timestamp']
-                    )
-                
-                with self.futures_lock:
-                    self.pending_futures.append(future)
-                
-                # Cleanup completed futures periodically
-                self._cleanup_futures()
-                
-            except Exception as e:
-                print(f"[WORKER] Error in worker loop: {e}")
-    
-    def _process_frame(self, frame, frame_id, force_recognition, submit_time):
-        """Process a single frame (runs in thread pool)"""
-        try:
-            start_time = time.time()
-            
-            # Perform recognition
-            _, results = self.face_system.recognize_faces(frame, force_recognition=force_recognition)
-            
-            processing_time = time.time() - start_time
-            latency = time.time() - submit_time
-            
-            # Update metrics
-            self.frames_processed += 1
-            self.avg_processing_time = (self.avg_processing_time * 0.9) + (processing_time * 0.1)
-            
-            # Put results in output queue
-            result_data = {
-                'frame_id': frame_id,
-                'results': results,
-                'processing_time': processing_time,
-                'latency': latency,
-                'timestamp': time.time()
-            }
-            
-            try:
-                self.result_queue.put_nowait(result_data)
-            except queue.Full:
-                # Result queue full, discard oldest and add new
-                try:
-                    self.result_queue.get_nowait()
-                    self.result_queue.put_nowait(result_data)
-                except queue.Empty:
-                    pass
-            
-            return result_data
-            
-        except Exception as e:
-            print(f"[WORKER] Error processing frame: {e}")
-            return None
-    
-    def _cleanup_futures(self):
-        """Remove completed futures from tracking list"""
-        with self.futures_lock:
-            self.pending_futures = [f for f in self.pending_futures if not f.done()]
-    
-    def get_stats(self):
-        """Get worker statistics"""
-        return {
-            'frames_processed': self.frames_processed,
-            'frames_dropped': self.frames_dropped,
-            'avg_processing_time': self.avg_processing_time,
-            'pending_tasks': len(self.pending_futures),
-            'frame_queue_size': self.frame_queue.qsize(),
-            'result_queue_size': self.result_queue.qsize()
-        }
-    
-    # ===== Async Face Detection Methods =====
-    
-    def submit_detection(self, frame, frame_id=None, detection_method='combined'):
-        """
-        Submit a frame for face detection only (no recognition).
-        Used during registration mode.
-        
-        Args:
-            frame: BGR image frame from camera
-            frame_id: Optional frame identifier for tracking
-            detection_method: 'fast', 'robust', or 'combined'
-            
-        Returns:
-            True if frame was accepted, False if dropped
-        """
-        if not self.is_running:
-            return False
-        
-        try:
-            self.frame_queue.put_nowait({
-                'frame': frame.copy(),
-                'frame_id': frame_id or time.time(),
-                'detection_only': True,
-                'detection_method': detection_method,
-                'timestamp': time.time()
-            })
-            return True
-        except queue.Full:
-            self.frames_dropped += 1
-            return False
-    
-    def _process_detection(self, frame, frame_id, detection_method, submit_time):
-        """Process a single frame for detection only (runs in thread pool)"""
-        try:
-            start_time = time.time()
-            
-            # Perform detection based on method
-            if detection_method == 'fast':
-                faces = self.face_system.detect_faces_fast(frame)
-            elif detection_method == 'robust':
-                faces = self.face_system.detect_faces_robust(frame)
-            else:  # combined
-                faces = self.face_system.detect_faces_combined(frame)
-            
-            processing_time = time.time() - start_time
-            latency = time.time() - submit_time
-            
-            # Update metrics
-            self.frames_processed += 1
-            self.avg_processing_time = (self.avg_processing_time * 0.9) + (processing_time * 0.1)
-            
-            # Put results in output queue
-            result_data = {
-                'frame_id': frame_id,
-                'faces': faces,
-                'detection_only': True,
-                'processing_time': processing_time,
-                'latency': latency,
-                'timestamp': time.time()
-            }
-            
-            try:
-                self.result_queue.put_nowait(result_data)
-            except queue.Full:
-                try:
-                    self.result_queue.get_nowait()
-                    self.result_queue.put_nowait(result_data)
-                except queue.Empty:
-                    pass
-            
-            return result_data
-            
-        except Exception as e:
-            print(f"[WORKER] Error processing detection: {e}")
-            return None
 
 # ==================== ON-SCREEN KEYBOARD ====================
 class OnScreenKeyboard:
@@ -1300,10 +1146,6 @@ class DoorEntryKiosk:
         self.current_zone = 'center'
         self.zone_targets = {'center': 30, 'left': 18, 'right': 18, 'up': 17, 'down': 17}  # = 100 total
         
-        # Async detection results cache for registration mode
-        self._cached_detection_faces = []
-        self._last_detection_frame_id = -1
-        
         # Training state - prevents concurrent InsightFace access
         self.is_training = False
         self.reg_process_locked = False  # Lock during capture, training, and encoding
@@ -1323,24 +1165,8 @@ class DoorEntryKiosk:
         self.last_cache_cleanup = time.time()
         self.cache_cleanup_interval = 60  # seconds
         
-        # Initialize recognition worker for non-blocking face recognition
-        self.recognition_worker = RecognitionWorker(self.face_system, max_workers=2)
-        
-        # Latest recognition results for display (updated from worker)
-        self.latest_recognition_results = []
-        self.recognition_results_lock = threading.Lock()
-        
-        # Frame processing optimization - pre-allocated buffers
-        self._display_buffer = np.empty((330, 440, 3), dtype=np.uint8)  # Pre-allocated display buffer
-        self._display_buffer_rgb = np.empty((330, 440, 3), dtype=np.uint8)  # Pre-allocated RGB buffer
-        self._last_displayed_frame_id = -1  # Track which frame was last displayed
-        self._cached_imgtk = None  # Cached PhotoImage to avoid recreation
-        
         # Create GUI
         self.create_kiosk_interface()
-        
-        # Start recognition worker
-        self.recognition_worker.start()
         
         # Start camera
         self.start_camera()
@@ -1583,34 +1409,27 @@ class DoorEntryKiosk:
     
     def start_camera(self):
         """Start the camera in a background thread"""
+        # Start the background recognition thread
+        self.face_system.start_recognition_thread()
+        
         self.camera_thread = threading.Thread(target=self.camera_loop, daemon=True)
         self.camera_thread.start()
     
     def camera_loop(self):
-        """Main camera loop running in a separate thread - non-blocking recognition"""
+        """Main camera loop running in a separate thread"""
         try:
             self.camera.start()
             frame_time = time.time()
-            frame_counter = 0
-            
-            # Pre-allocated buffer for display frame modifications
-            display_frame = None
             
             while self.is_running:
                 loop_start = time.time()
                 
-                # Get the newest frame from the camera (zero-copy for read-only use)
-                frame = self.camera.capture_frame(copy=False)
+                # Get the newest frame from the camera
+                frame = self.camera.capture_frame()
                 if frame is None:
                     continue
                 
-                # Only copy when we need to modify (draw overlays)
-                # Reuse display_frame buffer if same size
-                if display_frame is None or display_frame.shape != frame.shape:
-                    display_frame = np.empty_like(frame)
-                np.copyto(display_frame, frame)
-                
-                frame_counter += 1
+                display_frame = frame.copy()
                 
                 if self.is_scanning and not self.registration_mode and not self.admin_mode:
                     # Skip recognition if training is in progress (prevents segfault)
@@ -1618,76 +1437,51 @@ class DoorEntryKiosk:
                         cv2.putText(display_frame, "Training in progress...", (50, 50),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
                     else:
-                        # Non-blocking: Submit frame to recognition worker every N frames
-                        if frame_counter % Config.RECOGNITION_INTERVAL_FRAMES == 0:
-                            self.recognition_worker.submit_frame(frame, frame_id=frame_counter)
+                        # Perform optimized face recognition
+                        _, results = self.face_system.recognize_faces(frame)
                         
-                        # Non-blocking: Poll for recognition results
-                        worker_results = self.recognition_worker.get_results()
+                        # Track performance metrics
+                        self.faces_detected = len(results)
+                        cache_hits_this_frame = sum(1 for r in results if r.get('from_cache', False))
+                        cache_misses_this_frame = len(results) - cache_hits_this_frame
+                        self.cache_hits += cache_hits_this_frame
+                        self.cache_misses += cache_misses_this_frame
                         
-                        # Process any available results
-                        for result_data in worker_results:
-                            results = result_data.get('results', [])
+                        # Update status based on whether faces are detected
+                        if len(results) > 0 and self.current_status not in ("granted", "denied"):
+                            self.root.after(0, lambda: self.set_status("active_scanning"))
+                        elif len(results) == 0 and self.current_status == "active_scanning":
+                            self.root.after(0, lambda: self.set_status("scanning"))
+                        
+                        for result in results:
+                            name = result['name']
+                            confidence = result['confidence']
+                            from_cache = result.get('from_cache', False)
                             
-                            # Track performance metrics
-                            self.faces_detected = len(results)
-                            cache_hits_this_frame = sum(1 for r in results if r.get('from_cache', False))
-                            cache_misses_this_frame = len(results) - cache_hits_this_frame
-                            self.cache_hits += cache_hits_this_frame
-                            self.cache_misses += cache_misses_this_frame
-                            
-                            # Store latest results for display
-                            with self.recognition_results_lock:
-                                self.latest_recognition_results = results
-                            
-                            # Update status based on whether faces are detected
-                            if len(results) > 0 and self.current_status not in ("granted", "denied"):
-                                self.root.after(0, lambda: self.set_status("active_scanning"))
-                            elif len(results) == 0 and self.current_status == "active_scanning":
-                                self.root.after(0, lambda: self.set_status("scanning"))
-                            
-                            for result in results:
-                                name = result['name']
-                                confidence = result['confidence']
-                                from_cache = result.get('from_cache', False)
-                                
-                                # Determine access
-                                if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
-                                    # Check cooldown
+                            # Determine access
+                            if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
+                                # Check cooldown
+                                now = time.time()
+                                if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
+                                    self.last_access[name] = now
+                                    
+                                    # Grant access
+                                    self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
+                            else:
+                                # Check if we should log denied access (only for non-cached results)
+                                if name == "Unknown" and self.current_status in ("scanning", "active_scanning") and not from_cache:
                                     now = time.time()
-                                    if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
-                                        self.last_access[name] = now
-                                        
-                                        # Grant access
-                                        self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
-                                else:
-                                    # Check if we should log denied access (only for non-cached results)
-                                    if name == "Unknown" and self.current_status in ("scanning", "active_scanning") and not from_cache:
-                                        now = time.time()
-                                        if "Unknown" not in self.last_access or (now - self.last_access["Unknown"]) > Config.COOLDOWN_SECONDS:
-                                            self.last_access["Unknown"] = now
-                                            self.root.after(0, self.deny_access)
+                                    if "Unknown" not in self.last_access or (now - self.last_access["Unknown"]) > Config.COOLDOWN_SECONDS:
+                                        self.last_access["Unknown"] = now
+                                        self.root.after(0, self.deny_access)
                 
                 elif self.registration_mode:
-                    # Registration mode - async face detection for non-blocking operation
+                    # Registration mode - use robust detection only when actively capturing
                     frame_height, frame_width = display_frame.shape[:2]
-                    
-                    # Submit frame for async detection every few frames
-                    if frame_counter % 2 == 0:  # Every 2nd frame
-                        self.recognition_worker.submit_detection(frame, frame_id=frame_counter)
-                    
-                    # Poll for detection results (non-blocking)
-                    detection_results = self.recognition_worker.get_results()
-                    for result_data in detection_results:
-                        if result_data.get('detection_only', False):
-                            self._cached_detection_faces = result_data.get('faces', [])
-                            self._last_detection_frame_id = result_data.get('frame_id', -1)
-                    
-                    # Use cached detection results
-                    faces = self._cached_detection_faces
                     
                     if self.auto_capture_mode:
                         # Active capture mode - show Face ID overlay
+                        faces = self.face_system.detect_faces_combined(frame)
                         frame_center_x = frame_width // 2
                         frame_center_y = frame_height // 2
                         
@@ -1751,8 +1545,8 @@ class DoorEntryKiosk:
                         # Training in progress - just show clean feed, progress is in UI label
                         pass
                     else:
-                        # Idle/manual capture mode - use cached async detection results
-                        # (detection is already being submitted above for all registration modes)
+                        # Idle/manual capture mode - just show simple face detection
+                        faces = self.face_system.detect_faces_combined(frame)
                         if len(faces) == 1:
                             top, right, bottom, left = faces[0]
                             cv2.rectangle(display_frame, (int(left), int(top)), (int(right), int(bottom)), (0, 255, 0), 2)
@@ -1776,15 +1570,11 @@ class DoorEntryKiosk:
                         print(f"Cache cleanup: removed {expired_count} expired entries")
                     self.last_cache_cleanup = now
                 
-                # Store current frame reference (for registration capture)
-                # Only copy if registration mode needs to save images
-                if self.registration_mode:
-                    self.current_frame = frame.copy() if self.auto_capture_mode else frame
-                else:
-                    self.current_frame = frame  # Reference only, no copy needed
+                # Store current frame
+                self.current_frame = frame.copy()
                 
-                # Update display - pass display_frame which already has overlays drawn
-                self.root.after(0, lambda f=display_frame.copy(): self.display_frame(f))
+                # Update display
+                self.root.after(0, lambda f=display_frame: self.display_frame(f))
                 
                 # Adaptive frame rate - aim for ~30 FPS
                 loop_time = time.time() - loop_start
@@ -1797,34 +1587,17 @@ class DoorEntryKiosk:
             self.camera.stop()
     
     def display_frame(self, frame):
-        """Display a frame on the video label (and admin preview if in admin mode)
-        
-        Optimized with:
-        - Lazy BGR→RGB conversion (only when needed)
-        - Pre-allocated resize buffer
-        - Minimal object creation
-        """
-        frame_h, frame_w = frame.shape[:2]
-        target_w, target_h = 440, 330
-        
-        # Resize to display size using pre-allocated buffer if needed
-        if frame_w != target_w or frame_h != target_h:
-            # Resize directly into pre-allocated buffer
-            cv2.resize(frame, (target_w, target_h), dst=self._display_buffer)
-            resized = self._display_buffer
-        else:
-            resized = frame
-        
-        # Lazy color conversion: BGR→RGB only for display
+        """Display a frame on the video label (and admin preview if in admin mode)"""
         if USE_PICAMERA:
-            # Picamera already provides RGB
-            frame_rgb = resized
+            frame_rgb = frame
         else:
-            # Convert BGR to RGB using pre-allocated buffer
-            cv2.cvtColor(resized, cv2.COLOR_BGR2RGB, dst=self._display_buffer_rgb)
-            frame_rgb = self._display_buffer_rgb
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Create PIL Image and PhotoImage
+        # Fixed 440x330 display size for both views (scaled for 480px window)
+        frame_h, frame_w = frame_rgb.shape[:2]
+        if frame_w != 440 or frame_h != 330:
+            frame_rgb = cv2.resize(frame_rgb, (440, 330))
+        
         img = Image.fromarray(frame_rgb)
         imgtk = ImageTk.PhotoImage(image=img)
         
@@ -3080,9 +2853,8 @@ class DoorEntryKiosk:
         self.is_running = False
         self.is_scanning = False
         
-        # Stop recognition worker first
-        if hasattr(self, 'recognition_worker'):
-            self.recognition_worker.stop()
+        # Stop the background recognition thread
+        self.face_system.stop_recognition_thread()
         
         if self.camera_thread:
             self.camera_thread.join(timeout=2)
