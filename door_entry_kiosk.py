@@ -10,11 +10,12 @@ import numpy as np
 from PIL import Image, ImageTk
 import json
 
-# Try to import face_recognition - required for this application
+# Try to import insightface - required for this application
 try:
-    import face_recognition
+    from insightface.app import FaceAnalysis
+    import insightface
 except ImportError:
-    print("Error: face_recognition library not found. Please install it with: pip install face-recognition")
+    print("Error: insightface library not found. Please install it with: pip install insightface onnxruntime")
     exit(1)
 
 # Try to import picamera2 for Raspberry Pi, fall back to OpenCV
@@ -47,7 +48,7 @@ class Config:
     CAMERA_RESOLUTION = (640, 480)
     
     # Recognition Settings
-    RECOGNITION_THRESHOLD = 0.8  # Lower = more strict (0.0 - 1.0)
+    RECOGNITION_THRESHOLD = 0.45  # Cosine similarity threshold for InsightFace (0.4-0.5 recommended)
     COOLDOWN_SECONDS = 5  # Prevent repeated access logs for same person
     
     # Performance Settings
@@ -55,7 +56,7 @@ class Config:
     FACE_CACHE_TTL = 2.0  # Seconds to cache a recognized face
     FACE_POSITION_TOLERANCE = 80  # Pixels tolerance for face position matching
     DETECTION_SCALE_FACTOR = 4  # Scale down factor for faster processing
-    USE_FAST_DETECTION = True  # Use Haar cascade for initial detection
+    USE_FAST_DETECTION = False  # Disabled - InsightFace handles detection efficiently
     
     # Door Control (GPIO Pin for Raspberry Pi)
     DOOR_RELAY_PIN = 17
@@ -400,31 +401,36 @@ class CameraManager:
 
 # ==================== FACE RECOGNITION SYSTEM ====================
 class FaceRecognitionSystem:
-    """Core face recognition logic with performance optimizations"""
+    """Core face recognition logic with performance optimizations using InsightFace"""
     
     def __init__(self, dataset_path=None, encodings_path=None):
         self.dataset_path = dataset_path or Config.DATASET_PATH
         self.encodings_path = encodings_path or Config.ENCODINGS_PATH
         self.known_encodings = []
         self.known_names = []
+        self.known_encodings_normalized = None  # Pre-normalized matrix for fast comparison
         self.cv_scaler = Config.DETECTION_SCALE_FACTOR
         
-        # Performance: Pre-load Haar cascade for fast face detection
+        # Initialize InsightFace model (buffalo_s is lighter for Raspberry Pi)
         try:
-            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-            if not os.path.exists(cascade_path):
-                raise FileNotFoundError(f"Haar cascade file not found at: {cascade_path}")
-            
-            self.face_cascade = cv2.CascadeClassifier(cascade_path)
-            
-            if self.face_cascade.empty():
-                raise RuntimeError("Failed to load Haar cascade classifier - file may be corrupted")
-                
+            self.face_app = FaceAnalysis(name='buffalo_s', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+            self.face_app.prepare(ctx_id=0, det_size=(640, 640))
+            print("[INFO] InsightFace model (buffalo_s) loaded successfully")
         except Exception as e:
             raise RuntimeError(
-                f"Could not load face detection model: {e}\n"
-                f"Please ensure OpenCV is properly installed with: pip install opencv-python"
+                f"Could not load InsightFace model: {e}\n"
+                f"Please ensure insightface is properly installed with: pip install insightface onnxruntime"
             )
+        
+        # Keep Haar cascade for fast detection fallback (optional)
+        try:
+            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            if os.path.exists(cascade_path):
+                self.face_cascade = cv2.CascadeClassifier(cascade_path)
+            else:
+                self.face_cascade = None
+        except Exception:
+            self.face_cascade = None
         
         # Performance: Face cache to avoid repeated recognition
         self.face_cache = FaceCache()
@@ -438,18 +444,30 @@ class FaceRecognitionSystem:
         self.load_encodings()
     
     def load_encodings(self):
-        """Load face encodings from pickle file"""
+        """Load face encodings from pickle file and pre-normalize for fast comparison"""
         if os.path.exists(self.encodings_path):
             try:
                 with open(self.encodings_path, "rb") as f:
                     data = pickle.loads(f.read())
-                self.known_encodings = data["encodings"]
+                # Convert lists back to numpy arrays for InsightFace compatibility
+                self.known_encodings = [np.array(enc) for enc in data["encodings"]]
                 self.known_names = data["names"]
+                # Pre-normalize encodings for vectorized cosine similarity
+                self._update_normalized_encodings()
                 return True
             except Exception as e:
                 print(f"Error loading encodings: {e}")
                 return False
         return False
+    
+    def _update_normalized_encodings(self):
+        """Pre-normalize all known encodings for fast vectorized comparison"""
+        if len(self.known_encodings) > 0:
+            encodings_matrix = np.array(self.known_encodings)
+            norms = np.linalg.norm(encodings_matrix, axis=1, keepdims=True)
+            self.known_encodings_normalized = encodings_matrix / norms
+        else:
+            self.known_encodings_normalized = None
     
     def get_registered_persons(self):
         """Get list of registered persons from dataset folder"""
@@ -504,24 +522,27 @@ class FaceRecognitionSystem:
             if image is None:
                 continue
             
-            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            # InsightFace expects BGR images
+            faces = self.face_app.get(image)
             
-            boxes = face_recognition.face_locations(rgb, model="hog")
-            encodings = face_recognition.face_encodings(rgb, boxes)
-            
-            for encoding in encodings:
-                known_encodings.append(encoding)
-                known_names.append(name)
+            for face in faces:
+                if face.embedding is not None:
+                    known_encodings.append(face.embedding)
+                    known_names.append(name)
         
         if not known_encodings:
             return False, "No faces detected in any images"
         
-        data = {"encodings": known_encodings, "names": known_names}
+        # Convert to numpy arrays for efficient storage and comparison
+        data = {"encodings": [enc.tolist() for enc in known_encodings], "names": known_names}
         with open(self.encodings_path, "wb") as f:
             f.write(pickle.dumps(data))
         
-        self.known_encodings = known_encodings
+        self.known_encodings = [np.array(enc) for enc in known_encodings]
         self.known_names = known_names
+        
+        # Pre-normalize for fast comparison
+        self._update_normalized_encodings()
         
         return True, f"Training complete! {len(known_encodings)} encodings from {len(set(known_names))} persons"
     
@@ -548,14 +569,13 @@ class FaceRecognitionSystem:
             if image is None:
                 continue
             
-            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            # InsightFace expects BGR images
+            faces = self.face_app.get(image)
             
-            boxes = face_recognition.face_locations(rgb, model="hog")
-            encodings = face_recognition.face_encodings(rgb, boxes)
-            
-            for encoding in encodings:
-                new_encodings.append(encoding)
-                new_names.append(person_name)
+            for face in faces:
+                if face.embedding is not None:
+                    new_encodings.append(face.embedding)
+                    new_names.append(person_name)
         
         if not new_encodings:
             return False, f"No faces detected in images for {person_name}"
@@ -569,10 +589,13 @@ class FaceRecognitionSystem:
         self.known_encodings.extend(new_encodings)
         self.known_names.extend(new_names)
         
-        # Save updated model
-        data = {"encodings": self.known_encodings, "names": self.known_names}
+        # Save updated model (convert numpy arrays to lists for serialization)
+        data = {"encodings": [enc.tolist() if hasattr(enc, 'tolist') else enc for enc in self.known_encodings], "names": self.known_names}
         with open(self.encodings_path, "wb") as f:
             f.write(pickle.dumps(data))
+        
+        # Pre-normalize for fast comparison
+        self._update_normalized_encodings()
         
         # Clear cache since we have new encodings
         self.face_cache.clear()
@@ -600,13 +623,16 @@ class FaceRecognitionSystem:
         
         # Save updated model
         if self.known_encodings:
-            data = {"encodings": self.known_encodings, "names": self.known_names}
+            data = {"encodings": [enc.tolist() if hasattr(enc, 'tolist') else enc for enc in self.known_encodings], "names": self.known_names}
             with open(self.encodings_path, "wb") as f:
                 f.write(pickle.dumps(data))
+            # Pre-normalize for fast comparison
+            self._update_normalized_encodings()
         else:
             # No encodings left, remove the file
             if os.path.exists(self.encodings_path):
                 os.remove(self.encodings_path)
+            self.known_encodings_normalized = None
         
         # Clear cache
         self.face_cache.clear()
@@ -615,6 +641,10 @@ class FaceRecognitionSystem:
     
     def detect_faces_fast(self, frame):
         """Fast face detection using Haar cascade (no recognition)"""
+        # Fall back to InsightFace if Haar cascade not available
+        if self.face_cascade is None or self.face_cascade.empty():
+            return self.detect_faces_robust(frame)
+        
         small_frame = cv2.resize(frame, (0, 0), fx=1/self.cv_scaler, fy=1/self.cv_scaler)
         gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
         
@@ -626,7 +656,7 @@ class FaceRecognitionSystem:
             minSize=(30, 30)
         )
         
-        # Convert to face_recognition format and scale up
+        # Convert to (top, right, bottom, left) format and scale up
         locations = []
         for (x, y, w, h) in faces:
             # Scale back to original frame size
@@ -640,23 +670,21 @@ class FaceRecognitionSystem:
     
     def detect_faces_robust(self, frame):
         """
-        Robust face detection using dlib (via face_recognition library).
+        Robust face detection using InsightFace.
         Better at detecting faces at various angles - ideal for registration.
-        Slower than Haar cascade but more reliable.
+        More reliable than Haar cascade.
         """
-        # Downscale for faster processing
-        small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-        rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+        # InsightFace expects BGR images (which is what OpenCV provides)
+        faces = self.face_app.get(frame)
         
-        # Use face_recognition's HOG-based detector (more robust to angles)
-        face_locations = face_recognition.face_locations(rgb_small, model="hog")
+        # Convert InsightFace bbox format to (top, right, bottom, left)
+        face_locations = []
+        for face in faces:
+            bbox = face.bbox.astype(int)
+            left, top, right, bottom = bbox[0], bbox[1], bbox[2], bbox[3]
+            face_locations.append((top, right, bottom, left))
         
-        # Scale back to original size
-        scaled_locations = []
-        for (top, right, bottom, left) in face_locations:
-            scaled_locations.append((top * 2, right * 2, bottom * 2, left * 2))
-        
-        return scaled_locations
+        return face_locations
     
     def detect_faces_combined(self, frame):
         """
@@ -673,98 +701,69 @@ class FaceRecognitionSystem:
         return faces
     
     def recognize_faces(self, frame, force_recognition=False):
-        """Detect and recognize faces in a frame with caching and optimization"""
+        """Detect and recognize faces in a frame using InsightFace"""
         self.frame_count += 1
         
-        if not self.known_encodings:
+        if not self.known_encodings or self.known_encodings_normalized is None:
             return frame, []
         
         results = []
         
-        # Step 1: Fast face detection using Haar cascade
-        if Config.USE_FAST_DETECTION:
-            fast_locations = self.detect_faces_fast(frame)
+        # Skip frames for performance (unless forced)
+        if not force_recognition and self.frame_count % Config.RECOGNITION_INTERVAL_FRAMES != 0:
+            return frame, []
+        
+        # Use InsightFace for detection and embedding extraction (BGR input - OpenCV default)
+        faces = self.face_app.get(frame)
+        
+        # Process each detected face
+        for face in faces:
+            if face.embedding is None:
+                continue
             
-            # If no faces detected by fast method, skip expensive recognition
-            if not fast_locations:
-                return frame, []
-        
-        # Step 2: Check cache for each detected face
-        faces_to_recognize = []
-        cached_results = []
-        
-        if Config.USE_FAST_DETECTION:
-            for location in fast_locations:
-                cached = self.face_cache.get(location)
-                if cached and not force_recognition:
-                    # Use cached result
-                    cached_results.append({
-                        'name': cached['name'],
-                        'confidence': cached['confidence'],
-                        'location': location,
-                        'from_cache': True
-                    })
-                else:
-                    faces_to_recognize.append(location)
-        
-        # Step 3: Only run expensive face_recognition if needed
-        should_recognize = (
-            force_recognition or
-            len(faces_to_recognize) > 0 or
-            (self.frame_count % Config.RECOGNITION_INTERVAL_FRAMES == 0 and Config.USE_FAST_DETECTION)
-        )
-        
-        if should_recognize and (faces_to_recognize or not Config.USE_FAST_DETECTION):
-            # Prepare frame for face_recognition
-            small_frame = cv2.resize(frame, (0, 0), fx=1/self.cv_scaler, fy=1/self.cv_scaler)
-            rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+            face_encoding = face.embedding
+            bbox = face.bbox.astype(int)
+            left, top, right, bottom = bbox[0], bbox[1], bbox[2], bbox[3]
+            location = (top, right, bottom, left)
             
-            # Get face locations and encodings
-            if Config.USE_FAST_DETECTION and faces_to_recognize:
-                # Use the locations we already found, scaled down
-                scaled_locations = [
-                    (t // self.cv_scaler, r // self.cv_scaler, 
-                     b // self.cv_scaler, l // self.cv_scaler)
-                    for (t, r, b, l) in faces_to_recognize
-                ]
-                face_encodings = face_recognition.face_encodings(rgb_small, scaled_locations)
-                face_locations = faces_to_recognize
-            else:
-                # Full detection with face_recognition library
-                scaled_locations = face_recognition.face_locations(rgb_small)
-                face_encodings = face_recognition.face_encodings(rgb_small, scaled_locations)
-                # Scale up locations
-                face_locations = [
-                    (t * self.cv_scaler, r * self.cv_scaler,
-                     b * self.cv_scaler, l * self.cv_scaler)
-                    for (t, r, b, l) in scaled_locations
-                ]
-            
-            # Recognize each face
-            for location, face_encoding in zip(face_locations, face_encodings):
-                matches = face_recognition.compare_faces(self.known_encodings, face_encoding)
-                name = "Unknown"
-                confidence = 0.0
-                
-                if True in matches:
-                    face_distances = face_recognition.face_distance(self.known_encodings, face_encoding)
-                    best_match_index = np.argmin(face_distances)
-                    if matches[best_match_index]:
-                        name = self.known_names[best_match_index]
-                        confidence = 1 - face_distances[best_match_index]
-                
-                # Cache this result
-                self.face_cache.put(location, name, confidence, face_encoding)
-                
+            # Check cache first
+            cached = self.face_cache.get(location)
+            if cached and not force_recognition:
                 results.append({
-                    'name': name,
-                    'confidence': confidence,
+                    'name': cached['name'],
+                    'confidence': cached['confidence'],
                     'location': location,
-                    'from_cache': False
+                    'from_cache': True
                 })
-        
-        # Combine cached and new results
-        results.extend(cached_results)
+                continue
+            
+            # Vectorized cosine similarity with pre-normalized encodings
+            name = "Unknown"
+            confidence = 0.0
+            
+            # Normalize current face encoding
+            face_norm = face_encoding / np.linalg.norm(face_encoding)
+            
+            # Single matrix multiplication for all comparisons
+            similarities = np.dot(self.known_encodings_normalized, face_norm)
+            
+            best_match_index = np.argmax(similarities)
+            best_similarity = similarities[best_match_index]
+            
+            # Use configured threshold
+            if best_similarity > Config.RECOGNITION_THRESHOLD:
+                name = self.known_names[best_match_index]
+                confidence = float(best_similarity)
+            
+            # Cache this result
+            self.face_cache.put(location, name, confidence, face_encoding)
+            
+            results.append({
+                'name': name,
+                'confidence': confidence,
+                'location': location,
+                'from_cache': False
+            })
         
         return frame, results
     
@@ -969,7 +968,7 @@ class DoorEntryKiosk:
         self.current_zone = 'center'
         self.zone_targets = {'center': 30, 'left': 18, 'right': 18, 'up': 17, 'down': 17}  # = 100 total
         
-        # Training state - prevents concurrent face_recognition access
+        # Training state - prevents concurrent InsightFace access
         self.is_training = False
         self.reg_process_locked = False  # Lock during capture, training, and encoding
         
