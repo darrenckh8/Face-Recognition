@@ -3754,15 +3754,19 @@ class DoorEntryKiosk:
         to ensure data integrity and process completion.
         """
         if self.reg_process_locked:
-            # Determine which tab to force back to
-            if self.is_training:
-                # Training in progress - force back to train tab (index 1)
+            # Determine which tab to force back to based on what's in progress
+            if self.registration_mode or self.auto_capture_mode:
+                # Registration/auto-capture in progress - force back to register tab (index 0)
+                self.admin_notebook.select(0)
+                messagebox.showwarning("Registration in Progress", "Please wait for capture and encoding to complete.")
+            elif self.is_training:
+                # Full model training from Train tab - force back to train tab (index 1)
                 self.admin_notebook.select(1)
                 messagebox.showwarning("Training in Progress", "Please wait for training to complete.")
             else:
-                # Registration/capture in progress - force back to register tab (index 0)
+                # Fallback - force to register tab
                 self.admin_notebook.select(0)
-                messagebox.showwarning("Capture in Progress", "Please wait for capture and encoding to complete.")
+                messagebox.showwarning("Process in Progress", "Please wait for the current operation to complete.")
     
     def close_admin_panel(self):
         """Close the admin panel and restore the kiosk interface.
