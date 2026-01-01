@@ -1,3 +1,4 @@
+# ==================== STANDARD LIBRARY IMPORTS ====================
 import tkinter as tk
 from tkinter import ttk, messagebox
 import cv2
@@ -16,7 +17,8 @@ import logging
 import shutil
 from typing import Optional, List, Tuple, Dict, Any
 
-# Configure logging
+# ==================== LOGGING CONFIGURATION ====================
+# Configure application-wide logging with timestamp and level information
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -24,7 +26,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger('DoorEntry')
 
-# Try to import insightface - required for this application
+# ==================== OPTIONAL DEPENDENCIES ====================
+# InsightFace: Required for face detection and recognition
 try:
     from insightface.app import FaceAnalysis
     import insightface
@@ -32,7 +35,7 @@ except ImportError:
     logger.error("insightface library not found. Please install it with: pip install insightface onnxruntime")
     exit(1)
 
-# Try to import picamera2 for Raspberry Pi, fall back to OpenCV
+# Picamera2: Optional - enables Raspberry Pi camera support
 USE_PICAMERA = False
 try:
     from picamera2 import Picamera2
@@ -41,7 +44,7 @@ try:
 except ImportError:
     USE_PICAMERA = False
 
-# Try to import GPIO for Raspberry Pi door control
+# RPi.GPIO: Optional - enables physical door relay control on Raspberry Pi
 USE_GPIO = False
 try:
     import RPi.GPIO as GPIO
@@ -51,42 +54,68 @@ except ImportError:
     USE_GPIO = False
 
 
-# ==================== UTILITY FUNCTIONS ====================
+# ==================== SECURITY UTILITIES ====================
 def hash_password(password: str) -> str:
-    """Hash a password using SHA-256 with salt for secure storage"""
-    salt = "door_entry_kiosk_2024"  # In production, use a random salt per user
+    """
+    Hash a password using SHA-256 with a salt for secure storage.
+    
+    Args:
+        password: The plaintext password to hash
+        
+    Returns:
+        The hexadecimal SHA-256 hash of the salted password
+        
+    Note:
+        In production, use a unique random salt per user stored alongside the hash.
+    """
+    salt = "door_entry_kiosk_2024"
     return hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
 
 def verify_password(password: str, hashed: str) -> bool:
-    """Verify a password against its hash"""
+    """
+    Verify a plaintext password against a stored hash.
+    
+    Args:
+        password: The plaintext password to verify
+        hashed: The stored hash to compare against
+        
+    Returns:
+        True if the password matches, False otherwise
+    """
     return hash_password(password) == hashed
 
 
-# ==================== CONFIGURATION ====================
+# ==================== APPLICATION CONFIGURATION ====================
 class Config:
-    # Kiosk Settings
-    FULLSCREEN = False
-    WINDOW_TITLE = "Door Entry System"
+    """Central configuration class for all application settings.
     
-    # Admin Settings - Store hashed password (hash of "admin123")
-    ADMIN_PASSWORD_HASH = hash_password("admin123")  # Change this in production!
+    Modify these values to customize the kiosk behavior.
+    """
     
-    # Camera Settings
-    CAMERA_RESOLUTION = (640, 480)
+    # ----- Window Settings -----
+    FULLSCREEN = False                    # Set True for production kiosk deployment
+    WINDOW_TITLE = "Door Entry System"    # Window title bar text
     
-    # Recognition Settings
-    RECOGNITION_THRESHOLD = 0.45  # Cosine similarity threshold for InsightFace (0.4-0.5 recommended)
-    COOLDOWN_SECONDS = 5  # Prevent repeated access logs for same person
+    # ----- Security Settings -----
+    # Default admin password hash (plaintext: "admin123") - CHANGE IN PRODUCTION!
+    ADMIN_PASSWORD_HASH = hash_password("admin123")
     
-    # Performance Settings
-    RECOGNITION_INTERVAL_FRAMES = 2  # Only submit frame for recognition every N frames
-    FACE_CACHE_TTL = 5.0  # Seconds to cache a recognized face (longer for embedding-based caching)
-    FACE_POSITION_TOLERANCE = 100  # Pixels tolerance for face position matching
-    DETECTION_SCALE_FACTOR = 4  # Scale down factor for faster processing
-    USE_FAST_DETECTION = False  # Disabled - InsightFace handles detection efficiently
-    EMBEDDING_CACHE_THRESHOLD = 0.6  # Cosine similarity for same-face detection in cache
+    # ----- Camera Settings -----
+    CAMERA_RESOLUTION = (640, 480)        # Camera capture resolution (width, height)
     
-    # Memory Management Settings
+    # ----- Face Recognition Settings -----
+    RECOGNITION_THRESHOLD = 0.45          # Minimum cosine similarity for a match (0.4-0.5 recommended)
+    COOLDOWN_SECONDS = 5                  # Seconds between access logs for same person
+    
+    # ----- Performance Tuning -----
+    RECOGNITION_INTERVAL_FRAMES = 2       # Process every Nth frame for recognition
+    FACE_CACHE_TTL = 5.0                  # Seconds to remember a recognized face
+    FACE_POSITION_TOLERANCE = 100         # Pixel tolerance for face position matching
+    DETECTION_SCALE_FACTOR = 4            # Downscale factor for Haar cascade detection
+    USE_FAST_DETECTION = False            # Use Haar cascade (faster but less accurate)
+    EMBEDDING_CACHE_THRESHOLD = 0.6       # Similarity threshold for cache matching
+    
+    # ----- Memory Management Settings -----
     MAX_CACHE_ENTRIES = 20  # Maximum faces to keep in cache
     ACCESS_LOG_MAX_MEMORY_ENTRIES = 1000  # Max entries to keep in memory (older are on disk only)
     FRAME_POOL_SIZE = 3  # Number of pre-allocated frames for recognition queue
@@ -103,32 +132,33 @@ class Config:
     # Apple-like Clean Design Colors
     COLOR_GRANTED = "#34C759"    # Apple Green
     COLOR_DENIED = "#FF3B30"     # Apple Red
-    COLOR_SCANNING = "#007AFF"   # Apple Blue
-    COLOR_WARNING = "#FF9500"    # Apple Orange
+    COLOR_SCANNING = "#007AFF"                # Blue - face detected, processing
+    COLOR_WARNING = "#FF9500"                 # Orange - warnings/alerts
     
-    # Light Theme
-    COLOR_BG = "#F2F2F7"         # Light gray background
-    COLOR_CARD = "#FFFFFF"       # White cards
-    COLOR_CARD_SECONDARY = "#F9F9F9"  # Slightly off-white
-    COLOR_TEXT = "#1C1C1E"       # Near black text
-    COLOR_TEXT_SECONDARY = "#8E8E93"  # Gray text
-    COLOR_TEXT_TERTIARY = "#AEAEB2"   # Light gray text
-    COLOR_BORDER = "#E5E5EA"     # Subtle border
-    COLOR_SHADOW = "#C7C7CC"     # Shadow color
-    COLOR_HIGHLIGHT = "#E3F2FD"  # Light blue highlight for hover states
+    # ----- Light Theme Colors -----
+    COLOR_BG = "#F2F2F7"                       # Main window background
+    COLOR_CARD = "#FFFFFF"                    # Card/panel background
+    COLOR_CARD_SECONDARY = "#F9F9F9"          # Alternate card background
+    COLOR_TEXT = "#1C1C1E"                    # Primary text color
+    COLOR_TEXT_SECONDARY = "#8E8E93"          # Secondary/muted text
+    COLOR_TEXT_TERTIARY = "#AEAEB2"           # Tertiary/disabled text
+    COLOR_BORDER = "#E5E5EA"                  # Border color for cards/inputs
+    COLOR_SHADOW = "#C7C7CC"                  # Drop shadow color
+    COLOR_HIGHLIGHT = "#E3F2FD"               # Hover/focus highlight
     
-    # UI/UX Timing Settings
-    STATUS_DISPLAY_DURATION = 3000  # ms to show granted/denied before returning to scan
-    ANIMATION_DURATION = 150  # ms for UI transitions
-    TOAST_DURATION = 2500  # ms to show toast messages
+    # ----- UI Animation Timing (milliseconds) -----
+    STATUS_DISPLAY_DURATION = 3000            # How long to show access granted/denied
+    ANIMATION_DURATION = 150                  # Button/transition animations
+    TOAST_DURATION = 2500                     # Toast notification display time
     
-    # Typography (System fonts that look like SF Pro)
+    # ----- Typography -----
+    # Uses platform-native fonts for best appearance
     FONT_FAMILY = "SF Pro Display" if os.name == 'darwin' else "Segoe UI" if os.name == 'nt' else "Helvetica Neue"
     FONT_FAMILY_MONO = "SF Mono" if os.name == 'darwin' else "Consolas" if os.name == 'nt' else "Monaco"
     
-    # Backup Settings
-    BACKUP_ENABLED = True
-    MAX_BACKUPS = 5  # Number of backup files to keep
+    # ----- Backup Configuration -----
+    BACKUP_ENABLED = True                     # Auto-backup before encoding changes
+    MAX_BACKUPS = 5                           # Rolling backup limit (oldest deleted)
     
     @classmethod
     def validate(cls) -> List[str]:
@@ -165,25 +195,39 @@ class Config:
 
 # ==================== BACKUP SYSTEM ====================
 class BackupManager:
-    """Manages backup and restore of critical data files"""
+    """
+    Handles automatic backup of critical data files (encodings.pickle).
+    
+    Creates timestamped backups before any modification and maintains
+    a rolling window of recent backups for recovery purposes.
+    """
     
     @staticmethod
     def create_backup(file_path: str, max_backups: int = 5) -> Optional[str]:
-        """Create a timestamped backup of a file"""
+        """
+        Create a timestamped backup copy of a file.
+        
+        Args:
+            file_path: Path to the file to backup
+            max_backups: Maximum number of backups to retain
+            
+        Returns:
+            Path to the created backup file, or None if backup failed
+        """
         if not os.path.exists(file_path):
             return None
         
         try:
-            # Create backup filename with timestamp
+            # Generate unique backup filename with current timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             base, ext = os.path.splitext(file_path)
             backup_path = f"{base}_backup_{timestamp}{ext}"
             
-            # Copy the file
+            # Preserve file metadata during copy
             shutil.copy2(file_path, backup_path)
             logger.info(f"Created backup: {backup_path}")
             
-            # Clean up old backups (keep only max_backups most recent)
+            # Enforce backup retention limit
             BackupManager._cleanup_old_backups(base, ext, max_backups)
             
             return backup_path
@@ -193,11 +237,15 @@ class BackupManager:
     
     @staticmethod
     def _cleanup_old_backups(base: str, ext: str, max_backups: int):
-        """Remove old backup files, keeping only the most recent ones"""
+        """
+        Remove excess backup files beyond the retention limit.
+        Keeps the most recent backups based on filename timestamp.
+        """
         import glob
         pattern = f"{base}_backup_*{ext}"
-        backups = sorted(glob.glob(pattern), reverse=True)
+        backups = sorted(glob.glob(pattern), reverse=True)  # Newest first
         
+        # Delete all backups beyond the limit
         for old_backup in backups[max_backups:]:
             try:
                 os.remove(old_backup)
@@ -207,7 +255,15 @@ class BackupManager:
     
     @staticmethod
     def get_latest_backup(file_path: str) -> Optional[str]:
-        """Get the path to the most recent backup of a file"""
+        """
+        Find the most recent backup file for a given source file.
+        
+        Args:
+            file_path: Path to the original file
+            
+        Returns:
+            Path to the newest backup, or None if no backups exist
+        """
         import glob
         base, ext = os.path.splitext(file_path)
         pattern = f"{base}_backup_*{ext}"
@@ -216,7 +272,16 @@ class BackupManager:
     
     @staticmethod
     def restore_from_backup(file_path: str, backup_path: str = None) -> bool:
-        """Restore a file from its backup"""
+        """
+        Restore a file from a backup copy.
+        
+        Args:
+            file_path: Destination path to restore to
+            backup_path: Specific backup to use (defaults to most recent)
+            
+        Returns:
+            True if restore succeeded, False otherwise
+        """
         if backup_path is None:
             backup_path = BackupManager.get_latest_backup(file_path)
         
@@ -235,29 +300,56 @@ class BackupManager:
 
 # ==================== FACE STABILITY TRACKER ====================
 class FaceStabilityTracker:
-    """Tracks face position stability to ensure recognition only runs on settled faces"""
+    """
+    Tracks face movement over consecutive frames to detect stability.
+    
+    This prevents recognition from running on moving faces, which can
+    cause inconsistent results. Recognition only triggers when a face
+    has remained relatively stationary for several frames.
+    
+    Attributes:
+        stability_threshold: Maximum pixel movement allowed to be considered stable
+        stable_frames_required: Number of consecutive stable frames needed
+    """
     
     def __init__(self, stability_threshold: int = 200, stable_frames_required: int = 5):
-        self.stability_threshold = stability_threshold  # Max pixel movement to be considered stable
-        self.stable_frames_required = stable_frames_required  # Consecutive stable frames needed
-        self.last_positions: Dict[int, List[Tuple[int, int]]] = {}  # face_id -> list of center positions
-        self.stable_count: Dict[int, int] = {}  # face_id -> consecutive stable frame count
-        self.lock = threading.Lock()
+        """
+        Initialize the stability tracker.
+        
+        Args:
+            stability_threshold: Max pixel distance between frames to count as stable
+            stable_frames_required: How many stable frames before recognition triggers
+        """
+        self.stability_threshold = stability_threshold
+        self.stable_frames_required = stable_frames_required
+        self.last_positions: Dict[int, List[Tuple[int, int]]] = {}  # Track position history per face
+        self.stable_count: Dict[int, int] = {}  # Consecutive stable frames per face
+        self.lock = threading.Lock()  # Thread-safe access
     
     def _get_face_center(self, location: Tuple[int, int, int, int]) -> Tuple[int, int]:
-        """Get center point of face bounding box"""
+        """Calculate the center point of a face bounding box."""
         top, right, bottom, left = location
         return ((left + right) // 2, (top + bottom) // 2)
     
     def _calculate_movement(self, pos1: Tuple[int, int], pos2: Tuple[int, int]) -> float:
-        """Calculate Euclidean distance between two positions"""
+        """Calculate Euclidean distance between two points."""
         return ((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2) ** 0.5
     
     def update_and_check_stability(self, face_id: int, location: Tuple[int, int, int, int]) -> bool:
-        """Update face position and return True if face is stable"""
+        """
+        Update tracking for a face and check if it's stable.
+        
+        Args:
+            face_id: Unique identifier for the face being tracked
+            location: Bounding box as (top, right, bottom, left)
+            
+        Returns:
+            True if face has been stable for required number of frames
+        """
         center = self._get_face_center(location)
         
         with self.lock:
+            # First time seeing this face
             if face_id not in self.last_positions:
                 self.last_positions[face_id] = [center]
                 self.stable_count[face_id] = 0
@@ -265,17 +357,18 @@ class FaceStabilityTracker:
             
             positions = self.last_positions[face_id]
             
-            # Check movement from last position
+            # Compare to last known position
             if positions:
                 movement = self._calculate_movement(center, positions[-1])
                 
                 if movement <= self.stability_threshold:
+                    # Face is stable, increment counter
                     self.stable_count[face_id] = self.stable_count.get(face_id, 0) + 1
                 else:
-                    # Face moved too much, reset stability count
+                    # Face moved too much, reset stability tracking
                     self.stable_count[face_id] = 0
             
-            # Keep only last few positions
+            # Maintain rolling window of recent positions
             positions.append(center)
             if len(positions) > 10:
                 positions.pop(0)
@@ -283,13 +376,13 @@ class FaceStabilityTracker:
             return self.stable_count[face_id] >= self.stable_frames_required
     
     def clear(self):
-        """Clear all tracking data"""
+        """Clear all tracking data for all faces."""
         with self.lock:
             self.last_positions.clear()
             self.stable_count.clear()
     
     def remove_face(self, face_id: int):
-        """Remove tracking data for a specific face"""
+        """Remove tracking data for a specific face when it leaves view."""
         with self.lock:
             self.last_positions.pop(face_id, None)
             self.stable_count.pop(face_id, None)
@@ -297,11 +390,27 @@ class FaceStabilityTracker:
 
 # ==================== FACE CACHE ====================
 class FaceCache:
-    """Caches recognized faces to avoid repeated recognition of the same face.
-    Uses both position and embedding similarity for robust face tracking."""
+    """
+    Caches recognized faces to prevent redundant recognition processing.
+    
+    Uses a dual-matching strategy combining:
+    - Position-based matching: Grid cells for approximate location matching
+    - Embedding similarity: Cosine similarity for identity verification
+    
+    This allows the system to skip recognition for faces that have already
+    been identified and are still visible in the camera view.
+    """
     
     def __init__(self, ttl: Optional[float] = None, position_tolerance: Optional[int] = None, 
                  max_entries: Optional[int] = None):
+        """
+        Initialize the face cache.
+        
+        Args:
+            ttl: Time-to-live in seconds before cache entries expire
+            position_tolerance: Pixel tolerance for position-based matching
+            max_entries: Maximum number of faces to cache simultaneously
+        """
         self.ttl = ttl or Config.FACE_CACHE_TTL
         self.position_tolerance = position_tolerance or Config.FACE_POSITION_TOLERANCE
         self.embedding_threshold = getattr(Config, 'EMBEDDING_CACHE_THRESHOLD', 0.6)
@@ -310,17 +419,26 @@ class FaceCache:
         self.lock = threading.Lock()
     
     def _get_position_key(self, location: Tuple[int, int, int, int]) -> Tuple[int, int]:
-        """Generate a grid-based position key for face location"""
+        """
+        Convert face bounding box to a grid cell key for fast lookup.
+        
+        Divides the frame into grid cells based on position_tolerance,
+        allowing efficient cache lookups for faces in similar positions.
+        """
         top, right, bottom, left = location
         center_x = (left + right) // 2
         center_y = (top + bottom) // 2
-        # Round to grid cells based on tolerance
         grid_x = center_x // self.position_tolerance
         grid_y = center_y // self.position_tolerance
         return (grid_x, grid_y)
     
     def _compute_embedding_similarity(self, enc1: np.ndarray, enc2: np.ndarray) -> float:
-        """Compute cosine similarity between two embeddings"""
+        """
+        Calculate cosine similarity between two face embeddings.
+        
+        Returns a value between -1 and 1, where 1 indicates identical faces.
+        Used to determine if a cached face matches the current face.
+        """
         if enc1 is None or enc2 is None:
             return 0.0
         norm1 = np.linalg.norm(enc1)
@@ -331,24 +449,29 @@ class FaceCache:
     
     def _find_nearby_cache(self, location: Tuple[int, int, int, int], 
                            encoding: Optional[np.ndarray] = None) -> Optional[Dict[str, Any]]:
-        """Find a cached face near the given location or with similar embedding"""
+        """
+        Search for a cached face matching the given location or embedding.
+        
+        Searches all non-expired cache entries and returns the best match
+        based on a combined score of position proximity and embedding similarity.
+        """
         top, right, bottom, left = location
         center_x = (left + right) // 2
         center_y = (top + bottom) // 2
         
         now = time.time()
         best_match = None
-        best_score = -1  # Combined score (position + embedding)
+        best_score = -1
         
         with self.lock:
-            # Clean expired entries and find best match
+            # Collect expired entries for cleanup
             expired_keys = []
             for key, entry in self.cache.items():
                 if now - entry['timestamp'] > self.ttl:
                     expired_keys.append(key)
                     continue
                 
-                # Position-based matching
+                # Calculate position distance
                 cached_top, cached_right, cached_bottom, cached_left = entry['location']
                 cached_center_x = (cached_left + cached_right) // 2
                 cached_center_y = (cached_top + cached_bottom) // 2
@@ -356,12 +479,12 @@ class FaceCache:
                 distance = ((center_x - cached_center_x) ** 2 + (center_y - cached_center_y) ** 2) ** 0.5
                 position_match = distance < self.position_tolerance * 1.5
                 
-                # Embedding-based matching (more reliable for same person)
+                # Calculate embedding similarity if available
                 embedding_similarity = 0.0
                 if encoding is not None and entry.get('encoding') is not None:
                     embedding_similarity = self._compute_embedding_similarity(encoding, entry['encoding'])
                 
-                # Combined scoring: position helps, but embedding is more important
+                # Score prioritizes embedding match over position
                 if embedding_similarity > self.embedding_threshold:
                     # Same face based on embedding - strong match
                     score = embedding_similarity + (0.2 if position_match else 0)
@@ -383,11 +506,24 @@ class FaceCache:
     
     def get(self, location: Tuple[int, int, int, int], 
             encoding: Optional[np.ndarray] = None) -> Optional[Dict[str, Any]]:
-        """Get cached recognition result for a face at given location or with similar embedding"""
+        """
+        Retrieve cached recognition result by location and/or embedding.
+        
+        Args:
+            location: Face bounding box (top, right, bottom, left)
+            encoding: Face embedding vector for similarity matching
+            
+        Returns:
+            Cached result dict with name, confidence, etc., or None if not found
+        """
         return self._find_nearby_cache(location, encoding)
     
     def get_by_embedding(self, encoding: np.ndarray) -> Optional[Dict[str, Any]]:
-        """Get cached recognition result for a face with similar embedding"""
+        """
+        Find cached face purely by embedding similarity.
+        
+        Used when position matching isn't reliable (e.g., face has moved significantly).
+        """
         if encoding is None:
             return None
         
@@ -397,6 +533,7 @@ class FaceCache:
         
         with self.lock:
             for key, entry in self.cache.items():
+                # Skip expired entries
                 if now - entry['timestamp'] > self.ttl:
                     continue
                 if entry.get('encoding') is None:
@@ -411,14 +548,22 @@ class FaceCache:
     
     def put(self, location: Tuple[int, int, int, int], name: str, confidence: float, 
             encoding: Optional[np.ndarray] = None) -> None:
-        """Cache a recognition result"""
+        """
+        Store a recognition result in the cache.
+        
+        Args:
+            location: Face bounding box for position-based lookup
+            name: Recognized person's name
+            confidence: Recognition confidence score
+            encoding: Face embedding for similarity-based matching
+        """
         key = self._get_position_key(location)
         with self.lock:
-            # Evict oldest entries if cache is full
+            # Enforce cache size limit
             if len(self.cache) >= self.max_entries:
                 self._evict_oldest_entries()
             
-            # Store embedding as float32 to save memory (insightface uses float32 internally)
+            # Store embedding as float32 to reduce memory usage
             stored_encoding = None
             if encoding is not None:
                 stored_encoding = np.asarray(encoding, dtype=np.float32)
@@ -432,10 +577,12 @@ class FaceCache:
             }
     
     def _evict_oldest_entries(self):
-        """Remove oldest entries to make room (must be called with lock held)"""
+        """
+        Remove oldest 25% of entries when cache is full.
+        Must be called while holding the lock.
+        """
         if not self.cache:
             return
-        # Sort by timestamp and remove oldest 25%
         entries = sorted(self.cache.items(), key=lambda x: x[1]['timestamp'])
         num_to_remove = max(1, len(entries) // 4)
         for key, _ in entries[:num_to_remove]:
@@ -443,25 +590,33 @@ class FaceCache:
     
     def update_location(self, old_location: Tuple[int, int, int, int], 
                         new_location: Tuple[int, int, int, int]) -> None:
-        """Update the location of a cached face (for tracking)"""
+        """
+        Update cache when a tracked face moves to a new position.
+        Refreshes the TTL timestamp to keep the entry alive.
+        """
         old_key = self._get_position_key(old_location)
         new_key = self._get_position_key(new_location)
         with self.lock:
             if old_key in self.cache:
                 entry = self.cache[old_key]
                 entry['location'] = new_location
-                entry['timestamp'] = time.time()  # Refresh TTL
+                entry['timestamp'] = time.time()
                 if old_key != new_key:
                     self.cache[new_key] = entry
                     del self.cache[old_key]
     
     def clear(self) -> None:
-        """Clear all cached entries"""
+        """Remove all entries from the cache."""
         with self.lock:
             self.cache.clear()
     
     def cleanup_expired(self) -> int:
-        """Remove expired entries from cache, returns count of removed entries"""
+        """
+        Remove all expired entries from cache.
+        
+        Returns:
+            Number of entries removed
+        """
         now = time.time()
         with self.lock:
             expired_keys = [k for k, v in self.cache.items() if now - v['timestamp'] > self.ttl]
@@ -470,7 +625,7 @@ class FaceCache:
             return len(expired_keys)
     
     def get_all_active(self) -> List[Dict[str, Any]]:
-        """Get all non-expired cached entries"""
+        """Get all non-expired cached entries for display purposes."""
         now = time.time()
         with self.lock:
             return [entry.copy() for entry in self.cache.values() 
@@ -479,63 +634,94 @@ class FaceCache:
 
 # ==================== DOOR CONTROLLER ====================
 class DoorController:
-    """Controls the physical door lock (GPIO for Raspberry Pi or simulation)"""
+    """
+    Controls the physical door lock mechanism.
+    
+    Supports GPIO-based relay control for Raspberry Pi deployments,
+    with automatic fallback to simulation mode on non-Pi systems.
+    """
     
     def __init__(self):
+        """Initialize door controller and set up GPIO if available."""
         self.is_unlocked = False
         self.unlock_thread = None
         
+        # Configure GPIO for relay control on Raspberry Pi
         if USE_GPIO:
             GPIO.setmode(GPIO.BCM)
             GPIO.setup(Config.DOOR_RELAY_PIN, GPIO.OUT)
-            GPIO.output(Config.DOOR_RELAY_PIN, GPIO.LOW)
+            GPIO.output(Config.DOOR_RELAY_PIN, GPIO.LOW)  # Start locked
     
     def unlock(self, duration=None):
-        """Unlock the door for specified duration"""
+        """
+        Unlock the door for a specified duration.
+        
+        Args:
+            duration: Seconds to keep door unlocked (uses config default if None)
+        """
         if duration is None:
             duration = Config.DOOR_UNLOCK_DURATION
         
+        # Prevent overlapping unlock operations
         if self.unlock_thread and self.unlock_thread.is_alive():
-            return  # Already unlocking
+            return
         
         self.unlock_thread = threading.Thread(target=self._unlock_sequence, args=(duration,))
         self.unlock_thread.start()
     
     def _unlock_sequence(self, duration):
-        """Execute the unlock sequence"""
+        """
+        Execute the timed unlock sequence.
+        Runs in a separate thread to avoid blocking the main loop.
+        """
         self.is_unlocked = True
         
         if USE_GPIO:
-            GPIO.output(Config.DOOR_RELAY_PIN, GPIO.HIGH)
+            GPIO.output(Config.DOOR_RELAY_PIN, GPIO.HIGH)  # Activate relay
         
         logger.info(f"Door unlocked for {duration} seconds")
         time.sleep(duration)
         
         if USE_GPIO:
-            GPIO.output(Config.DOOR_RELAY_PIN, GPIO.LOW)
+            GPIO.output(Config.DOOR_RELAY_PIN, GPIO.LOW)  # Deactivate relay
         
         self.is_unlocked = False
         logger.info("Door locked")
     
     def cleanup(self):
-        """Cleanup GPIO on exit"""
+        """Release GPIO resources on application exit."""
         if USE_GPIO:
             GPIO.cleanup()
 
 
 # ==================== ACCESS LOG ====================
 class AccessLog:
-    """Manages access log entries with memory-efficient storage"""
+    """
+    Manages access event logging with persistent storage.
+    
+    Stores access attempts (granted/denied) with timestamps.
+    Uses memory-efficient storage keeping only recent entries in RAM
+    while maintaining full history on disk.
+    """
     
     def __init__(self, log_path=None):
+        """
+        Initialize access log.
+        
+        Args:
+            log_path: Path to JSON log file (uses config default if None)
+        """
         self.log_path = log_path or Config.ACCESS_LOG_PATH
         self.max_memory_entries = getattr(Config, 'ACCESS_LOG_MAX_MEMORY_ENTRIES', 1000)
-        self.entries = []  # Only recent entries in memory
-        self._total_entries = 0  # Total entries including on-disk
+        self.entries = []  # Recent entries kept in memory
+        self._total_entries = 0  # Total count including on-disk entries
         self.load()
     
     def load(self):
-        """Load existing log entries (only keep recent ones in memory)"""
+        """
+        Load log entries from disk.
+        Only keeps the most recent entries in memory to limit RAM usage.
+        """
         if os.path.exists(self.log_path):
             try:
                 with open(self.log_path, 'r') as f:
@@ -551,11 +737,12 @@ class AccessLog:
             self._total_entries = 0
     
     def save(self):
-        """Save log entries to file (appends new entries efficiently)"""
+        """
+        Persist log entries to disk.
+        Merges in-memory entries with existing disk entries to prevent duplicates.
+        """
         try:
-            # For small logs, just write everything
-            # For large logs, we could implement append-only, but JSON doesn't support it well
-            # So we load existing, merge, and save
+            # Load existing entries from disk
             if os.path.exists(self.log_path):
                 with open(self.log_path, 'r') as f:
                     try:
@@ -565,8 +752,7 @@ class AccessLog:
             else:
                 all_entries = []
             
-            # Merge: keep older entries from disk, add new from memory
-            # Deduplicate by timestamp
+            # Merge: deduplicate by timestamp to avoid duplicate entries
             existing_timestamps = {e['timestamp'] for e in all_entries}
             new_entries = [e for e in self.entries if e['timestamp'] not in existing_timestamps]
             all_entries.extend(new_entries)
@@ -579,7 +765,17 @@ class AccessLog:
             logger.error(f"Failed to save access log: {e}")
     
     def add_entry(self, name, access_granted, confidence=0.0):
-        """Add a new access log entry"""
+        """
+        Record a new access event.
+        
+        Args:
+            name: Name of person attempting access
+            access_granted: Whether access was allowed
+            confidence: Recognition confidence score
+            
+        Returns:
+            The created log entry dictionary
+        """
         entry = {
             "timestamp": datetime.now().isoformat(),
             "name": name,
@@ -589,7 +785,7 @@ class AccessLog:
         self.entries.append(entry)
         self._total_entries += 1
         
-        # Trim memory if too large
+        # Limit memory usage by trimming old entries
         if len(self.entries) > self.max_memory_entries:
             self.entries = self.entries[-self.max_memory_entries:]
         
@@ -597,23 +793,33 @@ class AccessLog:
         return entry
     
     def get_recent(self, count=50):
-        """Get most recent entries"""
+        """Get the most recent N log entries in reverse chronological order."""
         return list(reversed(self.entries[-count:]))
     
     def get_filtered(self, date_from=None, date_to=None, name_filter=None, count=100):
-        """Get entries filtered by date range and/or name"""
+        """
+        Query log entries with optional filters.
+        
+        Args:
+            date_from: Earliest date to include (inclusive)
+            date_to: Latest date to include (inclusive)
+            name_filter: Partial name match (case-insensitive)
+            count: Maximum entries to return
+            
+        Returns:
+            List of matching entries in reverse chronological order
+        """
         filtered = []
         for entry in reversed(self.entries):
-            # Parse entry timestamp
             entry_date = datetime.fromisoformat(entry['timestamp']).date()
             
-            # Date range filter
+            # Apply date range filter
             if date_from and entry_date < date_from:
                 continue
             if date_to and entry_date > date_to:
                 continue
             
-            # Name filter (case-insensitive partial match)
+            # Apply name filter (case-insensitive substring match)
             if name_filter and name_filter.lower() not in entry['name'].lower():
                 continue
             
@@ -624,50 +830,66 @@ class AccessLog:
         return filtered
     
     def get_unique_names(self):
-        """Get list of unique names in the log"""
+        """Get sorted list of all unique names in the access log."""
         names = set()
         for entry in self.entries:
             names.add(entry['name'])
         return sorted(list(names))
     
     def clear(self):
-        """Clear all entries"""
+        """Delete all log entries from memory and disk."""
         self.entries = []
         self.save()
 
 
 # ==================== CAMERA MANAGER ====================
 class CameraManager:
-    """Manages camera operations in a separate thread for zero-latency frame capture"""
+    """
+    Manages camera hardware with background frame capture.
+    
+    Runs a dedicated thread for continuous frame capture to ensure
+    the main thread always has the latest frame available without blocking.
+    Supports both USB webcams and Raspberry Pi camera module.
+    """
     
     def __init__(self, use_picamera=False, resolution=(640, 480)):
+        """
+        Initialize camera manager.
+        
+        Args:
+            use_picamera: Use Raspberry Pi camera instead of USB webcam
+            resolution: Capture resolution as (width, height)
+        """
         self.use_picamera = use_picamera
         self.resolution = resolution
         self.camera = None
         self.is_running = False
         
-        # Thread-safe frame storage
+        # Thread-safe frame buffer
         self.current_frame = None
         self.frame_lock = threading.Lock()
         self.capture_thread = None
     
     def start(self):
-        """Initialize and start the camera with background capture thread"""
+        """
+        Initialize camera hardware and start background capture.
+        Automatically probes for available camera devices.
+        """
         if self.use_picamera:
+            # Raspberry Pi camera module
             self.camera = Picamera2()
             self.camera.configure(self.camera.create_preview_configuration(
                 main={"format": 'XRGB8888', "size": self.resolution}, buffer_count=2
             ))
             self.camera.start()
         else:
-            # Try multiple video indices in case camera mounts at /dev/video1 or /dev/video2
+            # USB webcam - probe multiple indices for flexibility
             camera_indices = [0, 1, 2]
             self.camera = None
             
             for idx in camera_indices:
                 cap = cv2.VideoCapture(idx)
                 if cap.isOpened():
-                    # Test if we can actually read a frame
                     ret, _ = cap.read()
                     if ret:
                         self.camera = cap
@@ -681,10 +903,10 @@ class CameraManager:
             if self.camera is None:
                 raise RuntimeError("Could not connect to any camera. Tried indices: 0, 1, 2")
             
+            # Configure camera properties
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
-            # Reduce buffer size to minimize latency
-            self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize latency
         
         self.is_running = True
         
@@ -692,11 +914,14 @@ class CameraManager:
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.capture_thread.start()
         
-        # Wait for first frame
+        # Allow camera to warm up
         time.sleep(0.3)
     
     def _capture_loop(self):
-        """Background thread that continuously captures frames"""
+        """
+        Continuous frame capture running in background thread.
+        Ensures latest frame is always available for the main loop.
+        """
         while self.is_running:
             try:
                 if self.use_picamera:
@@ -707,7 +932,7 @@ class CameraManager:
                     if not ret:
                         continue
                 
-                # Store the latest frame thread-safely
+                # Thread-safe frame update
                 with self.frame_lock:
                     self.current_frame = frame
                     
@@ -716,7 +941,10 @@ class CameraManager:
                 time.sleep(0.1)
     
     def capture_frame(self):
-        """Get the latest captured frame (non-blocking)"""
+        """
+        Get the most recent captured frame.
+        Returns immediately with latest frame (non-blocking).
+        """
         if not self.is_running:
             return None
         
@@ -726,7 +954,7 @@ class CameraManager:
         return None
     
     def stop(self):
-        """Stop capture thread and release the camera"""
+        """Stop capture thread and release camera hardware."""
         self.is_running = False
         
         # Wait for capture thread to finish
@@ -743,23 +971,41 @@ class CameraManager:
 
 # ==================== FACE RECOGNITION SYSTEM ====================
 class FaceRecognitionSystem:
-    """Core face recognition logic with performance optimizations using InsightFace.
-    Uses background threading to avoid blocking the main camera loop."""
+    """
+    Core face recognition engine using InsightFace (buffalo_s model).
+    
+    Features:
+    - Background threaded recognition to prevent UI blocking
+    - Face stability detection to avoid recognizing moving faces
+    - Embedding caching to prevent redundant recognition
+    - Vectorized cosine similarity for fast matching
+    - Support for CUDA and CPU execution providers
+    """
     
     def __init__(self, dataset_path=None, encodings_path=None):
+        """
+        Initialize the face recognition system.
+        
+        Args:
+            dataset_path: Directory containing person face images
+            encodings_path: Path to pickle file with face encodings
+        """
         self.dataset_path = dataset_path or Config.DATASET_PATH
         self.encodings_path = encodings_path or Config.ENCODINGS_PATH
         self.known_encodings = []
         self.known_names = []
-        self.known_encodings_normalized = None  # Pre-normalized matrix for fast comparison
+        self.known_encodings_normalized = None  # Pre-computed for fast matching
         self.cv_scaler = Config.DETECTION_SCALE_FACTOR
         
-        # Face stability tracking - only recognize settled faces
+        # Face stability tracking - wait for face to settle before recognizing
         self.stability_tracker = FaceStabilityTracker()
         
-        # Initialize InsightFace model (buffalo_s is lighter for Raspberry Pi)
+        # Initialize InsightFace model
         try:
-            self.face_app = FaceAnalysis(name='buffalo_s', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+            self.face_app = FaceAnalysis(
+                name='buffalo_s',  # Lightweight model suitable for edge devices
+                providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+            )
             self.face_app.prepare(ctx_id=0, det_size=(640, 640))
             logger.info("InsightFace model (buffalo_s) loaded successfully")
         except Exception as e:
@@ -768,7 +1014,7 @@ class FaceRecognitionSystem:
                 f"Please ensure insightface is properly installed with: pip install insightface onnxruntime"
             )
         
-        # Keep Haar cascade for fast detection fallback (optional)
+        # Optional Haar cascade for fast fallback detection
         try:
             cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
             if os.path.exists(cascade_path):
@@ -778,37 +1024,43 @@ class FaceRecognitionSystem:
         except Exception:
             self.face_cascade = None
         
-        # Performance: Face cache to avoid repeated recognition
+        # Cache to avoid re-recognizing the same face
         self.face_cache = FaceCache()
         
-        # Performance: Frame counter for skipping
+        # Frame skip counter for performance
         self.frame_count = 0
         
         # ========== THREADED RECOGNITION ==========
-        # Background thread for face recognition to prevent UI lag
+        # Background thread prevents recognition from blocking the camera loop
         self._recognition_thread = None
         self._recognition_lock = threading.Lock()
-        self._frame_queue = Queue(maxsize=2)  # Small queue to prevent memory buildup
+        self._frame_queue = Queue(maxsize=2)  # Limit queue size to prevent memory buildup
         self._last_results = []  # Most recent recognition results
         self._last_results_lock = threading.Lock()
         self._recognition_running = False
         self._stop_recognition = threading.Event()
         
+        # Ensure dataset directory exists
         if not os.path.exists(self.dataset_path):
             os.makedirs(self.dataset_path)
         
         self.load_encodings()
     
     def load_encodings(self):
-        """Load face encodings from pickle file and pre-normalize for fast comparison"""
+        """
+        Load face encodings from disk and prepare for fast matching.
+        Pre-normalizes all embeddings for vectorized cosine similarity.
+        """
         if os.path.exists(self.encodings_path):
             try:
                 with open(self.encodings_path, "rb") as f:
                     data = pickle.loads(f.read())
-                # Convert lists to numpy arrays with float32 for memory efficiency
+                    
+                # Convert to float32 arrays for memory efficiency
                 self.known_encodings = [np.array(enc, dtype=np.float32) for enc in data["encodings"]]
                 self.known_names = data["names"]
-                # Pre-normalize encodings for vectorized cosine similarity
+                
+                # Pre-normalize for vectorized similarity computation
                 self._update_normalized_encodings()
                 logger.info(f"Loaded {len(self.known_encodings)} encodings for {len(set(self.known_names))} persons")
                 return True
@@ -818,9 +1070,11 @@ class FaceRecognitionSystem:
         return False
     
     def _update_normalized_encodings(self):
-        """Pre-normalize all known encodings for fast vectorized comparison"""
+        """
+        Pre-compute normalized encoding matrix for fast similarity.
+        Normalizing once here avoids per-comparison normalization overhead.
+        """
         if len(self.known_encodings) > 0:
-            # Use float32 for memory efficiency (InsightFace embeddings are 512-dim)
             encodings_matrix = np.array(self.known_encodings, dtype=np.float32)
             norms = np.linalg.norm(encodings_matrix, axis=1, keepdims=True)
             self.known_encodings_normalized = (encodings_matrix / norms).astype(np.float32)
@@ -828,7 +1082,12 @@ class FaceRecognitionSystem:
             self.known_encodings_normalized = None
     
     def get_registered_persons(self):
-        """Get list of registered persons from dataset folder"""
+        """
+        Get list of all persons with face images in the dataset folder.
+        
+        Returns:
+            List of tuples: (person_name, image_count)
+        """
         persons = []
         if os.path.exists(self.dataset_path):
             for name in os.listdir(self.dataset_path):
@@ -840,18 +1099,27 @@ class FaceRecognitionSystem:
         return persons
     
     def get_trained_persons(self):
-        """Get unique names from trained encodings"""
+        """Get list of unique names that have been trained (have encodings)."""
         return list(set(self.known_names))
     
     def create_person_folder(self, name):
-        """Create a folder for a new person"""
+        """Create a directory for storing a person's face images."""
         person_folder = os.path.join(self.dataset_path, name)
         if not os.path.exists(person_folder):
             os.makedirs(person_folder)
         return person_folder
     
     def save_face_image(self, frame, name):
-        """Save a captured face image"""
+        """
+        Save a captured face image to the person's folder.
+        
+        Args:
+            frame: OpenCV image (BGR format)
+            name: Person's name for folder organization
+            
+        Returns:
+            Path to the saved image file
+        """
         folder = self.create_person_folder(name)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"{name}_{timestamp}.jpg"
@@ -860,7 +1128,18 @@ class FaceRecognitionSystem:
         return filepath
     
     def train_model(self, progress_callback=None):
-        """Train the face recognition model on all images in dataset"""
+        """
+        Train face recognition on all images in the dataset.
+        
+        Scans all person folders, extracts face embeddings from each image,
+        and saves the encodings to disk.
+        
+        Args:
+            progress_callback: Optional function(current, total, path) for progress updates
+            
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
         from imutils import paths
         
         image_paths = list(paths.list_images(self.dataset_path))
@@ -874,13 +1153,14 @@ class FaceRecognitionSystem:
             if progress_callback:
                 progress_callback(i + 1, len(image_paths), image_path)
             
+            # Extract person name from folder structure
             name = image_path.split(os.path.sep)[-2]
             
             image = cv2.imread(image_path)
             if image is None:
                 continue
             
-            # InsightFace expects BGR images
+            # Get face embeddings using InsightFace
             faces = self.face_app.get(image)
             
             for face in faces:
@@ -891,25 +1171,36 @@ class FaceRecognitionSystem:
         if not known_encodings:
             return False, "No faces detected in any images"
         
-        # Create backup before saving new encodings
+        # Backup existing encodings before overwriting
         if Config.BACKUP_ENABLED:
             BackupManager.create_backup(self.encodings_path, Config.MAX_BACKUPS)
         
-        # Convert to numpy arrays for efficient storage and comparison
+        # Save encodings to disk
         data = {"encodings": [enc.tolist() for enc in known_encodings], "names": known_names}
         with open(self.encodings_path, "wb") as f:
             f.write(pickle.dumps(data))
         
+        # Update in-memory encodings
         self.known_encodings = [np.array(enc) for enc in known_encodings]
         self.known_names = known_names
-        
-        # Pre-normalize for fast comparison
         self._update_normalized_encodings()
         
         return True, f"Training complete! {len(known_encodings)} encodings from {len(set(known_names))} persons"
     
     def train_single_person(self, person_name, progress_callback=None):
-        """Train only a single person's images and add to existing model (incremental training)"""
+        """
+        Incrementally train a single person without retraining everyone.
+        
+        Removes any existing encodings for this person first, then adds
+        new encodings from their current images.
+        
+        Args:
+            person_name: Name of person to train
+            progress_callback: Optional progress update function
+            
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
         from imutils import paths
         
         person_folder = os.path.join(self.dataset_path, person_name)
@@ -931,7 +1222,6 @@ class FaceRecognitionSystem:
             if image is None:
                 continue
             
-            # InsightFace expects BGR images
             faces = self.face_app.get(image)
             
             for face in faces:
@@ -942,7 +1232,7 @@ class FaceRecognitionSystem:
         if not new_encodings:
             return False, f"No faces detected in images for {person_name}"
         
-        # Remove any existing encodings for this person (in case of re-training)
+        # Remove existing encodings for this person (allows re-training)
         indices_to_keep = [i for i, name in enumerate(self.known_names) if name != person_name]
         self.known_encodings = [self.known_encodings[i] for i in indices_to_keep]
         self.known_names = [self.known_names[i] for i in indices_to_keep]
@@ -955,70 +1245,77 @@ class FaceRecognitionSystem:
         if Config.BACKUP_ENABLED:
             BackupManager.create_backup(self.encodings_path, Config.MAX_BACKUPS)
         
-        # Save updated model (convert numpy arrays to lists for serialization)
+        # Persist updated encodings to disk
         data = {"encodings": [enc.tolist() if hasattr(enc, 'tolist') else enc for enc in self.known_encodings], "names": self.known_names}
         with open(self.encodings_path, "wb") as f:
             f.write(pickle.dumps(data))
         
-        # Pre-normalize for fast comparison
+        # Refresh normalized matrix for similarity calculations
         self._update_normalized_encodings()
         
-        # Clear cache since we have new encodings
+        # Clear cache since encodings changed
         self.face_cache.clear()
         
         return True, f"Added {len(new_encodings)} encodings for {person_name}"
     
     def remove_person_from_model(self, person_name):
-        """Remove a person's encodings from the trained model"""
+        """
+        Remove all encodings for a person from the trained model.
+        
+        Args:
+            person_name: Name of person to remove
+            
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
         if not self.known_names:
             return False, "No trained model exists"
         
-        # Check if person exists in model
         if person_name not in self.known_names:
             return True, f"{person_name} not found in model (already removed or never trained)"
         
-        # Count encodings to remove
         count_before = len(self.known_encodings)
         
-        # Remove all encodings for this person
+        # Filter out encodings for this person
         indices_to_keep = [i for i, name in enumerate(self.known_names) if name != person_name]
         self.known_encodings = [self.known_encodings[i] for i in indices_to_keep]
         self.known_names = [self.known_names[i] for i in indices_to_keep]
         
         count_removed = count_before - len(self.known_encodings)
         
-        # Create backup before modifying
+        # Backup before modifying disk file
         if Config.BACKUP_ENABLED:
             BackupManager.create_backup(self.encodings_path, Config.MAX_BACKUPS)
         
-        # Save updated model
+        # Update or remove the encodings file
         if self.known_encodings:
             data = {"encodings": [enc.tolist() if hasattr(enc, 'tolist') else enc for enc in self.known_encodings], "names": self.known_names}
             with open(self.encodings_path, "wb") as f:
                 f.write(pickle.dumps(data))
-            # Pre-normalize for fast comparison
             self._update_normalized_encodings()
         else:
-            # No encodings left, remove the file
+            # No encodings left, clean up
             if os.path.exists(self.encodings_path):
                 os.remove(self.encodings_path)
             self.known_encodings_normalized = None
         
-        # Clear cache
         self.face_cache.clear()
         
         return True, f"Removed {count_removed} encodings for {person_name}"
     
     def detect_faces_fast(self, frame):
-        """Fast face detection using Haar cascade (no recognition)"""
-        # Fall back to InsightFace if Haar cascade not available
+        """
+        Fast face detection using Haar cascade.
+        Less accurate but faster than InsightFace detection.
+        Falls back to InsightFace if Haar cascade unavailable.
+        """
         if self.face_cascade is None or self.face_cascade.empty():
             return self.detect_faces_robust(frame)
         
+        # Downscale for faster processing
         small_frame = cv2.resize(frame, (0, 0), fx=1/self.cv_scaler, fy=1/self.cv_scaler)
         gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
         
-        # Detect faces with Haar cascade (fast)
         faces = self.face_cascade.detectMultiScale(
             gray,
             scaleFactor=1.1,
@@ -1026,10 +1323,9 @@ class FaceRecognitionSystem:
             minSize=(30, 30)
         )
         
-        # Convert to (top, right, bottom, left) format and scale up
+        # Convert coordinates and scale back to original resolution
         locations = []
         for (x, y, w, h) in faces:
-            # Scale back to original frame size
             top = y * self.cv_scaler
             right = (x + w) * self.cv_scaler
             bottom = (y + h) * self.cv_scaler
@@ -1041,13 +1337,12 @@ class FaceRecognitionSystem:
     def detect_faces_robust(self, frame):
         """
         Robust face detection using InsightFace.
-        Better at detecting faces at various angles - ideal for registration.
-        More reliable than Haar cascade.
+        More accurate and handles various face angles well.
+        Preferred method for face registration.
         """
-        # InsightFace expects BGR images (which is what OpenCV provides)
         faces = self.face_app.get(frame)
         
-        # Convert InsightFace bbox format to (top, right, bottom, left)
+        # Convert InsightFace bbox [left, top, right, bottom] to standard format
         face_locations = []
         for face in faces:
             bbox = face.bbox.astype(int)
@@ -1058,22 +1353,23 @@ class FaceRecognitionSystem:
     
     def detect_faces_combined(self, frame):
         """
-        Combined detection: try fast Haar first, fall back to robust dlib.
-        Best of both worlds for registration mode.
+        Hybrid detection: fast Haar cascade first, then InsightFace fallback.
+        Optimizes for speed while maintaining detection reliability.
         """
-        # Try fast detection first
         faces = self.detect_faces_fast(frame)
         
-        # If no faces found, try robust detection
+        # Fall back to robust detection if fast detection finds nothing
         if not faces:
             faces = self.detect_faces_robust(frame)
         
         return faces
     
+    # ========== BACKGROUND RECOGNITION THREAD METHODS ==========
+    
     def start_recognition_thread(self):
-        """Start the background recognition thread"""
+        """Launch the background recognition processing thread."""
         if self._recognition_thread is not None and self._recognition_thread.is_alive():
-            return  # Already running
+            return
         
         self._stop_recognition.clear()
         self._recognition_thread = threading.Thread(target=self._recognition_loop, daemon=True)
@@ -1081,10 +1377,10 @@ class FaceRecognitionSystem:
         logger.info("Background recognition thread started")
     
     def stop_recognition_thread(self):
-        """Stop the background recognition thread"""
+        """Gracefully shut down the recognition thread."""
         self._stop_recognition.set()
         
-        # Clear the queue to unblock the thread
+        # Drain queue to unblock the worker thread
         try:
             while not self._frame_queue.empty():
                 self._frame_queue.get_nowait()
@@ -1097,15 +1393,16 @@ class FaceRecognitionSystem:
         logger.info("Background recognition thread stopped")
     
     def _recognition_loop(self):
-        """Background thread that processes frames for recognition"""
+        """
+        Main loop for background recognition thread.
+        Continuously pulls frames from queue and processes them.
+        """
         while not self._stop_recognition.is_set():
             try:
-                # Wait for frame with timeout to allow checking stop flag
                 frame = self._frame_queue.get(timeout=0.1)
             except Empty:
                 continue
             
-            # Process the frame
             with self._recognition_lock:
                 self._recognition_running = True
                 try:
@@ -1126,10 +1423,9 @@ class FaceRecognitionSystem:
         
         results = []
         
-        # Use InsightFace for detection and embedding extraction (BGR input - OpenCV default)
+        # Run InsightFace detection and embedding extraction
         faces = self.face_app.get(frame)
         
-        # Process each detected face
         for face_idx, face in enumerate(faces):
             if face.embedding is None:
                 continue
@@ -1139,13 +1435,13 @@ class FaceRecognitionSystem:
             left, top, right, bottom = bbox[0], bbox[1], bbox[2], bbox[3]
             location = (top, right, bottom, left)
             
-            # Check if face is stable (not moving) before running recognition
+            # Check face stability before attempting recognition
             is_stable = self.stability_tracker.update_and_check_stability(face_idx, location)
             
-            # Check cache first using embedding similarity
+            # Try cache lookup by embedding similarity first
             cached = self.face_cache.get_by_embedding(face_encoding)
             if cached:
-                # Update location in cache (face may have moved)
+                # Update cache position since face may have moved
                 self.face_cache.update_location(cached['location'], location)
                 results.append({
                     'name': cached['name'],
@@ -1156,7 +1452,7 @@ class FaceRecognitionSystem:
                 })
                 continue
             
-            # Also check by position as fallback
+            # Fallback: check cache by position
             cached = self.face_cache.get(location, face_encoding)
             if cached:
                 results.append({
@@ -1168,9 +1464,8 @@ class FaceRecognitionSystem:
                 })
                 continue
             
-            # Only perform actual recognition if face is stable
+            # Defer recognition for moving faces
             if not is_stable:
-                # Face is still moving, return placeholder result
                 results.append({
                     'name': 'Scanning...',
                     'confidence': 0.0,
@@ -1180,25 +1475,24 @@ class FaceRecognitionSystem:
                 })
                 continue
             
-            # Vectorized cosine similarity with pre-normalized encodings
+            # Perform actual recognition using vectorized cosine similarity
             name = "Unknown"
             confidence = 0.0
             
-            # Normalize current face encoding
+            # Normalize current embedding
             face_norm = face_encoding / np.linalg.norm(face_encoding)
             
-            # Single matrix multiplication for all comparisons
+            # Compute similarities against all known faces in one operation
             similarities = np.dot(self.known_encodings_normalized, face_norm)
             
             best_match_index = np.argmax(similarities)
             best_similarity = similarities[best_match_index]
             
-            # Use configured threshold
             if best_similarity > Config.RECOGNITION_THRESHOLD:
                 name = self.known_names[best_match_index]
                 confidence = float(best_similarity)
             
-            # Cache this result
+            # Cache result for future frames
             self.face_cache.put(location, name, confidence, face_encoding)
             
             results.append({
@@ -1206,29 +1500,38 @@ class FaceRecognitionSystem:
                 'confidence': confidence,
                 'location': location,
                 'from_cache': False,
-                'is_stable': True  # Only reaches here if stable
+                'is_stable': True
             })
         
         return results
     
     def recognize_faces(self, frame, force_recognition=False):
-        """Non-blocking face recognition using background thread.
-        Submits frame for processing and returns cached/last results immediately."""
+        """
+        Non-blocking face recognition using background thread.
+        
+        Submits frame for processing and immediately returns cached/previous results.
+        This prevents the camera loop from being blocked by slow recognition.
+        
+        Args:
+            frame: OpenCV BGR image
+            force_recognition: Skip frame interval check
+            
+        Returns:
+            Tuple of (frame, list of recognition results)
+        """
         self.frame_count += 1
         
         if not self.known_encodings or self.known_encodings_normalized is None:
             return frame, []
         
-        # Skip frames for performance (unless forced)
+        # Implement frame skipping for performance
         if not force_recognition and self.frame_count % Config.RECOGNITION_INTERVAL_FRAMES != 0:
-            # Return last known results from cache
             with self._last_results_lock:
                 return frame, self._last_results.copy() if self._last_results else []
         
-        # Submit frame for background processing (non-blocking)
-        # Use put_nowait to avoid blocking if queue is full (drop frame instead)
+        # Submit frame to background thread (non-blocking)
         try:
-            # Clear old frames to always process the newest
+            # Discard old frames to ensure we process the most recent
             while not self._frame_queue.empty():
                 try:
                     self._frame_queue.get_nowait()
@@ -1236,35 +1539,37 @@ class FaceRecognitionSystem:
                     break
             self._frame_queue.put_nowait(frame.copy())
         except:
-            pass  # Queue full, skip this frame
+            pass  # Queue full - drop this frame
         
-        # Return last known results immediately (no blocking)
+        # Return immediately with cached results
         with self._last_results_lock:
             return frame, self._last_results.copy() if self._last_results else []
     
     def recognize_faces_sync(self, frame, force_recognition=False):
-        """Synchronous face recognition (blocking) - use for single-frame recognition"""
+        """
+        Synchronous face recognition (blocks until complete).
+        Use for single-frame recognition scenarios.
+        """
         if not self.known_encodings or self.known_encodings_normalized is None:
             return frame, []
         
         return frame, self._process_recognition(frame)
     
     def get_last_results(self):
-        """Get the most recent recognition results"""
+        """Retrieve the most recent recognition results."""
         with self._last_results_lock:
             return self._last_results.copy() if self._last_results else []
     
     def is_recognition_busy(self):
-        """Check if recognition is currently processing"""
+        """Check if recognition thread is currently processing a frame."""
         return self._recognition_running
     
     def clear_cache(self):
-        """Clear the face recognition cache and pending frames"""
+        """Reset face cache, stability tracker, and pending frame queue."""
         self.face_cache.clear()
         self.stability_tracker.clear()
         with self._last_results_lock:
             self._last_results = []
-        # Clear pending frames
         try:
             while not self._frame_queue.empty():
                 self._frame_queue.get_nowait()
@@ -1274,12 +1579,25 @@ class FaceRecognitionSystem:
 
 # ==================== ON-SCREEN KEYBOARD ====================
 class OnScreenKeyboard:
-    """Touch-friendly on-screen keyboard embedded in parent container"""
+    """
+    Touch-friendly virtual keyboard for kiosk text entry.
     
-    _active_keyboard = None  # Track active keyboard to prevent duplicates
+    Designed for touchscreen environments where physical keyboard
+    is not available. Supports shift for uppercase and special characters.
+    """
+    
+    _active_keyboard = None  # Singleton to prevent duplicate keyboards
     
     def __init__(self, container, entry_widget, root_window):
-        # Close any existing keyboard first
+        """
+        Create a virtual keyboard attached to an entry widget.
+        
+        Args:
+            container: Parent frame to embed keyboard into
+            entry_widget: Text entry field to receive keystrokes
+            root_window: Main application window for event binding
+        """
+        # Close any existing keyboard to prevent duplicates
         if OnScreenKeyboard._active_keyboard is not None:
             try:
                 OnScreenKeyboard._active_keyboard.close()
@@ -1291,17 +1609,17 @@ class OnScreenKeyboard:
         self.root_window = root_window
         self.shift_on = False
         self.keyboard_frame = None
-        self.all_buttons = []  # Track all keyboard buttons
+        self.all_buttons = []
         
         self._create_keyboard()
         
-        # Bind events for auto-close
+        # Auto-close on Enter key
         self.entry.bind('<Return>', lambda e: self.close())
         
         OnScreenKeyboard._active_keyboard = self
     
     def _is_keyboard_widget(self, widget):
-        """Check if widget is part of keyboard"""
+        """Check if a widget belongs to this keyboard."""
         if widget == self.keyboard_frame or widget == self.entry:
             return True
         if widget in self.all_buttons:
@@ -1317,15 +1635,14 @@ class OnScreenKeyboard:
         return False
     
     def _create_keyboard(self):
-        """Create the keyboard layout embedded in container"""
-        # Create keyboard frame at bottom of container
+        """Build the keyboard layout and embed it in the container."""
         self.keyboard_frame = tk.Frame(self.container, bg=Config.COLOR_BORDER)
         self.keyboard_frame.pack(side=tk.BOTTOM, fill=tk.X)
         
         main_frame = tk.Frame(self.keyboard_frame, bg=Config.COLOR_BG)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         
-        # Keyboard rows - all keys same size except space bar
+        # Keyboard layout - QWERTY with special keys
         rows = [
             ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
             ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'],
@@ -1339,6 +1656,7 @@ class OnScreenKeyboard:
             row_frame.pack(fill=tk.X, pady=1)
             
             for key in row:
+                # Style special keys differently
                 bg_color = Config.COLOR_CARD
                 fg_color = Config.COLOR_TEXT
                 if key == '✓':
@@ -1348,7 +1666,7 @@ class OnScreenKeyboard:
                     bg_color = Config.COLOR_DENIED
                     fg_color = "#FFFFFF"
                 
-                # Use expand for equal sizing, space bar gets more expand weight
+                # Space bar gets more width
                 expand_weight = 3 if key == ' ' else 1
                 
                 btn = tk.Button(
@@ -1369,34 +1687,36 @@ class OnScreenKeyboard:
                     self.shift_btn = btn
     
     def _on_key_press(self, key):
-        """Handle key press"""
+        """Handle virtual key press event."""
         if key == '✓':
             self.close()
         elif key == '✕':
             self.entry.delete(0, tk.END)
             self.close()
         elif key == '⌫':
+            # Backspace - remove last character
             current = self.entry.get()
             self.entry.delete(0, tk.END)
             self.entry.insert(0, current[:-1])
         elif key == '⇧':
+            # Toggle shift mode
             self.shift_on = not self.shift_on
             self.shift_btn.config(bg=Config.COLOR_SCANNING if self.shift_on else Config.COLOR_CARD,
                                   fg="#FFFFFF" if self.shift_on else Config.COLOR_TEXT)
         elif key == ' ':
             self.entry.insert(tk.END, ' ')
         else:
+            # Regular character - apply shift if active
             char = key.upper() if self.shift_on else key
             self.entry.insert(tk.END, char)
             if self.shift_on:
                 self.shift_on = False
                 self.shift_btn.config(bg=Config.COLOR_CARD, fg=Config.COLOR_TEXT)
         
-        # Keep focus on entry
         self.entry.focus_set()
     
     def close(self):
-        """Close the keyboard"""
+        """Destroy keyboard and clean up resources."""
         try:
             self.entry.unbind('<Return>')
         except:
@@ -1412,21 +1732,36 @@ class OnScreenKeyboard:
 
 
 def show_keyboard(container, entry_widget, root_window=None):
-    """Show the on-screen keyboard embedded in container"""
+    """Convenience function to display the on-screen keyboard."""
     if root_window is None:
         root_window = container
     OnScreenKeyboard(container, entry_widget, root_window)
 
 
-# ==================== KIOSK GUI ====================
+# ==================== MAIN KIOSK APPLICATION ====================
 class DoorEntryKiosk:
-    """Main Kiosk Application"""
+    """
+    Main application class for the door entry kiosk system.
+    
+    Manages the complete kiosk interface including:
+    - Live camera feed with face detection overlay
+    - Face recognition and access control
+    - Admin panel for user management and training
+    - Registration workflow for new users
+    - Access logging and statistics
+    """
     
     def __init__(self, root):
+        """
+        Initialize the kiosk application.
+        
+        Args:
+            root: Tkinter root window
+        """
         self.root = root
         self.root.title(Config.WINDOW_TITLE)
         
-        # Set fullscreen or window size
+        # Configure window mode
         if Config.FULLSCREEN:
             self.root.attributes('-fullscreen', True)
             self.root.bind('<Escape>', lambda e: self.toggle_fullscreen())
@@ -1436,43 +1771,43 @@ class DoorEntryKiosk:
         
         self.root.configure(bg=Config.COLOR_BG)
         
-        # Initialize components
+        # Initialize core system components
         self.camera = CameraManager(use_picamera=USE_PICAMERA, resolution=Config.CAMERA_RESOLUTION)
         self.face_system = FaceRecognitionSystem()
         self.door_controller = DoorController()
         self.access_log = AccessLog()
         
-        # State variables
+        # ========== Application State ==========
         self.is_running = True
         self.is_scanning = True
         self.camera_thread = None
-        self.current_status = "scanning"  # scanning, granted, denied
+        self.current_status = "scanning"  # States: scanning, granted, denied
         self.status_message = ""
-        self.last_access = {}  # Track cooldowns per person
+        self.last_access = {}  # Cooldown tracking per person
         self.admin_mode = False
         
-        # Registration state
+        # ========== Registration State ==========
         self.registration_mode = False
         self.registration_name = ""
         self.captured_count = 0
         self.current_frame = None
         
-        # Auto-capture Face ID style registration
+        # Face ID style auto-capture settings
         self.auto_capture_mode = False
-        self.auto_capture_target = 100  # Target number of photos
+        self.auto_capture_target = 100
         self.auto_capture_interval = 0.2  # Seconds between captures
         self.last_auto_capture = 0
         
-        # Face ID style zone tracking (based on face position, not pose estimation)
+        # Zone-based capture for multi-angle coverage
         self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
         self.current_zone = 'center'
-        self.zone_targets = {'center': 30, 'left': 18, 'right': 18, 'up': 17, 'down': 17}  # = 100 total
+        self.zone_targets = {'center': 30, 'left': 18, 'right': 18, 'up': 17, 'down': 17}
         
-        # Training state - prevents concurrent InsightFace access
+        # ========== Training State ==========
         self.is_training = False
-        self.reg_process_locked = False  # Lock during capture, training, and encoding
+        self.reg_process_locked = False  # Prevents concurrent InsightFace operations
         
-        # Performance tracking
+        # ========== Performance Tracking ==========
         self.fps_counter = 0
         self.fps_start_time = time.time()
         self.current_fps = 0.0
@@ -1480,51 +1815,53 @@ class DoorEntryKiosk:
         self.cache_hits = 0
         self.cache_misses = 0
         
-        # User management state
-        self.person_map = {}  # Maps listbox index to person name
+        # ========== User Management State ==========
+        self.person_map = {}  # Maps listbox indices to person names
         
-        # Memory management - periodic cache cleanup
+        # ========== Memory Management ==========
         self.last_cache_cleanup = time.time()
-        self.cache_cleanup_interval = 60  # seconds
+        self.cache_cleanup_interval = 60  # Cleanup every 60 seconds
         
         # UI state tracking
         self._status_reset_id = None  # For cancelling pending status resets
         self._toast_id = None  # For toast notification timing
-        self._pending_toasts = []  # Queue of toast messages
+        self._pending_toasts = []  # Queue of toast notifications
         
-        # Create GUI
+        # Build the user interface
         self.create_kiosk_interface()
         
-        # Start camera
+        # Initialize camera system
         self.start_camera()
         
-        # Handle window close
+        # Handle window close properly
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
-        # Bind keyboard shortcuts
+        # Keyboard shortcuts
         self.root.bind('<F1>', lambda e: self.show_admin_login())
         self.root.bind('<F11>', lambda e: self.toggle_fullscreen())
     
     def toggle_fullscreen(self):
-        """Toggle fullscreen mode"""
+        """Toggle between fullscreen and windowed mode."""
         is_fullscreen = self.root.attributes('-fullscreen')
         self.root.attributes('-fullscreen', not is_fullscreen)
     
     def create_kiosk_interface(self):
-        """Create the main kiosk interface - commercial Apple-like design"""
-        # Configure root window
+        """
+        Build the main kiosk interface with Apple-inspired design.
+        Creates the camera view, status display, and navigation elements.
+        """
         self.root.configure(bg=Config.COLOR_BG)
         
-        # Main container - edge to edge
+        # Main container frame
         self.main_frame = tk.Frame(self.root, bg=Config.COLOR_BG)
         self.main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # ===== TOP BAR - Minimal status bar =====
+        # ===== TOP STATUS BAR =====
         top_bar = tk.Frame(self.main_frame, bg=Config.COLOR_BG, height=40)
         top_bar.pack(fill=tk.X, padx=15, pady=(10, 0))
         top_bar.pack_propagate(False)
         
-        # Time display - left side, elegant
+        # Current time display
         self.time_label = tk.Label(
             top_bar,
             text="",
@@ -1535,7 +1872,7 @@ class DoorEntryKiosk:
         self.time_label.pack(side=tk.LEFT, pady=8)
         self.update_time()
         
-        # Live indicator - right side
+        # Live camera indicator
         self.fps_indicator = tk.Label(
             top_bar,
             text="● LIVE",
@@ -1545,15 +1882,15 @@ class DoorEntryKiosk:
         )
         self.fps_indicator.pack(side=tk.RIGHT, pady=8)
         
-        # ===== CENTER CONTENT - Camera and Status =====
+        # ===== CENTER CONTENT AREA =====
         center_frame = tk.Frame(self.main_frame, bg=Config.COLOR_BG)
         center_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
         
-        # Camera feed - large, centered, rounded appearance
+        # Camera feed container
         camera_wrapper = tk.Frame(center_frame, bg=Config.COLOR_BG)
         camera_wrapper.pack(expand=True)
         
-        # Video container with card styling
+        # Video display with card styling
         self.video_container = tk.Frame(
             camera_wrapper, 
             bg=Config.COLOR_CARD,
@@ -1563,7 +1900,7 @@ class DoorEntryKiosk:
         self.video_container.pack()
         self.video_container.pack_propagate(False)
         
-        # Fixed video size for consistent UI (scaled for 480px window)
+        # Set fixed video dimensions
         video_width = 440
         video_height = 330
         self.video_container.config(width=video_width, height=video_height)
@@ -1571,12 +1908,11 @@ class DoorEntryKiosk:
         self.video_label = tk.Label(self.video_container, bg="#000000")
         self.video_label.pack(fill=tk.BOTH, expand=True)
         
-        # ===== STATUS OVERLAY - Floating status badge =====
-        # This sits below the camera
+        # ===== STATUS DISPLAY =====
         status_frame = tk.Frame(camera_wrapper, bg=Config.COLOR_BG)
         status_frame.pack(pady=(15, 0))
         
-        # Status card - pill shaped appearance
+        # Status card with pill-style appearance
         self.status_card = tk.Frame(
             status_frame, 
             bg=Config.COLOR_CARD,
@@ -1589,7 +1925,7 @@ class DoorEntryKiosk:
         status_inner.pack(padx=20, pady=12)
         self.status_frame = status_inner
         
-        # Horizontal status layout
+        # Status icon (color-coded)
         self.status_icon_label = tk.Label(
             status_inner,
             text="◉",
@@ -1599,6 +1935,7 @@ class DoorEntryKiosk:
         )
         self.status_icon_label.pack(side=tk.LEFT, padx=(0, 10))
         
+        # Status text container
         status_text_frame = tk.Frame(status_inner, bg=Config.COLOR_CARD)
         status_text_frame.pack(side=tk.LEFT)
         
@@ -1622,15 +1959,14 @@ class DoorEntryKiosk:
         )
         self.status_detail_label.pack(anchor="w")
         
-        # Store text frame reference
         self.status_text_frame = status_text_frame
         
-        # ===== BOTTOM BAR =====
+        # ===== BOTTOM NAVIGATION BAR =====
         bottom_bar = tk.Frame(self.main_frame, bg=Config.COLOR_BG, height=50)
         bottom_bar.pack(fill=tk.X, side=tk.BOTTOM, padx=15, pady=(0, 10))
         bottom_bar.pack_propagate(False)
         
-        # Left side - Settings button (subtle)
+        # Settings button
         self.admin_btn = tk.Button(
             bottom_bar,
             text="⚙",
@@ -1645,7 +1981,7 @@ class DoorEntryKiosk:
         )
         self.admin_btn.pack(side=tk.LEFT, pady=10)
         
-        # Center - Company/Building name
+        # Building/company branding
         self.title_label = tk.Label(
             bottom_bar,
             text="EDUWEL",
@@ -1656,7 +1992,7 @@ class DoorEntryKiosk:
         )
         self.title_label.pack(side=tk.LEFT, expand=True, pady=10)
         
-        # Right side - User count
+        # Registered user count
         self.info_label = tk.Label(
             bottom_bar,
             text=f"{len(self.face_system.get_trained_persons())} Users",
@@ -1666,7 +2002,7 @@ class DoorEntryKiosk:
         )
         self.info_label.pack(side=tk.RIGHT, pady=10)
         
-        # Hidden activity log for this view (shown in admin panel)
+        # Hidden listbox for access log (visible in admin panel only)
         self.log_listbox = tk.Listbox(self.main_frame)
         self.log_listbox.pack_forget()
         
@@ -1674,19 +2010,19 @@ class DoorEntryKiosk:
         self.update_log_display()
     
     def update_time(self):
-        """Update the time display"""
+        """Update the clock display in the top bar."""
         current_time = datetime.now().strftime("%H:%M:%S")
         current_date = datetime.now().strftime("%a, %b %d %Y")
         self.time_label.config(text=f"{current_time}  ·  {current_date}")
         self.root.after(1000, self.update_time)
     
     def update_log_display(self):
-        """Update the access log display"""
+        """Refresh the access log listbox with recent entries."""
         self.log_listbox.delete(0, tk.END)
         entries = self.access_log.get_recent(8)
         
         for entry in entries:
-            # Format time as relative if recent, otherwise absolute
+            # Format timestamps as relative or absolute
             entry_time = datetime.fromisoformat(entry['timestamp'])
             now = datetime.now()
             diff = now - entry_time
@@ -1706,7 +2042,14 @@ class DoorEntryKiosk:
             self.log_listbox.insert(tk.END, f"  {status_icon}  {time_str:>8}   {name}")
     
     def set_status(self, status, name="", confidence=0.0):
-        """Update the status display with Apple-like styling and smooth transitions"""
+        """
+        Update the status display with appropriate styling.
+        
+        Args:
+            status: One of "scanning", "active_scanning", "processing", "granted", "denied"
+            name: Person name for granted status
+            confidence: Recognition confidence for display
+        """
         self.current_status = status
         
         # Cancel any pending status reset
@@ -1714,8 +2057,8 @@ class DoorEntryKiosk:
             self.root.after_cancel(self._status_reset_id)
             self._status_reset_id = None
         
-        # Helper to update all widget backgrounds
         def update_bg(bg_color, icon_fg, text_fg, detail_fg):
+            """Helper to update all widget colors consistently."""
             self.status_card.config(bg=bg_color, highlightbackground=bg_color)
             self.status_frame.config(bg=bg_color)
             self.status_text_frame.config(bg=bg_color)
@@ -1724,14 +2067,12 @@ class DoorEntryKiosk:
             self.status_detail_label.config(bg=bg_color, fg=detail_fg)
         
         if status == "granted":
-            # Truncate long names for display
             display_name = name if len(name) <= 20 else name[:18] + "..."
             self.status_icon_label.config(text="✓")
             self.status_text_label.config(text=f"Welcome, {display_name}")
-            # Show confidence as percentage
             self.status_detail_label.config(text=f"Access granted • {confidence:.0%} match")
             update_bg(Config.COLOR_GRANTED, "#FFFFFF", "#FFFFFF", "#E8F5E9")
-            # Reset to scanning after configured duration
+            # Auto-reset to scanning after display duration
             self._status_reset_id = self.root.after(
                 Config.STATUS_DISPLAY_DURATION, 
                 self._set_status_scanning
@@ -1755,14 +2096,14 @@ class DoorEntryKiosk:
             self.status_card.config(highlightbackground=Config.COLOR_SCANNING)
             
         elif status == "processing":
-            # New status for when recognition is in progress
+            # Face detected but still settling
             self.status_icon_label.config(text="⏳")
             self.status_text_label.config(text="Processing...")
             self.status_detail_label.config(text="Please wait")
             update_bg(Config.COLOR_CARD, Config.COLOR_WARNING, Config.COLOR_TEXT, Config.COLOR_TEXT_SECONDARY)
             self.status_card.config(highlightbackground=Config.COLOR_WARNING)
             
-        else:  # scanning (ready state)
+        else:  # Default scanning state
             self.status_icon_label.config(text="◉")
             self.status_text_label.config(text="Ready to Scan")
             self.status_detail_label.config(text="Look at the camera")
@@ -1770,23 +2111,24 @@ class DoorEntryKiosk:
             self.status_card.config(highlightbackground=Config.COLOR_BORDER)
     
     def _set_status_active_scanning(self):
-        """Helper to set status to active_scanning (avoids lambda creation)"""
+        """Helper method to set active scanning status."""
         self.set_status("active_scanning")
     
     def _set_status_scanning(self):
-        """Helper to set status to scanning (avoids lambda creation)"""
+        """Helper method to reset to idle scanning status."""
         self.set_status("scanning")
     
     def start_camera(self):
-        """Start the camera in a background thread"""
-        # Start the background recognition thread
+        """Initialize camera and start the main processing loop."""
         self.face_system.start_recognition_thread()
-        
         self.camera_thread = threading.Thread(target=self.camera_loop, daemon=True)
         self.camera_thread.start()
     
     def camera_loop(self):
-        """Main camera loop running in a separate thread"""
+        """
+        Main camera processing loop running in background thread.
+        Handles frame capture, face recognition, and access decisions.
+        """
         try:
             self.camera.start()
             frame_time = time.time()
@@ -1794,7 +2136,7 @@ class DoorEntryKiosk:
             while self.is_running:
                 loop_start = time.time()
                 
-                # Get the newest frame from the camera
+                # Grab latest frame from camera
                 frame = self.camera.capture_frame()
                 if frame is None:
                     continue
@@ -1802,52 +2144,48 @@ class DoorEntryKiosk:
                 display_frame = frame.copy()
                 
                 if self.is_scanning and not self.registration_mode and not self.admin_mode:
-                    # Skip recognition if training is in progress (prevents segfault)
+                    # Skip recognition during training to avoid conflicts
                     if self.is_training:
                         cv2.putText(display_frame, "Training in progress...", (50, 50),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
                     else:
-                        # Perform optimized face recognition
+                        # Run face recognition
                         _, results = self.face_system.recognize_faces(frame)
-                        
-                        # Track faces detected
                         self.faces_detected = len(results)
                         
-                        # Check if any face is still settling
+                        # Check face stability status
                         any_unstable = any(not r.get('is_stable', True) for r in results)
                         any_stable = any(r.get('is_stable', True) for r in results)
                         
-                        # Update status based on face detection and stability
+                        # Update UI status based on face detection
                         if len(results) > 0 and self.current_status not in ("granted", "denied"):
                             if any_unstable and not any_stable:
-                                # Face detected but still moving - show processing
                                 self.root.after(0, lambda: self.set_status("processing"))
                             else:
                                 self.root.after(0, self._set_status_active_scanning)
                         elif len(results) == 0 and self.current_status in ("active_scanning", "processing"):
                             self.root.after(0, self._set_status_scanning)
                         
+                        # Process each recognized face
                         for result in results:
                             name = result['name']
                             confidence = result['confidence']
                             from_cache = result.get('from_cache', False)
                             is_stable = result.get('is_stable', True)
                             
-                            # Skip recognition actions for unstable faces
+                            # Skip unstable faces
                             if not is_stable or name == 'Scanning...':
                                 continue
                             
-                            # Determine access
+                            # Handle recognized faces
                             if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
-                                # Check cooldown
                                 now = time.time()
+                                # Apply cooldown to prevent duplicate logs
                                 if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
                                     self.last_access[name] = now
-                                    
-                                    # Grant access
                                     self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
                             else:
-                                # Check if we should log denied access (only for non-cached results)
+                                # Log unknown faces (with cooldown)
                                 if name == "Unknown" and self.current_status in ("scanning", "active_scanning") and not from_cache:
                                     now = time.time()
                                     if "Unknown" not in self.last_access or (now - self.last_access["Unknown"]) > Config.COOLDOWN_SECONDS:
@@ -1855,11 +2193,11 @@ class DoorEntryKiosk:
                                         self.root.after(0, self.deny_access)
                 
                 elif self.registration_mode:
-                    # Registration mode - use robust detection only when actively capturing
+                    # Registration mode with zone-based capture
                     frame_height, frame_width = display_frame.shape[:2]
                     
                     if self.auto_capture_mode:
-                        # Active capture mode - show Face ID overlay
+                        # Active face capture with positioning overlay
                         faces = self.face_system.detect_faces_combined(frame)
                         frame_center_x = frame_width // 2
                         frame_center_y = frame_height // 2
@@ -1867,7 +2205,7 @@ class DoorEntryKiosk:
                         if len(faces) == 1:
                             top, right, bottom, left = faces[0]
                             
-                            # Calculate face center
+                            # Calculate face position
                             face_center_x = (left + right) / 2
                             face_center_y = (top + bottom) / 2
                             
@@ -1988,13 +2326,16 @@ class DoorEntryKiosk:
                 pass
     
     def display_frame(self, frame):
-        """Display a frame on the video label (and admin preview if in admin mode)"""
+        """
+        Display a frame on the video label.
+        Also updates admin preview if admin panel is open.
+        """
         if USE_PICAMERA:
             frame_rgb = frame
         else:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Fixed 440x330 display size for both views (scaled for 480px window)
+        # Ensure consistent display size
         frame_h, frame_w = frame_rgb.shape[:2]
         if frame_w != 440 or frame_h != 330:
             frame_rgb = cv2.resize(frame_rgb, (440, 330))
@@ -2002,25 +2343,32 @@ class DoorEntryKiosk:
         img = Image.fromarray(frame_rgb)
         imgtk = ImageTk.PhotoImage(image=img)
         
-        # Display on admin video label if admin panel is open
+        # Update admin preview if visible
         if self.admin_mode and hasattr(self, 'admin_video_label'):
             try:
                 if self.admin_video_label.winfo_exists():
                     self.admin_video_label.imgtk = imgtk
                     self.admin_video_label.configure(image=imgtk)
             except tk.TclError:
-                pass  # Widget was destroyed
+                pass
         else:
-            # Update main video label
+            # Update main kiosk display
             self.video_label.imgtk = imgtk
             self.video_label.configure(image=imgtk)
     
     def show_toast(self, message, toast_type="info", duration=None):
-        """Show a temporary toast notification at the bottom of the screen"""
+        """
+        Display a temporary notification toast at the bottom of screen.
+        
+        Args:
+            message: Text to display
+            toast_type: One of "success", "error", "warning", "info"
+            duration: Display time in milliseconds (uses config default if None)
+        """
         if duration is None:
             duration = Config.TOAST_DURATION
         
-        # Determine colors based on type
+        # Color schemes for each toast type
         colors = {
             "success": (Config.COLOR_GRANTED, "#FFFFFF"),
             "error": (Config.COLOR_DENIED, "#FFFFFF"),
@@ -2029,7 +2377,7 @@ class DoorEntryKiosk:
         }
         bg_color, fg_color = colors.get(toast_type, colors["info"])
         
-        # Create toast label if it doesn't exist
+        # Create or update toast label
         if not hasattr(self, 'toast_label') or not self.toast_label.winfo_exists():
             self.toast_label = tk.Label(
                 self.main_frame,
@@ -2041,58 +2389,55 @@ class DoorEntryKiosk:
                 pady=8
             )
         
-        # Update toast content
         self.toast_label.config(text=message, bg=bg_color, fg=fg_color)
         
-        # Position at bottom center
+        # Position centered near bottom
         self.toast_label.place(relx=0.5, rely=0.92, anchor="center")
-        self.toast_label.lift()  # Bring to front
+        self.toast_label.lift()
         
-        # Cancel any existing toast timer
+        # Cancel existing timer
         if self._toast_id:
             self.root.after_cancel(self._toast_id)
         
-        # Schedule hide
+        # Auto-hide after duration
         self._toast_id = self.root.after(duration, self._hide_toast)
     
     def _hide_toast(self):
-        """Hide the toast notification"""
+        """Remove toast from display."""
         if hasattr(self, 'toast_label') and self.toast_label.winfo_exists():
             self.toast_label.place_forget()
         self._toast_id = None
     
     def grant_access(self, name, confidence):
-        """Handle access granted with visual and audio feedback"""
+        """
+        Handle successful face recognition - grant access.
+        Unlocks door, logs access, and shows success feedback.
+        """
         self.set_status("granted", name, confidence)
         self.access_log.add_entry(name, True, confidence)
         self.door_controller.unlock()
         self.update_log_display()
-        
-        # Visual pulse effect on video container
         self._pulse_border(Config.COLOR_GRANTED)
-        
         logger.info(f"Access granted: {name} ({confidence:.1%})")
     
     def deny_access(self):
-        """Handle access denied with visual feedback"""
+        """
+        Handle failed recognition - deny access.
+        Logs attempt and shows denial feedback.
+        """
         self.set_status("denied")
         self.access_log.add_entry("Unknown", False, 0.0)
         self.update_log_display()
-        
-        # Visual pulse effect
         self._pulse_border(Config.COLOR_DENIED)
-        
         logger.info("Access denied: Unknown person")
     
     def _pulse_border(self, color, duration=300):
-        """Create a pulse effect on the video container border"""
+        """Create a brief color pulse on the video container border."""
         original_color = self.video_container.cget('highlightbackground')
         original_thickness = self.video_container.cget('highlightthickness')
         
-        # Set highlight
         self.video_container.config(highlightbackground=color, highlightthickness=3)
         
-        # Reset after duration
         self.root.after(
             duration, 
             lambda: self.video_container.config(
@@ -2102,8 +2447,10 @@ class DoorEntryKiosk:
         )
     
     def _cleanup_old_access_entries(self, current_time):
-        """Remove old entries from last_access dict to prevent memory leak"""
-        # Keep entries for 10x the cooldown period, then remove
+        """
+        Remove stale entries from cooldown tracking dict.
+        Prevents unbounded memory growth over long uptime.
+        """
         max_age = Config.COOLDOWN_SECONDS * 10
         keys_to_remove = [
             name for name, timestamp in self.last_access.items()
@@ -2113,8 +2460,7 @@ class DoorEntryKiosk:
             del self.last_access[key]
     
     def show_admin_login(self):
-        """Show admin login dialog with custom dialog for fullscreen compatibility"""
-        # Create custom dialog (simpledialog has issues with fullscreen on macOS)
+        """Display the admin login dialog for authentication."""
         login_dialog = tk.Toplevel(self.root)
         login_dialog.title("Admin Login")
         login_dialog.geometry("350x280")
@@ -2221,39 +2567,37 @@ class DoorEntryKiosk:
             messagebox.showerror("Error", "Invalid password")
     
     def _show_password_keyboard(self, dialog, content, entry):
-        """Show keyboard in password dialog with expanded size"""
-        # Expand dialog to fit keyboard
+        """Display on-screen keyboard for password entry."""
         dialog.geometry("480x450")
         dialog.update_idletasks()
         x = (dialog.winfo_screenwidth() - 480) // 2
         y = (dialog.winfo_screenheight() - 450) // 2
         dialog.geometry(f"480x450+{x}+{y}")
-        
-        # Show keyboard
         show_keyboard(content, entry, dialog)
     
     def show_admin_panel(self):
-        """Show the admin control panel - replaces kiosk UI in same window"""
+        """
+        Display the admin control panel.
+        Replaces the main kiosk interface with admin tabs.
+        """
         self.admin_mode = True
         self.is_scanning = False
-        
-        # Clear the face cache when entering admin mode
         self.face_system.clear_cache()
         
-        # Hide the main kiosk UI
+        # Hide kiosk interface
         self.main_frame.pack_forget()
         
-        # Force window size to stay consistent
+        # Maintain window size
         if Config.FULLSCREEN:
             self.root.attributes('-fullscreen', True)
         else:
             self.root.geometry("480x800")
         
-        # Create admin frame in the same window
+        # Create admin interface
         self.admin_frame = tk.Frame(self.root, bg=Config.COLOR_BG)
         self.admin_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Title header
+        # Header with title and close button
         header = tk.Frame(self.admin_frame, bg=Config.COLOR_BG)
         header.pack(fill=tk.X, padx=15, pady=(15, 8))
         
@@ -2265,7 +2609,6 @@ class DoorEntryKiosk:
             bg=Config.COLOR_BG
         ).pack(side=tk.LEFT)
         
-        # Done button in header
         close_btn = tk.Button(
             header,
             text="Done",
@@ -2280,7 +2623,7 @@ class DoorEntryKiosk:
         )
         close_btn.pack(side=tk.RIGHT)
         
-        # Configure notebook style for Apple look
+        # Configure notebook styling
         style = ttk.Style()
         style.configure('TNotebook', background=Config.COLOR_BG, borderwidth=0)
         style.configure('TNotebook.Tab', 
@@ -2294,54 +2637,51 @@ class DoorEntryKiosk:
         
         notebook = ttk.Notebook(self.admin_frame)
         notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        self.admin_notebook = notebook  # Store reference for tab locking
+        self.admin_notebook = notebook
         
-        # Bind tab change to check if allowed
+        # Lock tab switching during operations
         notebook.bind('<<NotebookTabChanged>>', self.on_tab_changed)
         
-        # Tab 1: Register New Face
+        # Create admin tabs
         register_tab = tk.Frame(notebook, bg=Config.COLOR_BG)
         notebook.add(register_tab, text="  Register  ")
         self.create_register_tab(register_tab)
         
-        # Tab 2: Train Model
         train_tab = tk.Frame(notebook, bg=Config.COLOR_BG)
         notebook.add(train_tab, text="  Train  ")
         self.create_train_tab(train_tab)
         
-        # Tab 3: Manage Users
         manage_tab = tk.Frame(notebook, bg=Config.COLOR_BG)
         notebook.add(manage_tab, text="  Users  ")
         self.create_manage_tab(manage_tab)
         
-        # Tab 4: Access Log
         log_tab = tk.Frame(notebook, bg=Config.COLOR_BG)
         notebook.add(log_tab, text="  Activity  ")
         self.create_log_tab(log_tab)
         
-        # Tab 5: Settings
         settings_tab = tk.Frame(notebook, bg=Config.COLOR_BG)
         notebook.add(settings_tab, text="  System  ")
         self.create_settings_tab(settings_tab)
     
     def create_register_tab(self, parent):
-        """Create registration tab in admin panel with camera preview"""
-        # Main container - vertical layout
+        """
+        Build the face registration tab with camera preview.
+        Supports Face ID style zone-based capture.
+        """
         self.reg_main_container = tk.Frame(parent, bg=Config.COLOR_BG)
         self.reg_main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
-        # Camera preview container with FIXED size to prevent expansion
+        # Camera preview with fixed dimensions
         camera_container = tk.Frame(self.reg_main_container, bg=Config.COLOR_CARD, 
                                    highlightbackground=Config.COLOR_BORDER, highlightthickness=1,
                                    width=440, height=330)
         camera_container.pack(pady=(0, 5))
-        camera_container.pack_propagate(False)  # Prevent size changes
+        camera_container.pack_propagate(False)
         
-        # Camera preview label
         self.admin_video_label = tk.Label(camera_container, bg="#000000")
         self.admin_video_label.pack(fill=tk.BOTH, expand=True)
         
-        # === SETUP PANEL (shown before starting) ===
+        # ===== SETUP PANEL (pre-registration) =====
         self.reg_setup_panel = tk.Frame(self.reg_main_container, bg=Config.COLOR_CARD,
                                         highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
         self.reg_setup_panel.pack(fill=tk.X, pady=3)
@@ -2349,7 +2689,7 @@ class DoorEntryKiosk:
         setup_inner = tk.Frame(self.reg_setup_panel, bg=Config.COLOR_CARD)
         setup_inner.pack(fill=tk.X, padx=10, pady=8)
         
-        # Name entry row
+        # Name input row
         name_row = tk.Frame(setup_inner, bg=Config.COLOR_CARD)
         name_row.pack(fill=tk.X)
         
@@ -2388,15 +2728,14 @@ class DoorEntryKiosk:
         )
         self.start_reg_btn.pack(side=tk.RIGHT, ipady=3, ipadx=10)
         
-        # === CAPTURE PANEL (shown during registration) ===
+        # ===== CAPTURE PANEL (active during registration) =====
         self.reg_capture_panel = tk.Frame(self.reg_main_container, bg=Config.COLOR_CARD,
                                           highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
-        # Don't pack yet - will be shown when registration starts
         
         capture_inner = tk.Frame(self.reg_capture_panel, bg=Config.COLOR_CARD)
         capture_inner.pack(fill=tk.X, padx=10, pady=8)
         
-        # Top row: status and stop button
+        # Status display row
         top_row = tk.Frame(capture_inner, bg=Config.COLOR_CARD)
         top_row.pack(fill=tk.X, pady=(0, 5))
         
@@ -2479,14 +2818,22 @@ class DoorEntryKiosk:
         self.auto_train_check.pack(side=tk.RIGHT)
     
     def create_train_tab(self, parent):
-        """Create training tab in admin panel with Apple styling"""
-        # Card container
+        """Build the model training tab with progress indicator.
+        
+        Args:
+            parent: Parent frame for the tab content.
+        
+        Creates a card with dataset statistics, a progress bar for
+        training feedback, and a button to trigger full model training.
+        """
+        # Training card container
         card = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
         card.pack(fill=tk.X, padx=10, pady=10)
         
         inner = tk.Frame(card, bg=Config.COLOR_CARD)
         inner.pack(fill=tk.X, padx=15, pady=15)
         
+        # Section header
         tk.Label(
             inner,
             text="Train Model",
@@ -2503,7 +2850,7 @@ class DoorEntryKiosk:
             bg=Config.COLOR_CARD
         ).pack(anchor=tk.W, pady=(3, 15))
         
-        # Dataset info
+        # Dataset statistics display
         persons = self.face_system.get_registered_persons()
         total_images = sum(count for _, count in persons)
         
@@ -2520,7 +2867,7 @@ class DoorEntryKiosk:
         )
         self.dataset_info_label.pack()
         
-        # Progress bar
+        # Progress bar with custom styling
         style = ttk.Style()
         style.configure("Custom.Horizontal.TProgressbar",
                        background=Config.COLOR_SCANNING,
@@ -2534,6 +2881,7 @@ class DoorEntryKiosk:
         )
         self.train_progress.pack(fill=tk.X, pady=(0, 5))
         
+        # Training status label
         self.train_status_label = tk.Label(
             inner,
             text="Ready to train",
@@ -2543,7 +2891,7 @@ class DoorEntryKiosk:
         )
         self.train_status_label.pack(pady=(0, 10))
         
-        # Train button
+        # Train button - triggers full dataset encoding
         self.train_btn = tk.Button(
             inner,
             text="Start Training",
@@ -2559,8 +2907,15 @@ class DoorEntryKiosk:
         self.train_btn.pack(fill=tk.X, ipady=6)
     
     def create_manage_tab(self, parent):
-        """Create user management tab in admin panel with Apple styling"""
-        # Header
+        """Build the user management tab with list and delete functionality.
+        
+        Args:
+            parent: Parent frame for the tab content.
+        
+        Displays a list of registered users with their photo counts
+        and provides a delete button for removing users.
+        """
+        # Header with title and refresh button
         header = tk.Frame(parent, bg=Config.COLOR_BG)
         header.pack(fill=tk.X, padx=10, pady=(10, 5))
         
@@ -2584,7 +2939,7 @@ class DoorEntryKiosk:
             command=self.refresh_manage_list
         ).pack(side=tk.RIGHT)
         
-        # List card
+        # User list container
         card = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
         card.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
@@ -2602,10 +2957,9 @@ class DoorEntryKiosk:
         )
         self.manage_listbox.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         
-        # Populate list
         self.refresh_manage_list()
         
-        # Delete button
+        # Action buttons
         btn_frame = tk.Frame(parent, bg=Config.COLOR_BG)
         btn_frame.pack(fill=tk.X, padx=10, pady=8)
         
@@ -2622,8 +2976,8 @@ class DoorEntryKiosk:
         ).pack(side=tk.RIGHT)
     
     def create_log_tab(self, parent):
-        """Create access log tab in admin panel with Apple styling"""
-        # Header
+        """Build the access log tab with filtering capabilities."""
+        # Header with title and clear button
         header = tk.Frame(parent, bg=Config.COLOR_BG)
         header.pack(fill=tk.X, padx=10, pady=(10, 5))
         
@@ -2647,7 +3001,7 @@ class DoorEntryKiosk:
             command=self.clear_access_log
         ).pack(side=tk.RIGHT)
         
-        # Quick filter buttons
+        # Quick date filter buttons
         filter_frame = tk.Frame(parent, bg=Config.COLOR_BG)
         filter_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
         
@@ -2699,7 +3053,7 @@ class DoorEntryKiosk:
             command=self.clear_log_filter
         ).pack(side=tk.LEFT, padx=2)
         
-        # Log card
+        # Log entries list
         card = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
         card.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
@@ -2717,16 +3071,16 @@ class DoorEntryKiosk:
         )
         self.admin_log_listbox.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         
-        # Initialize filter variables (needed by filter methods)
+        # Filter state
         self.log_date_from = None
         self.log_date_to = None
         self.log_name_var = tk.StringVar(value="All")
         
-        # Populate with all entries initially
+        # Load initial entries
         self.populate_log_listbox(self.access_log.get_recent(100))
     
     def set_log_date_range(self, days_back):
-        """Set date range for quick filters"""
+        """Apply a quick date filter to the access log display."""
         from datetime import timedelta, date
         today = datetime.now().date()
         
@@ -2735,17 +3089,16 @@ class DoorEntryKiosk:
         else:
             date_from = today - timedelta(days=days_back)
         
-        # Get filtered entries
         entries = self.access_log.get_filtered(date_from, today, None, count=100)
         self.populate_log_listbox(entries)
     
     def clear_log_filter(self):
-        """Clear all filters and show all entries"""
+        """Remove all filters and show all log entries."""
         self.log_name_var.set("All")
         self.populate_log_listbox(self.access_log.get_recent(100))
     
     def populate_log_listbox(self, entries):
-        """Populate the log listbox with entries including confidence scores"""
+        """Fill the log listbox with formatted access entries."""
         self.admin_log_listbox.delete(0, tk.END)
         
         if not entries:
@@ -2764,7 +3117,7 @@ class DoorEntryKiosk:
             )
     
     def create_settings_tab(self, parent):
-        """Create settings tab in admin panel with Apple styling"""
+        """Build the system settings tab with configuration options."""
         # Recognition Settings Card
         card1 = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
         card1.pack(fill=tk.X, padx=10, pady=(10, 5))
@@ -2780,6 +3133,7 @@ class DoorEntryKiosk:
             bg=Config.COLOR_CARD
         ).pack(anchor=tk.W)
         
+        # Display current recognition settings as read-only info
         settings_items = [
             ("Confidence", f"{int(Config.RECOGNITION_THRESHOLD * 100)}%"),
             ("Cooldown", f"{Config.COOLDOWN_SECONDS}s"),
@@ -2804,7 +3158,7 @@ class DoorEntryKiosk:
                 bg=Config.COLOR_CARD
             ).pack(side=tk.RIGHT)
         
-        # System Info Card
+        # System Information Card
         card2 = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
         card2.pack(fill=tk.X, padx=10, pady=5)
         
@@ -2819,6 +3173,7 @@ class DoorEntryKiosk:
             bg=Config.COLOR_CARD
         ).pack(anchor=tk.W)
         
+        # Detect hardware configuration
         camera_type = "Pi Camera" if USE_PICAMERA else "USB Webcam"
         gpio_status = "Hardware" if USE_GPIO else "Simulated"
         
@@ -2846,7 +3201,7 @@ class DoorEntryKiosk:
                 bg=Config.COLOR_CARD
             ).pack(side=tk.RIGHT)
         
-        # Exit button
+        # Exit kiosk mode button (requires admin authentication to reach this tab)
         exit_frame = tk.Frame(parent, bg=Config.COLOR_BG)
         exit_frame.pack(fill=tk.X, padx=10, pady=15)
         
@@ -2862,32 +3217,45 @@ class DoorEntryKiosk:
             command=self.exit_kiosk
         ).pack()
     
+    # ==================== USER MANAGEMENT METHODS ====================
+    
     def refresh_manage_list(self):
-        """Refresh the manage users list"""
+        """Refresh the registered users list in the manage tab.
+        
+        Clears and repopulates the listbox with current registered persons,
+        maintaining an index-to-name mapping for deletion operations.
+        """
         self.manage_listbox.delete(0, tk.END)
-        self.person_map = {}  # Reset the mapping
+        self.person_map = {}
         
         persons = self.face_system.get_registered_persons()
         for idx, (name, count) in enumerate(persons):
-            self.person_map[idx] = name  # Store index-to-name mapping
+            self.person_map[idx] = name
             self.manage_listbox.insert(tk.END, f"  {name}   •   {count} photos")
     
     def refresh_train_tab(self):
-        """Refresh the train tab dataset info"""
+        """Update the training tab's dataset statistics display."""
         if hasattr(self, 'dataset_info_label'):
             persons = self.face_system.get_registered_persons()
             total_images = sum(count for _, count in persons)
             self.dataset_info_label.config(text=f"{len(persons)} people  •  {total_images} photos")
     
+    # ==================== REGISTRATION WORKFLOW ====================
+    
     def start_registration(self):
-        """Start face registration mode"""
+        """Begin the face registration workflow for a new person.
+        
+        Validates the entered name, checks for duplicates (with user
+        confirmation for adding more photos), and transitions the UI
+        from setup mode to capture mode.
+        """
         name = self.reg_name_entry.get().strip()
         if not name:
             self.show_toast("Please enter a name", "warning")
             self.reg_name_entry.focus_set()
             return
         
-        # Check for duplicate names
+        # Check for duplicate names with case-insensitive comparison
         existing_persons = [p[0].lower() for p in self.face_system.get_registered_persons()]
         if name.lower() in existing_persons:
             if not messagebox.askyesno(
@@ -2896,26 +3264,31 @@ class DoorEntryKiosk:
             ):
                 return
         
+        # Initialize registration state
         self.registration_mode = True
         self.registration_name = name
         self.captured_count = 0
         self.auto_capture_mode = False
         self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
         
-        # Swap panels - hide setup, show capture with animation feel
+        # Transition UI from setup panel to capture panel
         self.reg_setup_panel.pack_forget()
         self.reg_capture_panel.pack(fill=tk.X, pady=5)
         
-        # Update capture panel with name
+        # Update capture panel labels
         self.reg_name_display.config(text=name)
         self.reg_count_label.config(text="0 photos • Position face in frame")
         
         self.show_toast(f"Registering {name}", "info")
     
     def capture_photo(self):
-        """Capture a photo for registration with visual feedback"""
+        """Capture a single photo for registration with face detection validation.
+        
+        Verifies a face is present in the current frame before saving.
+        Provides visual feedback via border pulse on successful capture.
+        """
         if self.current_frame is not None and self.registration_mode:
-            # Check if there's a face in frame before saving
+            # Validate face presence before saving
             faces = self.face_system.detect_faces_fast(self.current_frame)
             if not faces:
                 self.show_toast("No face detected - position face in frame", "warning")
@@ -2925,76 +3298,93 @@ class DoorEntryKiosk:
             self.captured_count += 1
             self.reg_count_label.config(text=f"{self.captured_count} photos")
             
-            # Visual flash feedback on capture
+            # Visual feedback: green border pulse
             self._pulse_border(Config.COLOR_GRANTED, 150)
             
             logger.debug(f"Registration image saved: {filepath}")
     
     def stop_registration(self):
-        """Stop face registration mode and optionally auto-train"""
-        # Prevent stopping during capture or training
+        """End the registration session and optionally trigger auto-training.
+        
+        Prevents stopping during active capture/training operations.
+        Resets all registration state and transitions UI back to setup mode.
+        Triggers single-person training if auto-train option is enabled.
+        """
+        # Prevent interruption during capture or encoding
         if self.reg_process_locked:
             messagebox.showwarning("Please Wait", "Capture or encoding in progress. Please wait for completion.")
             return
         
+        # Save registration info before resetting
         person_name = self.registration_name
         captured = self.captured_count
         
+        # Reset all registration state
         self.registration_mode = False
         self.registration_name = ""
         self.auto_capture_mode = False
         self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
         
-        # Swap panels - hide capture, show setup
+        # Transition UI back to setup panel
         self.reg_capture_panel.pack_forget()
         self.reg_setup_panel.pack(fill=tk.X, pady=5)
         
-        # Reset capture panel buttons for next time
+        # Reset capture button states for next registration
         self.auto_capture_btn.config(text="⟳ Auto (100)", bg="#5856D6", command=self.start_auto_capture)
         self.capture_btn.config(state=tk.NORMAL)
         
-        # Clear name entry
+        # Clear name entry for next use
         self.reg_name_entry.delete(0, tk.END)
         
+        # Refresh lists to show new person
         self.refresh_manage_list()
         self.refresh_train_tab()
         
-        # Show feedback
+        # Show completion feedback
         if captured > 0:
             self.show_toast(f"Captured {captured} photos for {person_name}", "success")
         
-        # Auto-train the new person if option is enabled and photos were captured
-        # Skip if already trained via auto-capture flow
+        # Auto-train if enabled and not already trained via auto-capture flow
         already_trained = getattr(self, 'already_trained', False)
-        self.already_trained = False  # Reset for next registration
+        self.already_trained = False
         if not already_trained and hasattr(self, 'auto_train_var') and self.auto_train_var.get() and captured > 0 and person_name:
             self.train_single_person(person_name)
     
-    # ==================== AUTO-CAPTURE FACE ID STYLE ====================
+    # ==================== AUTO-CAPTURE (FACE ID STYLE) ====================
     
     def start_auto_capture(self):
-        """Start automatic Face ID style capture"""
+        """Begin automatic Face ID style photo capture.
+        
+        Enables zone-based capture mode that guides the user to move
+        their face to different positions (center, left, right, up, down)
+        to capture diverse angles for better recognition accuracy.
+        """
         if not self.registration_mode:
             return
         
+        # Enable auto-capture and lock navigation
         self.auto_capture_mode = True
-        self.reg_process_locked = True  # Lock navigation until everything is done
+        self.reg_process_locked = True
         self.last_auto_capture = time.time()
         self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
         
-        # Update UI
+        # Update button states
         self.capture_btn.config(state=tk.DISABLED)
         self.auto_capture_btn.config(text="⏹ Stop", bg=Config.COLOR_DENIED, command=self.stop_auto_capture)
         self.reg_count_label.config(text="Move face to fill all zones...")
     
     def stop_auto_capture(self):
-        """Stop automatic capture - requires confirmation"""
+        """Stop the automatic capture process with user confirmation.
+        
+        If process is locked (capture in progress), requires confirmation.
+        Photos already captured are kept but training won't auto-start.
+        """
         if self.reg_process_locked:
-            # Ask for confirmation to cancel
             if not messagebox.askyesno("Cancel Capture?", 
                 "Are you sure you want to cancel?\nPhotos already captured will be kept but training won't start."):
                 return
         
+        # Reset auto-capture state
         self.auto_capture_mode = False
         self.reg_process_locked = False
         self.capture_btn.config(state=tk.NORMAL)
@@ -3002,17 +3392,25 @@ class DoorEntryKiosk:
         self.update_registration_ui()
     
     def draw_faceid_overlay(self, frame):
-        """Draw Face ID style visual guide with zone indicators"""
+        """Draw Face ID style visual guide showing zone positions.
+        
+        Args:
+            frame: OpenCV frame to draw the overlay on.
+        
+        Draws a circular face positioning guide with zone indicators
+        around it (up, down, left, right, center) to help users
+        position their face correctly during auto-capture.
+        """
         frame_height, frame_width = frame.shape[:2]
         center_x, center_y = frame_width // 2, frame_height // 2
         
-        # Draw circular Face ID style guide in center
+        # Calculate guide circle radius based on frame size
         guide_radius = min(frame_width, frame_height) // 4
         
-        # Outer circle (face positioning guide)
+        # Draw outer positioning guide circle
         cv2.circle(frame, (center_x, center_y), guide_radius, (100, 100, 100), 2)
         
-        # Zone indicator positions (around the circle)
+        # Zone indicator positions around the guide circle
         zone_positions = {
             'up': (center_x, center_y - guide_radius - 30),
             'down': (center_x, center_y + guide_radius + 30),
@@ -3021,44 +3419,44 @@ class DoorEntryKiosk:
             'center': (center_x, center_y)
         }
         
-        # Draw zone indicators
+        # Draw zone indicators showing capture progress
         for zone, (zx, zy) in zone_positions.items():
             current = self.zone_captures.get(zone, 0)
             target = self.zone_targets.get(zone, 0)
             
-            # Calculate fill percentage
+            # Calculate completion percentage for this zone
             fill_pct = min(1.0, current / target) if target > 0 else 1.0
             
-            # Colors: gray unfilled, yellow partial, green complete
+            # Color coding: gray=empty, yellow=partial, green=complete
             if fill_pct >= 1.0:
-                color = (0, 255, 0)  # Green - complete
+                color = (0, 255, 0)   # Green - zone complete
             elif fill_pct > 0:
-                color = (0, 255, 255)  # Yellow - partial
+                color = (0, 255, 255) # Yellow - in progress
             else:
-                color = (80, 80, 80)  # Gray - empty
+                color = (80, 80, 80)  # Gray - not started
             
-            # Highlight current zone
+            # Highlight the current target zone with larger radius
             radius = 18 if zone == self.current_zone else 12
-            thickness = -1 if fill_pct >= 1.0 else 2
+            thickness = -1 if fill_pct >= 1.0 else 2  # Filled if complete
             
             if zone == 'center':
-                # Center is a ring, not a dot
+                # Center uses a ring instead of filled circle
                 cv2.circle(frame, (zx, zy), radius + 5, color, 2)
             else:
                 cv2.circle(frame, (zx, zy), radius, color, thickness)
-                # Show count
+                # Show count for incomplete zones
                 if fill_pct < 1.0:
                     cv2.putText(frame, str(current), (zx - 8, zy + 5),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         
-        # Header
+        # Mode header text
         mode_text = "FACE ID CAPTURE" if self.auto_capture_mode else "REGISTRATION"
         cv2.putText(frame, mode_text, (15, 35),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 100, 200), 2)
         cv2.putText(frame, self.registration_name, (15, 65),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
-        # Progress bar at bottom
+        # Progress bar at bottom (only during auto-capture)
         if self.auto_capture_mode:
             bar_width = 350
             bar_height = 14
@@ -3067,23 +3465,23 @@ class DoorEntryKiosk:
             
             progress = self.captured_count / self.auto_capture_target
             
-            # Background
+            # Draw progress bar background
             cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (40, 40, 40), -1)
-            # Fill
+            # Draw progress fill
             fill_width = int(bar_width * progress)
             cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), (0, 200, 0), -1)
-            # Border
+            # Draw border
             cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (100, 100, 100), 1)
             
-            # Count text
+            # Progress count text
             count_text = f"{self.captured_count}/{self.auto_capture_target}"
             cv2.putText(frame, count_text, (bar_x + bar_width + 10, bar_y + 12),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
-            # Guidance text
+            # Zone guidance text
             zones_complete = sum(1 for z in self.zone_captures if self.zone_captures[z] >= self.zone_targets.get(z, 0))
             if zones_complete < 5:
-                # Find which zone needs photos
+                # Find the next zone that needs more captures
                 for zone in ['center', 'left', 'right', 'up', 'down']:
                     if self.zone_captures.get(zone, 0) < self.zone_targets.get(zone, 0):
                         guidance = {
@@ -3101,7 +3499,7 @@ class DoorEntryKiosk:
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
     
     def update_registration_ui(self):
-        """Update the registration UI with current progress"""
+        """Update the registration UI labels with current capture progress."""
         if self.auto_capture_mode:
             zones_done = sum(1 for z in self.zone_captures 
                            if self.zone_captures[z] >= self.zone_targets.get(z, 0))
@@ -3112,34 +3510,49 @@ class DoorEntryKiosk:
             self.reg_count_label.config(text=f"{self.captured_count} photos")
     
     def complete_auto_registration(self):
-        """Called when auto-capture reaches target - automatically start training"""
+        """Complete auto-capture and automatically begin training.
+        
+        Called when the capture target is reached. Transitions the UI
+        to training mode and initiates single-person encoding. The
+        process lock remains active until training completes.
+        """
         self.auto_capture_mode = False
-        # reg_process_locked stays True - will be cleared after encoding completes
+        # Keep reg_process_locked True - will be cleared after encoding completes
+        
         zones_done = sum(1 for z in self.zone_captures 
                         if self.zone_captures[z] >= self.zone_targets.get(z, 0))
         
+        # Update UI to show training state
         self.reg_count_label.config(
             text=f"✓ {self.captured_count} photos • Training..."
         )
         
-        # Disable buttons during training
+        # Disable all registration buttons during training
         self.capture_btn.config(state=tk.DISABLED)
         self.auto_capture_btn.config(text="Encoding...", bg="#888888", state=tk.DISABLED)
         self.stop_reg_btn.config(state=tk.DISABLED)
         
-        # Start training with progress (lock already set from start_auto_capture)
+        # Start training in background thread
         self.train_single_person_with_progress(self.registration_name)
     
-    # ==================== END AUTO-CAPTURE ====================
+    # ==================== MODEL TRAINING ====================
     
     def train_single_person_with_progress(self, person_name):
-        """Train a single person with progress updates in the UI"""
+        """Train encodings for a single person with UI progress updates.
+        
+        Args:
+            person_name: Name of the person to encode.
+        
+        Runs encoding in a background thread while updating the UI
+        with progress. The reg_process_locked flag prevents navigation
+        until encoding and saving completes.
+        """
         self.is_training = True
-        self.reg_process_locked = True  # Ensure lock is set
+        self.reg_process_locked = True
         total_images = 0
         
         def update_progress_label(text):
-            """Safely update progress label"""
+            """Thread-safe label update helper."""
             try:
                 if hasattr(self, 'reg_count_label') and self.reg_count_label.winfo_exists():
                     self.reg_count_label.config(text=text)
@@ -3148,30 +3561,37 @@ class DoorEntryKiosk:
         
         def training_thread():
             nonlocal total_images
-            # Count images first
+            # Count images for progress tracking
             from imutils import paths
             person_folder = os.path.join(self.face_system.dataset_path, person_name)
             if os.path.exists(person_folder):
                 total_images = len(list(paths.list_images(person_folder)))
             
             def progress_callback(current, total, filepath):
+                """Update UI with encoding progress."""
                 if current == total:
-                    # Last image - show saving message
                     self.root.after(0, lambda: update_progress_label("Saving encodings..."))
                 else:
                     self.root.after(0, lambda c=current, t=total: update_progress_label(f"Encoding {c}/{t}..."))
             
             success, message = self.face_system.train_single_person(person_name, progress_callback)
-            # Only release lock after training AND saving is complete
+            # Schedule completion on main thread
             self.root.after(0, lambda: self.training_with_progress_complete(success, message))
         
         thread = threading.Thread(target=training_thread, daemon=True)
         thread.start()
     
     def training_with_progress_complete(self, success, message):
-        """Handle training completion from auto-capture flow"""
+        """Handle completion of training from the auto-capture flow.
+        
+        Args:
+            success: Whether training succeeded.
+            message: Status message from the training operation.
+        
+        Releases the process lock and re-enables UI controls.
+        """
         self.is_training = False
-        self.reg_process_locked = False  # NOW we can release the lock - everything is done
+        self.reg_process_locked = False  # Release lock - encoding complete
         
         # Safely update UI if widgets still exist
         try:
@@ -3191,7 +3611,7 @@ class DoorEntryKiosk:
                 self.stop_reg_btn.config(state=tk.NORMAL)
             
             if success:
-                # Set flag to prevent double-training in stop_registration
+                # Prevent double-training when stop_registration is called
                 self.already_trained = True
                 # Auto-close registration after short delay
                 self.root.after(1500, self.stop_registration)
@@ -3199,15 +3619,22 @@ class DoorEntryKiosk:
             pass  # Widgets were destroyed
     
     def train_single_person(self, person_name):
-        """Train only a single person (incremental training)"""
-        # Safely update label if it exists
+        """Train encodings for a single person without progress UI.
+        
+        Args:
+            person_name: Name of the person to encode.
+        
+        Used for manual training triggers (not from auto-capture flow).
+        Runs encoding in a background thread to keep UI responsive.
+        """
+        # Update label if widget exists
         try:
             if hasattr(self, 'reg_count_label') and self.reg_count_label.winfo_exists():
                 self.reg_count_label.config(text=f"Training {person_name}...")
         except tk.TclError:
             pass
         
-        self.is_training = True  # Pause recognition during training
+        self.is_training = True  # Pause live recognition during training
         
         def training_thread():
             success, message = self.face_system.train_single_person(person_name)
@@ -3217,17 +3644,22 @@ class DoorEntryKiosk:
         thread.start()
     
     def single_training_complete(self, success, message):
-        """Handle single person training completion"""
-        self.is_training = False  # Resume recognition
+        """Handle completion of single-person training.
         
-        # Safely update label if it exists
+        Args:
+            success: Whether training succeeded.
+            message: Status message from the training operation.
+        """
+        self.is_training = False  # Resume live recognition
+        
+        # Update label if widget exists
         try:
             if hasattr(self, 'reg_count_label') and self.reg_count_label.winfo_exists():
                 if success:
                     self.reg_count_label.config(text=f"✓ {message}")
                 else:
                     self.reg_count_label.config(text=f"✗ Training failed")
-                # Reset after a delay
+                # Reset label after delay
                 self.root.after(3000, self._reset_reg_count_label)
         except tk.TclError:
             pass
@@ -3238,7 +3670,7 @@ class DoorEntryKiosk:
             messagebox.showerror("Training Failed", message)
     
     def _reset_reg_count_label(self):
-        """Safely reset the registration count label"""
+        """Reset the registration count label to default state."""
         try:
             if hasattr(self, 'reg_count_label') and self.reg_count_label.winfo_exists():
                 self.reg_count_label.config(text="0 photos")
@@ -3246,14 +3678,20 @@ class DoorEntryKiosk:
             pass
     
     def start_training(self):
-        """Start model training"""
+        """Begin full model training for all registered persons.
+        
+        Processes all images in the dataset folder, generates face
+        embeddings, and saves them to the encodings file. Updates
+        the progress bar and status label during training.
+        """
         self.train_btn.config(state=tk.DISABLED)
         self.train_progress['value'] = 0
         self.train_status_label.config(text="Training in progress...")
-        self.is_training = True  # Pause recognition during training
+        self.is_training = True  # Pause live recognition during training
         
         def training_thread():
             def progress_callback(current, total, filepath):
+                """Update progress bar and status from training thread."""
                 progress = (current / total) * 100
                 self.root.after(0, lambda: self.train_progress.configure(value=progress))
                 self.root.after(0, lambda: self.train_status_label.config(
@@ -3266,8 +3704,13 @@ class DoorEntryKiosk:
         thread.start()
     
     def training_complete(self, success, message):
-        """Handle training completion"""
-        self.is_training = False  # Resume recognition
+        """Handle completion of full model training.
+        
+        Args:
+            success: Whether training succeeded.
+            message: Status message from the training operation.
+        """
+        self.is_training = False  # Resume live recognition
         self.train_btn.config(state=tk.NORMAL)
         self.train_progress['value'] = 100 if success else 0
         self.train_status_label.config(text=message if len(message) < 50 else message[:47] + "...")
@@ -3278,8 +3721,15 @@ class DoorEntryKiosk:
         else:
             self.show_toast(f"Training failed: {message}", "error")
     
+    # ==================== USER DELETION ====================
+    
     def delete_person(self):
-        """Delete selected person from dataset and model"""
+        """Delete the selected person from both dataset and trained model.
+        
+        Removes the person's image folder and their encodings from the
+        saved model. Uses person_map for robust name lookup to avoid
+        string parsing issues with display text.
+        """
         selection = self.manage_listbox.curselection()
         if not selection:
             messagebox.showwarning("Warning", "Please select a person to delete")
@@ -3287,7 +3737,7 @@ class DoorEntryKiosk:
         
         selected_index = selection[0]
         
-        # Use person_map for robust name lookup (avoids string parsing issues)
+        # Use person_map for robust name lookup
         name = self.person_map.get(selected_index)
         if name is None:
             messagebox.showerror("Error", "Could not identify selected person. Please refresh and try again.")
@@ -3296,26 +3746,28 @@ class DoorEntryKiosk:
         if messagebox.askyesno("Confirm Delete", f"Delete '{name}' from dataset and recognition model?"):
             import shutil
             
-            # Delete from dataset folder
+            # Delete image folder from dataset
             person_folder = os.path.join(self.face_system.dataset_path, name)
             if os.path.exists(person_folder):
                 shutil.rmtree(person_folder)
             
-            # Remove from trained model
+            # Remove encodings from trained model
             success, message = self.face_system.remove_person_from_model(name)
             if success:
                 logger.info(f"User deleted: {message}")
             else:
                 logger.warning(f"Delete warning: {message}")
             
-            # Update UI
+            # Refresh UI lists
             self.refresh_manage_list()
             self.update_info_label()
             
             self.show_toast(f"'{name}' has been removed", "success")
     
+    # ==================== ACCESS LOG MANAGEMENT ====================
+    
     def clear_access_log(self):
-        """Clear the access log with confirmation"""
+        """Clear all access log entries with user confirmation."""
         entry_count = len(self.access_log.entries)
         if entry_count == 0:
             self.show_toast("Log is already empty", "info")
@@ -3332,31 +3784,43 @@ class DoorEntryKiosk:
             self.show_toast("Access log cleared", "success")
     
     def update_info_label(self):
-        """Update the info label"""
+        """Update the user count display in the kiosk interface."""
         count = len(self.face_system.get_trained_persons())
         self.info_label.config(text=f"{count} Users")
     
+    # ==================== ADMIN PANEL NAVIGATION ====================
+    
     def on_tab_changed(self, event):
-        """Handle notebook tab change - prevent if capture or training in progress"""
+        """Handle notebook tab changes with process lock enforcement.
+        
+        Prevents tab switching during active capture or training operations
+        to ensure data integrity and process completion.
+        """
         if self.reg_process_locked:
             # Force back to register tab
             self.admin_notebook.select(0)
             messagebox.showwarning("Process in Progress", "Please wait for capture and encoding to complete.")
     
     def close_admin_panel(self):
-        """Close the admin panel and restore kiosk UI"""
-        # Prevent closing during capture or training
+        """Close the admin panel and restore the kiosk interface.
+        
+        Prevents closing during active capture or training operations.
+        Cleans up registration state if a session was in progress.
+        """
+        # Prevent closing during active process
         if self.reg_process_locked:
             messagebox.showwarning("Process in Progress", "Please wait for capture and encoding to complete.")
             return
         
+        # Clean up any in-progress registration
         if self.registration_mode:
             self.stop_registration()
         
+        # Reset mode flags
         self.admin_mode = False
         self.is_scanning = True
         
-        # Clear cache and reset performance stats when returning to scanning
+        # Clear recognition cache and stats for fresh scanning
         self.face_system.clear_cache()
         self.cache_hits = 0
         self.cache_misses = 0
@@ -3364,7 +3828,7 @@ class DoorEntryKiosk:
         # Destroy admin frame and restore main kiosk UI
         self.admin_frame.destroy()
         
-        # Force window size to stay consistent
+        # Ensure window size remains consistent
         if Config.FULLSCREEN:
             self.root.attributes('-fullscreen', True)
         else:
@@ -3372,33 +3836,51 @@ class DoorEntryKiosk:
         
         self.main_frame.pack(fill=tk.BOTH, expand=True)
         
+        # Refresh displays with any updates from admin operations
         self.update_log_display()
         self.update_info_label()
     
     def exit_kiosk(self):
-        """Exit the kiosk application"""
+        """Exit the kiosk application after user confirmation."""
         if messagebox.askyesno("Exit", "Are you sure you want to exit the kiosk?"):
             self.on_closing()
     
+    # ==================== APPLICATION CLEANUP ====================
+    
     def on_closing(self):
-        """Handle window close event"""
+        """Clean up resources and close the application gracefully.
+        
+        Stops background threads, cleans up GPIO, and destroys the window.
+        Called when the window is closed or exit is requested.
+        """
+        # Signal all loops to stop
         self.is_running = False
         self.is_scanning = False
         
         # Stop the background recognition thread
         self.face_system.stop_recognition_thread()
         
+        # Wait for camera thread to finish
         if self.camera_thread:
             self.camera_thread.join(timeout=2)
         
+        # Release GPIO resources
         self.door_controller.cleanup()
+        
+        # Destroy the tkinter window
         self.root.destroy()
 
 
-# ==================== MAIN ====================
+# ==================== APPLICATION ENTRY POINT ====================
+
 def main():
-    """Main entry point"""
-    # Validate configuration on startup
+    """Application entry point.
+    
+    Validates configuration, initializes the Tkinter root window,
+    creates the kiosk application, and starts the main event loop.
+    Configuration errors are logged and displayed before exit.
+    """
+    # Validate configuration before starting
     config_errors = Config.validate()
     if config_errors:
         logger.error("Configuration validation failed:")
@@ -3409,11 +3891,13 @@ def main():
             print(f"  - {error}")
         return
     
+    # Log startup information
     logger.info("Door Entry Kiosk starting...")
     logger.info(f"Camera: {'Pi Camera' if USE_PICAMERA else 'USB Webcam'}")
     logger.info(f"Door Control: {'GPIO Hardware' if USE_GPIO else 'Simulated'}")
     logger.info(f"Backup: {'Enabled' if Config.BACKUP_ENABLED else 'Disabled'}")
     
+    # Create and run the application
     root = tk.Tk()
     app = DoorEntryKiosk(root)
     root.mainloop()
