@@ -3850,11 +3850,16 @@ class DoorEntryKiosk:
         Unlocks door, logs access, and shows success feedback.
         """
         self.set_status("granted", name, confidence)
-        self.access_log.add_entry(name, True, confidence)
         self.door_controller.unlock()
-        self.update_log_display()
         self._pulse_border(Config.COLOR_GRANTED)
         logger.info(f"Access granted: {name} ({confidence:.1%})")
+        
+        # Do database writes and log refresh asynchronously to avoid blocking
+        threading.Thread(
+            target=self._async_log_access,
+            args=(name, True, confidence),
+            daemon=True
+        ).start()
     
     def deny_access(self):
         """
@@ -3862,10 +3867,21 @@ class DoorEntryKiosk:
         Logs attempt and shows denial feedback.
         """
         self.set_status("denied")
-        self.access_log.add_entry("Unknown", False, 0.0)
-        self.update_log_display()
         self._pulse_border(Config.COLOR_DENIED)
         logger.info("Access denied: Unknown person")
+        
+        # Do database writes and log refresh asynchronously to avoid blocking
+        threading.Thread(
+            target=self._async_log_access,
+            args=("Unknown", False, 0.0),
+            daemon=True
+        ).start()
+    
+    def _async_log_access(self, name, access_granted, confidence):
+        """Perform database write and UI update in background thread."""
+        self.access_log.add_entry(name, access_granted, confidence)
+        # Schedule UI update on main thread
+        self.root.after(0, self.update_log_display)
     
     def _pulse_border(self, color, duration=300):
         """Create a brief color pulse on the video container border."""
