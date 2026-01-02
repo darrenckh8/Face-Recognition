@@ -3,3 +3,6 @@
 /dataset
 *.pickle
 *.db
+
+# Environment secrets - NEVER commit!
+.env

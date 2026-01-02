@@ -12,10 +12,25 @@ import numpy as np
 from PIL import Image, ImageTk
 import json
 import gc
-import hashlib
 import logging
 import shutil
 from typing import Optional, List, Tuple, Dict, Any
+
+# ==================== SECURITY IMPORTS ====================
+# bcrypt: Secure password hashing (slow by design to resist brute-force)
+try:
+    import bcrypt
+    BCRYPT_AVAILABLE = True
+except ImportError:
+    BCRYPT_AVAILABLE = False
+    logging.warning("bcrypt not installed. Install with: pip install bcrypt")
+
+# python-dotenv: Load secrets from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # Load .env file if present
+except ImportError:
+    pass  # dotenv is optional, can use system environment variables
 
 # ==================== LOGGING CONFIGURATION ====================
 # Configure application-wide logging with timestamp and level information
@@ -57,32 +72,49 @@ except ImportError:
 # ==================== SECURITY UTILITIES ====================
 def hash_password(password: str) -> str:
     """
-    Hash a password using SHA-256 with a salt for secure storage.
+    Hash a password using bcrypt for secure storage.
+    
+    bcrypt is designed to be slow, making brute-force attacks infeasible.
+    It automatically generates and embeds a unique salt in the hash.
     
     Args:
         password: The plaintext password to hash
         
     Returns:
-        The hexadecimal SHA-256 hash of the salted password
+        The bcrypt hash string (includes salt and cost factor)
         
-    Note:
-        In production, use a unique random salt per user stored alongside the hash.
+    Raises:
+        RuntimeError: If bcrypt is not installed
     """
-    salt = "door_entry_kiosk_2024"
-    return hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
+    if not BCRYPT_AVAILABLE:
+        raise RuntimeError("bcrypt is required for password hashing. Install with: pip install bcrypt")
+    
+    # Generate salt and hash password (cost factor 12 = ~250ms on modern hardware)
+    salt = bcrypt.gensalt(rounds=12)
+    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
 
 def verify_password(password: str, hashed: str) -> bool:
     """
-    Verify a plaintext password against a stored hash.
+    Verify a plaintext password against a stored bcrypt hash.
+    
+    Uses constant-time comparison to prevent timing attacks.
     
     Args:
         password: The plaintext password to verify
-        hashed: The stored hash to compare against
+        hashed: The stored bcrypt hash to compare against
         
     Returns:
         True if the password matches, False otherwise
     """
-    return hash_password(password) == hashed
+    if not BCRYPT_AVAILABLE:
+        logging.error("bcrypt is required for password verification")
+        return False
+    
+    try:
+        return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+    except (ValueError, TypeError) as e:
+        logging.error(f"Password verification failed: {e}")
+        return False
 
 
 # ==================== APPLICATION CONFIGURATION ====================
@@ -97,8 +129,17 @@ class Config:
     WINDOW_TITLE = "Door Entry System"    # Window title bar text
     
     # ----- Security Settings -----
-    # Default admin password hash (plaintext: "admin123") - CHANGE IN PRODUCTION!
-    ADMIN_PASSWORD_HASH = hash_password("admin123")
+    # Load admin password hash from environment variable
+    # Generate a new hash with: python -c "import bcrypt; print(bcrypt.hashpw(b'your_password', bcrypt.gensalt(12)).decode())"
+    ADMIN_PASSWORD_HASH = os.environ.get('ADMIN_PASSWORD_HASH', '')
+    
+    # Warn if no password hash is configured
+    if not ADMIN_PASSWORD_HASH:
+        logging.warning(
+            "ADMIN_PASSWORD_HASH not set in environment. "
+            "Create a .env file with ADMIN_PASSWORD_HASH=<bcrypt_hash> or set the environment variable. "
+            "Generate hash with: python -c \"import bcrypt; print(bcrypt.hashpw(b'your_password', bcrypt.gensalt(12)).decode())\""
+        )
     
     # ----- Camera Settings -----
     CAMERA_RESOLUTION = (640, 480)        # Camera capture resolution (width, height)
