@@ -1590,6 +1590,7 @@ class BlinkDetector:
                 'start_time': now,
                 'last_seen': now,
                 'passed': False,
+                'liveness_passed': False,  # Prevents repeated "liveness verified" logs
                 'last_ear': 1.0,
                 'awaiting_blink': True,  # Start in awaiting state
                 # Per-person calibration
@@ -1616,6 +1617,7 @@ class BlinkDetector:
             state['consec_frames'] = 0
             state['start_time'] = now
             state['awaiting_blink'] = True
+            state['liveness_passed'] = False  # Allow new verification attempt
         
         # Convert to RGB for MediaPipe
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -1750,8 +1752,14 @@ class BlinkDetector:
             
             # Check if liveness passed
             if state['blink_count'] >= Config.BLINK_REQUIRED_COUNT:
-                # Don't cache 'passed' state - let the app level handle it
+                # Check if already verified (prevent repeated logging)
+                if state.get('liveness_passed'):
+                    # Already verified - return True but don't log again
+                    return True, state['blink_count'], avg_ear, False
+                
+                # First time reaching required count - mark as passed
                 state['awaiting_blink'] = False
+                state['liveness_passed'] = True  # Prevent repeated logging
                 logger.info(f"Liveness verified for {face_id} ({state['blink_count']} blinks)")
                 return True, state['blink_count'], avg_ear, False
             
