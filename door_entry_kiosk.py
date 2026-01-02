@@ -3814,10 +3814,26 @@ class DoorEntryKiosk:
         }
         bg_color, fg_color = colors.get(toast_type, colors["info"])
         
-        # Create or update toast label
-        if not hasattr(self, 'toast_label') or not self.toast_label.winfo_exists():
+        # Determine parent frame based on current mode
+        parent_frame = self.admin_frame if self.admin_mode and hasattr(self, 'admin_frame') else self.main_frame
+        
+        # Create or update toast label - recreate if parent changed or doesn't exist
+        try:
+            if not hasattr(self, 'toast_label') or not self.toast_label.winfo_exists() or self.toast_label.master != parent_frame:
+                if hasattr(self, 'toast_label') and self.toast_label.winfo_exists():
+                    self.toast_label.destroy()
+                self.toast_label = tk.Label(
+                    parent_frame,
+                    text="",
+                    font=(Config.FONT_FAMILY, 10),
+                    bg=bg_color,
+                    fg=fg_color,
+                    padx=15,
+                    pady=8
+                )
+        except tk.TclError:
             self.toast_label = tk.Label(
-                self.main_frame,
+                parent_frame,
                 text="",
                 font=(Config.FONT_FAMILY, 10),
                 bg=bg_color,
@@ -5245,7 +5261,7 @@ class DoorEntryKiosk:
         self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
         
         # Update button state
-        self.auto_capture_btn.config(text="⏹ Stop", bg=Config.COLOR_DENIED, command=self.stop_auto_capture)
+        self.auto_capture_btn.config(text="Stop", bg=Config.COLOR_DENIED, command=self.stop_auto_capture)
         self.reg_count_label.config(text="Move face to fill all zones...")
     
     def stop_auto_capture(self):
@@ -5744,21 +5760,40 @@ class DoorEntryKiosk:
         
         Prevents tab switching during active capture or training operations
         to ensure data integrity and process completion.
+        Also refreshes tab content when switching to Train or Users tabs.
         """
+        # Prevent recursive calls when we programmatically select a tab
+        if hasattr(self, '_tab_change_in_progress') and self._tab_change_in_progress:
+            return
+        
+        current_tab = self.admin_notebook.index(self.admin_notebook.select())
+        
         if self.reg_process_locked:
-            # Determine which tab to force back to based on what's in progress
-            if self.registration_mode or self.auto_capture_mode:
-                # Registration/auto-capture in progress - force back to register tab (index 0)
-                self.admin_notebook.select(0)
-                self.show_warning_dialog("Registration in Progress", "Please wait for capture and encoding to complete.")
-            elif self.is_training:
-                # Full model training from Train tab - force back to train tab (index 1)
-                self.admin_notebook.select(1)
-                self.show_warning_dialog("Training in Progress", "Please wait for training to complete.")
-            else:
-                # Fallback - force to register tab
-                self.admin_notebook.select(0)
-                self.show_warning_dialog("Process in Progress", "Please wait for the current operation to complete.")
+            self._tab_change_in_progress = True
+            try:
+                # Determine which tab to force back to based on what's in progress
+                if self.registration_mode or self.auto_capture_mode:
+                    # Registration/auto-capture in progress - force back to register tab (index 0)
+                    self.admin_notebook.select(0)
+                    # Use toast instead of blocking dialog to avoid stuck state
+                    self.show_toast("Please wait for capture and encoding to complete", "warning")
+                elif self.is_training:
+                    # Full model training from Train tab - force back to train tab (index 1)
+                    self.admin_notebook.select(1)
+                    self.show_toast("Please wait for training to complete", "warning")
+                else:
+                    # Fallback - force to register tab
+                    self.admin_notebook.select(0)
+                    self.show_toast("Please wait for the current operation to complete", "warning")
+            finally:
+                self._tab_change_in_progress = False
+            return
+        
+        # Auto-refresh content when switching to Train or Users tabs
+        if current_tab == 1:  # Train tab
+            self.refresh_train_tab()
+        elif current_tab == 2:  # Users tab
+            self.refresh_manage_list()
     
     def close_admin_panel(self):
         """Close the admin panel and restore the kiosk interface.
@@ -5768,7 +5803,7 @@ class DoorEntryKiosk:
         """
         # Prevent closing during active process
         if self.reg_process_locked:
-            self.show_warning_dialog("Process in Progress", "Please wait for capture and encoding to complete.")
+            self.show_toast("Please wait for capture and encoding to complete", "warning")
             return
         
         # Clean up any in-progress registration
