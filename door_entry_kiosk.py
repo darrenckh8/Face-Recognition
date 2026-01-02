@@ -3030,6 +3030,11 @@ class DoorEntryKiosk:
         self.last_access = {}  # Cooldown tracking per person
         self.admin_mode = False
         
+        # Blink detection mode - when active, skip face recognition to save resources
+        self.awaiting_blink_mode = False
+        self.awaiting_blink_name = None  # Name of person awaiting blink verification
+        self.awaiting_blink_location = None  # Last known face location
+        
         # ========== Registration State ==========
         self.registration_mode = False
         self.registration_name = ""
@@ -3406,7 +3411,49 @@ class DoorEntryKiosk:
                     if self.is_training:
                         cv2.putText(display_frame, "Training in progress...", (50, 50),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+                    
+                    elif self.awaiting_blink_mode and self.awaiting_blink_name:
+                        # ========== BLINK-ONLY MODE ==========
+                        # Skip expensive face recognition - only run blink detection
+                        # This gives maximum resources to camera feed and EAR detection
+                        
+                        if self.face_system.blink_detector and self.face_system.blink_detector.available:
+                            # Use lightweight face detection just to find face location
+                            faces = self.face_system.detect_faces_combined(frame)
+                            
+                            if len(faces) > 0:
+                                # Use first detected face
+                                top, right, bottom, left = faces[0]
+                                bbox = (left, top, right, bottom)
+                                self.awaiting_blink_location = (top, right, bottom, left)
+                                
+                                # Run blink detection (lightweight compared to full recognition)
+                                liveness_passed, blink_count, ear, awaiting = self.face_system.blink_detector.check_blink(
+                                    frame, bbox, self.awaiting_blink_name
+                                )
+                                
+                                if liveness_passed:
+                                    # Blink detected! Grant access and exit blink mode
+                                    now = time.time()
+                                    name = self.awaiting_blink_name
+                                    self.awaiting_blink_mode = False
+                                    self.awaiting_blink_name = None
+                                    self.awaiting_blink_location = None
+                                    
+                                    if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
+                                        self.last_access[name] = now
+                                        # Use high confidence since they were already recognized
+                                        self.root.after(0, lambda n=name: self.grant_access(n, 0.95))
+                                # else: keep waiting for blink, status already shows "Please Blink"
+                            else:
+                                # Face disappeared - exit blink mode and return to scanning
+                                self.awaiting_blink_mode = False
+                                self.awaiting_blink_name = None
+                                self.awaiting_blink_location = None
+                                self.root.after(0, self._set_status_scanning)
+                    
                     else:
+                        # ========== NORMAL RECOGNITION MODE ==========
                         # Run face recognition with adaptive interval based on idle state
                         is_idle = self.no_face_frames >= self.idle_threshold_frames
                         _, results = self.face_system.recognize_faces(frame, idle_mode=is_idle)
@@ -3414,6 +3461,8 @@ class DoorEntryKiosk:
                         
                         # Track if any face is awaiting blink verification
                         any_awaiting_blink = False
+                        pending_blink_name = None
+                        pending_blink_location = None
                         
                         # First pass: check blink status for all recognized faces
                         for result in results:
@@ -3432,61 +3481,60 @@ class DoorEntryKiosk:
                                     liveness_passed, _, _, awaiting = self.face_system.blink_detector.check_blink(frame, bbox, name)
                                     if not liveness_passed and awaiting:
                                         any_awaiting_blink = True
+                                        pending_blink_name = name
+                                        pending_blink_location = location
                         
-                        # Check face stability status
-                        any_unstable = any(not r.get('is_stable', True) for r in results)
-                        any_stable = any(r.get('is_stable', True) for r in results)
-                        
-                        # Update UI status based on face detection (but don't override awaiting_blink)
-                        if len(results) > 0 and self.current_status not in ("granted", "denied"):
-                            if any_awaiting_blink:
-                                if self.current_status != "awaiting_blink":
-                                    self.root.after(0, lambda: self.set_status("awaiting_blink"))
-                            elif any_unstable and not any_stable:
-                                self.root.after(0, lambda: self.set_status("processing"))
-                            elif self.current_status != "awaiting_blink":
-                                self.root.after(0, self._set_status_active_scanning)
-                        elif len(results) == 0 and self.current_status in ("active_scanning", "processing", "awaiting_blink"):
-                            self.root.after(0, self._set_status_scanning)
-                        
-                        # Process each recognized face
-                        for result in results:
-                            name = result['name']
-                            confidence = result['confidence']
-                            from_cache = result.get('from_cache', False)
-                            is_stable = result.get('is_stable', True)
-                            location = result.get('location', (0, 0, 0, 0))
+                        # If awaiting blink, enter blink-only mode to save resources
+                        if any_awaiting_blink and pending_blink_name:
+                            self.awaiting_blink_mode = True
+                            self.awaiting_blink_name = pending_blink_name
+                            self.awaiting_blink_location = pending_blink_location
+                            if self.current_status != "awaiting_blink":
+                                self.root.after(0, lambda: self.set_status("awaiting_blink"))
+                            # Skip rest of processing - will handle in blink-only mode next frame
+                            pass
+                        else:
+                            # Check face stability status
+                            any_unstable = any(not r.get('is_stable', True) for r in results)
+                            any_stable = any(r.get('is_stable', True) for r in results)
                             
-                            # Skip unstable faces
-                            if not is_stable or name == 'Scanning...':
-                                continue
-                            
-                            # Handle recognized faces
-                            if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
-                                # Check blink-based liveness if enabled
-                                liveness_passed = True
-                                if self.face_system.blink_detector and self.face_system.blink_detector.available:
-                                    # Convert location (top, right, bottom, left) to bbox (left, top, right, bottom)
-                                    top, right, bottom, left = location
-                                    bbox = (left, top, right, bottom)
-                                    liveness_passed, blink_count, _, awaiting = self.face_system.blink_detector.check_blink(frame, bbox, name)
-                                    
-                                    if not liveness_passed:
-                                        # Skip granting access - UI status already set above
-                                        continue
+                            # Update UI status based on face detection
+                            if len(results) > 0 and self.current_status not in ("granted", "denied"):
+                                if any_unstable and not any_stable:
+                                    self.root.after(0, lambda: self.set_status("processing"))
+                                else:
+                                    self.root.after(0, self._set_status_active_scanning)
+                            elif len(results) == 0 and self.current_status in ("active_scanning", "processing", "awaiting_blink"):
+                                self.root.after(0, self._set_status_scanning)
+                        
+                        # Process each recognized face (only if not in blink-waiting mode)
+                        if not any_awaiting_blink:
+                            for result in results:
+                                name = result['name']
+                                confidence = result['confidence']
+                                from_cache = result.get('from_cache', False)
+                                is_stable = result.get('is_stable', True)
+                                location = result.get('location', (0, 0, 0, 0))
                                 
-                                now = time.time()
-                                # Apply cooldown to prevent duplicate logs
-                                if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
-                                    self.last_access[name] = now
-                                    self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
-                            else:
-                                # Log unknown faces (with cooldown)
-                                if name == "Unknown" and self.current_status in ("scanning", "active_scanning") and not from_cache:
+                                # Skip unstable faces
+                                if not is_stable or name == 'Scanning...':
+                                    continue
+                                
+                                # Handle recognized faces
+                                if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
+                                    # Blink already passed if we're here (checked in first pass)
                                     now = time.time()
-                                    if "Unknown" not in self.last_access or (now - self.last_access["Unknown"]) > Config.COOLDOWN_SECONDS:
-                                        self.last_access["Unknown"] = now
-                                        self.root.after(0, self.deny_access)
+                                    # Apply cooldown to prevent duplicate logs
+                                    if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
+                                        self.last_access[name] = now
+                                        self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
+                                else:
+                                    # Log unknown faces (with cooldown)
+                                    if name == "Unknown" and self.current_status in ("scanning", "active_scanning") and not from_cache:
+                                        now = time.time()
+                                        if "Unknown" not in self.last_access or (now - self.last_access["Unknown"]) > Config.COOLDOWN_SECONDS:
+                                            self.last_access["Unknown"] = now
+                                            self.root.after(0, self.deny_access)
                 
                 elif self.registration_mode:
                     # Registration mode with zone-based capture
