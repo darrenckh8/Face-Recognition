@@ -278,6 +278,24 @@ class Config:
             errors.append(f"MAX_CACHE_ENTRIES must be at least 1, got {cls.MAX_CACHE_ENTRIES}")
         if cls.ACCESS_LOG_MAX_MEMORY_ENTRIES < 1:
             errors.append(f"ACCESS_LOG_MAX_MEMORY_ENTRIES must be at least 1, got {cls.ACCESS_LOG_MAX_MEMORY_ENTRIES}")
+        if cls.MAX_BACKUPS < 1:
+            errors.append(f"MAX_BACKUPS must be at least 1, got {cls.MAX_BACKUPS}")
+        
+        # Validate FPS settings (resource protection)
+        if cls.IDLE_FPS < 1 or cls.IDLE_FPS > 30:
+            errors.append(f"IDLE_FPS should be 1-30, got {cls.IDLE_FPS}")
+        if cls.ACTIVE_FPS < 10 or cls.ACTIVE_FPS > 60:
+            errors.append(f"ACTIVE_FPS should be 10-60, got {cls.ACTIVE_FPS}")
+        if cls.ACTIVE_FPS < cls.IDLE_FPS:
+            errors.append(f"ACTIVE_FPS ({cls.ACTIVE_FPS}) must be >= IDLE_FPS ({cls.IDLE_FPS})")
+        
+        # Validate blink detection settings (prevent false positives)
+        if not 0.0 <= cls.EAR_BLINK_RATIO <= 1.0:
+            errors.append(f"EAR_BLINK_RATIO must be between 0.0 and 1.0, got {cls.EAR_BLINK_RATIO}")
+        if cls.BLINK_REQUIRED_COUNT < 1:
+            errors.append(f"BLINK_REQUIRED_COUNT must be at least 1, got {cls.BLINK_REQUIRED_COUNT}")
+        if cls.BLINK_TIMEOUT_SECONDS < 1.0:
+            errors.append(f"BLINK_TIMEOUT_SECONDS must be at least 1.0, got {cls.BLINK_TIMEOUT_SECONDS}")
         
         # Validate camera resolution
         if cls.CAMERA_RESOLUTION[0] < 320 or cls.CAMERA_RESOLUTION[1] < 240:
@@ -1122,6 +1140,19 @@ class AccessLog:
             logger.info("Access log cleared")
         except sqlite3.Error as e:
             logger.error(f"Failed to clear access log: {e}")
+    
+    def optimize_database(self) -> None:
+        """Optimize database by removing unused space (VACUUM).
+        
+        Call periodically to prevent database file bloat after many write operations.
+        """
+        try:
+            conn = self._get_connection()
+            conn.execute("VACUUM")  # Reclaim unused disk space
+            conn.close()
+            logger.debug("Database optimized successfully")
+        except sqlite3.Error as e:
+            logger.warning(f"Database optimization failed: {e}")  # Don't error out for maintenance
     
     def migrate_from_json(self, json_path: str) -> int:
         """
@@ -3018,7 +3049,9 @@ class DoorEntryKiosk:
         # ========== Memory Management ==========
         self.last_cache_cleanup = time.time()
         self.last_gc_run = time.time()
+        self.last_db_optimize = time.time()  # Track database maintenance
         self.cache_cleanup_interval = 60  # Cleanup every 60 seconds
+        self.db_optimize_interval = 3600  # Optimize database every hour (3600 seconds)
         
         # ========== Adaptive Frame Rate State ==========
         self.target_fps = Config.IDLE_FPS  # Start in idle mode
@@ -3667,11 +3700,23 @@ class DoorEntryKiosk:
                     gc.collect()
                     self.last_gc_run = now
                 
+                # Periodic database optimization (VACUUM) to prevent bloat
+                if now - self.last_db_optimize > self.db_optimize_interval:
+                    # Run in thread to avoid blocking camera loop
+                    threading.Thread(target=self.access_log.optimize_database, daemon=True).start()
+                    self.last_db_optimize = now
+                
                 # Store current frame reference (avoid unnecessary copy when possible)
                 self.current_frame = frame
                 
                 # Update display
                 self.root.after(0, lambda f=display_frame: self.display_frame(f))
+                
+                # Explicit cleanup of frame objects to help garbage collector
+                # (display_frame and frame are large numpy arrays)
+                del display_frame
+                if frame is not None:
+                    del frame
                 
                 # Adaptive frame rate based on detection state
                 loop_time = time.time() - loop_start
@@ -5555,15 +5600,28 @@ def main():
         return
     
     # Log startup information
+    logger.info("=" * 60)
     logger.info("Door Entry Kiosk starting...")
     logger.info(f"Camera: {'Pi Camera' if USE_PICAMERA else 'USB Webcam'}")
     logger.info(f"Door Control: {'GPIO Hardware' if USE_GPIO else 'Simulated'}")
+    logger.info(f"Face Recognition: {'InsightFace buffalo_s' if not Config.USE_MULTIPROCESSING else 'Multiprocess InsightFace'}")
+    logger.info(f"Liveness Detection: {'Enabled (MediaPipe)' if Config.ENABLE_BLINK_DETECTION else 'Disabled'}")
+    logger.info(f"Vector Search: {'FAISS' if USE_FAISS else 'Linear'}")
     logger.info(f"Backup: {'Enabled' if Config.BACKUP_ENABLED else 'Disabled'}")
+    logger.info(f"Fullscreen: {'Yes' if Config.FULLSCREEN else 'No'}")
+    logger.info(f"Admin Password: {'Set' if Config.ADMIN_PASSWORD_HASH else 'WARNING: NOT SET'}")
+    logger.info("=" * 60)
     
-    # Create and run the application
-    root = tk.Tk()
-    app = DoorEntryKiosk(root)
-    root.mainloop()
+    # Create and run the application with error handling
+    try:
+        root = tk.Tk()
+        app = DoorEntryKiosk(root)
+        root.mainloop()
+    except Exception as e:
+        logger.error(f"Fatal error in application: {e}", exc_info=True)
+        print(f"\nFatal application error: {e}")
+        print("Check the log file for details.")
+        raise
 
 
 if __name__ == "__main__":
