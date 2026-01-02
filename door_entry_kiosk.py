@@ -2925,7 +2925,8 @@ class OnScreenKeyboard:
                 self.shift_on = False
                 self.shift_btn.config(bg=Config.COLOR_CARD, fg=Config.COLOR_TEXT)
         
-        self.entry.focus_set()
+        # Force focus back to entry (important for Wayland/Cage compatibility)
+        self.entry.focus_force()
     
     def close(self):
         """Destroy keyboard and clean up resources."""
@@ -3843,7 +3844,164 @@ class DoorEntryKiosk:
         if hasattr(self, 'toast_label') and self.toast_label.winfo_exists():
             self.toast_label.place_forget()
         self._toast_id = None
+
+    # ==================== INLINE DIALOG SYSTEM ====================
+    # These replace Tkinter messagebox dialogs for Cage/Wayland kiosk compatibility
     
+    def _show_inline_dialog(self, title, message, dialog_type="info", show_cancel=False, callback=None):
+        """
+        Display an inline dialog overlay that replaces messagebox popups.
+        
+        Args:
+            title: Dialog title text
+            message: Main message text
+            dialog_type: One of "info", "warning", "error", "question"
+            show_cancel: If True, shows Cancel button (for yes/no dialogs)
+            callback: Function to call with result (True for OK/Yes, False for Cancel/No)
+        
+        Returns:
+            For blocking dialogs without callback, returns the result directly.
+        """
+        # Color schemes for dialog types
+        colors = {
+            "info": Config.COLOR_SCANNING,
+            "success": Config.COLOR_GRANTED,
+            "warning": Config.COLOR_WARNING,
+            "error": Config.COLOR_DENIED,
+            "question": Config.COLOR_SCANNING
+        }
+        accent_color = colors.get(dialog_type, Config.COLOR_SCANNING)
+        
+        # Result storage for blocking mode
+        result = {'value': None, 'done': False}
+        
+        # Create overlay that covers the entire window
+        overlay = tk.Frame(self.root, bg='#00000088')
+        overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        
+        # Create semi-transparent background effect using a dark frame
+        bg_overlay = tk.Frame(overlay, bg='#000000')
+        bg_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        bg_overlay.configure(bg='#333333')
+        
+        # Center dialog card
+        dialog_frame = tk.Frame(overlay, bg=Config.COLOR_CARD, padx=25, pady=20)
+        dialog_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        
+        # Title with accent color bar
+        title_frame = tk.Frame(dialog_frame, bg=Config.COLOR_CARD)
+        title_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        accent_bar = tk.Frame(title_frame, bg=accent_color, width=4)
+        accent_bar.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        
+        tk.Label(
+            title_frame,
+            text=title,
+            font=(Config.FONT_FAMILY, 16, 'bold'),
+            fg=Config.COLOR_TEXT,
+            bg=Config.COLOR_CARD
+        ).pack(side=tk.LEFT)
+        
+        # Message
+        msg_label = tk.Label(
+            dialog_frame,
+            text=message,
+            font=(Config.FONT_FAMILY, 12),
+            fg=Config.COLOR_TEXT,
+            bg=Config.COLOR_CARD,
+            wraplength=350,
+            justify=tk.LEFT
+        )
+        msg_label.pack(pady=(0, 20))
+        
+        # Button frame
+        btn_frame = tk.Frame(dialog_frame, bg=Config.COLOR_CARD)
+        btn_frame.pack(fill=tk.X)
+        
+        def close_dialog(value):
+            result['value'] = value
+            result['done'] = True
+            overlay.destroy()
+            if callback:
+                callback(value)
+        
+        if show_cancel:
+            # Yes/No or OK/Cancel style
+            cancel_btn = tk.Button(
+                btn_frame,
+                text="Cancel" if dialog_type != "question" else "No",
+                font=(Config.FONT_FAMILY, 11),
+                fg=Config.COLOR_TEXT_SECONDARY,
+                bg=Config.COLOR_BG,
+                activeforeground=Config.COLOR_TEXT,
+                activebackground=Config.COLOR_CARD_SECONDARY,
+                relief=tk.FLAT,
+                cursor="hand2",
+                width=10,
+                command=lambda: close_dialog(False)
+            )
+            cancel_btn.pack(side=tk.LEFT, padx=(0, 10))
+            
+            ok_btn = tk.Button(
+                btn_frame,
+                text="OK" if dialog_type != "question" else "Yes",
+                font=(Config.FONT_FAMILY, 11),
+                fg="white",
+                bg=accent_color,
+                activeforeground="white",
+                activebackground=accent_color,
+                relief=tk.FLAT,
+                cursor="hand2",
+                width=10,
+                command=lambda: close_dialog(True)
+            )
+            ok_btn.pack(side=tk.RIGHT)
+        else:
+            # Single OK button centered
+            ok_btn = tk.Button(
+                btn_frame,
+                text="OK",
+                font=(Config.FONT_FAMILY, 11),
+                fg="white",
+                bg=accent_color,
+                activeforeground="white",
+                activebackground=accent_color,
+                relief=tk.FLAT,
+                cursor="hand2",
+                width=12,
+                command=lambda: close_dialog(True)
+            )
+            ok_btn.pack()
+        
+        # Handle Escape key
+        overlay.bind('<Escape>', lambda e: close_dialog(False if show_cancel else True))
+        overlay.focus_set()
+        
+        # If no callback provided, block until dialog is closed
+        if callback is None:
+            overlay.grab_set()
+            self.root.wait_window(overlay)
+            return result['value']
+        
+        return None
+    
+    def show_info_dialog(self, title, message, callback=None):
+        """Show an informational dialog (replaces messagebox.showinfo)."""
+        return self._show_inline_dialog(title, message, "info", False, callback)
+    
+    def show_warning_dialog(self, title, message, callback=None):
+        """Show a warning dialog (replaces messagebox.showwarning)."""
+        return self._show_inline_dialog(title, message, "warning", False, callback)
+    
+    def show_error_dialog(self, title, message, callback=None):
+        """Show an error dialog (replaces messagebox.showerror)."""
+        return self._show_inline_dialog(title, message, "error", False, callback)
+    
+    def show_confirm_dialog(self, title, message, callback=None):
+        """Show a yes/no confirmation dialog (replaces messagebox.askyesno)."""
+        return self._show_inline_dialog(title, message, "question", True, callback)
+
     def grant_access(self, name, confidence):
         """
         Handle successful face recognition - grant access.
@@ -3912,77 +4070,101 @@ class DoorEntryKiosk:
             del self.last_access[key]
     
     def show_admin_login(self):
-        """Display the admin login dialog for authentication."""
-        login_dialog = tk.Toplevel(self.root)
-        login_dialog.title("Admin Login")
-        login_dialog.geometry("350x280")
-        login_dialog.configure(bg=Config.COLOR_BG)
-        login_dialog.resizable(False, False)
+        """Display the admin login dialog for authentication.
         
-        # Center on screen
-        login_dialog.update_idletasks()
-        x = (login_dialog.winfo_screenwidth() - 350) // 2
-        y = (login_dialog.winfo_screenheight() - 280) // 2
-        login_dialog.geometry(f"350x280+{x}+{y}")
+        Uses inline frame for kiosk/Cage compatibility.
+        """
+        # Stop scanning while in login mode
+        was_scanning = self.is_scanning
+        self.is_scanning = False
         
-        # Make modal
-        login_dialog.transient(self.root)
-        login_dialog.grab_set()
-        login_dialog.focus_set()
+        # Hide main frame
+        self.main_frame.pack_forget()
         
-        # Password entry result
-        result = {'password': None}
+        # Create login frame that fills the window
+        login_frame = tk.Frame(self.root, bg=Config.COLOR_BG)
+        login_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Content frame
-        content = tk.Frame(login_dialog, bg=Config.COLOR_BG)
-        content.pack(fill=tk.BOTH, expand=True, padx=25, pady=20)
+        # Keyboard container at bottom (created first so it's available for binding)
+        keyboard_container = tk.Frame(login_frame, bg=Config.COLOR_BG)
+        keyboard_container.pack(side=tk.BOTTOM, fill=tk.X, pady=20)
+        
+        # Center content
+        center_frame = tk.Frame(login_frame, bg=Config.COLOR_BG)
+        center_frame.place(relx=0.5, rely=0.4, anchor=tk.CENTER)
+        
+        # Card-style container
+        card = tk.Frame(center_frame, bg=Config.COLOR_CARD, padx=30, pady=25)
+        card.pack()
         
         tk.Label(
-            content,
+            card,
+            text="Admin Login",
+            font=(Config.FONT_FAMILY, 18, 'bold'),
+            fg=Config.COLOR_TEXT,
+            bg=Config.COLOR_CARD
+        ).pack(pady=(0, 20))
+        
+        tk.Label(
+            card,
             text="Enter admin password:",
             font=(Config.FONT_FAMILY, 14),
             fg=Config.COLOR_TEXT,
-            bg=Config.COLOR_BG
+            bg=Config.COLOR_CARD
         ).pack(anchor=tk.W, pady=(0, 10))
         
         password_entry = tk.Entry(
-            content,
+            card,
             font=(Config.FONT_FAMILY, 14),
             show='*',
             relief=tk.FLAT,
-            bg=Config.COLOR_CARD,
+            bg=Config.COLOR_BG,
             fg=Config.COLOR_TEXT,
-            insertbackground=Config.COLOR_TEXT
+            insertbackground=Config.COLOR_TEXT,
+            width=25
         )
         password_entry.pack(fill=tk.X, ipady=8)
-        password_entry.bind('<Button-1>', lambda e: self._show_password_keyboard(login_dialog, content, password_entry))
-        password_entry.focus_set()
+        
+        # Allow reopening keyboard by clicking on entry
+        password_entry.bind('<Button-1>', lambda e: show_keyboard(keyboard_container, password_entry, self.root))
         
         # Button frame
-        btn_frame = tk.Frame(content, bg=Config.COLOR_BG)
+        btn_frame = tk.Frame(card, bg=Config.COLOR_CARD)
         btn_frame.pack(fill=tk.X, pady=(20, 0))
         
+        def cleanup_and_restore():
+            """Remove login frame and restore main interface."""
+            login_frame.destroy()
+            self.main_frame.pack(fill=tk.BOTH, expand=True)
+            self.is_scanning = was_scanning
+        
         def on_ok(event=None):
-            result['password'] = password_entry.get()
-            login_dialog.destroy()
+            password = password_entry.get()
+            cleanup_and_restore()
+            if password and verify_password(password, Config.ADMIN_PASSWORD_HASH):
+                logger.info("Admin login successful")
+                self.show_admin_panel()
+            elif password:
+                logger.warning("Failed admin login attempt")
+                self.show_error_dialog("Error", "Invalid password")
         
         def on_cancel(event=None):
-            login_dialog.destroy()
+            cleanup_and_restore()
         
         cancel_btn = tk.Button(
             btn_frame,
             text="Cancel",
             font=(Config.FONT_FAMILY, 12),
             fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_CARD,
+            bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_TEXT,
-            activebackground=Config.COLOR_CARD,
+            activebackground=Config.COLOR_BG,
             relief=tk.FLAT,
             cursor="hand2",
             width=10,
             command=on_cancel
         )
-        cancel_btn.pack(side=tk.LEFT)
+        cancel_btn.pack(side=tk.LEFT, padx=(0, 10))
         
         ok_btn = tk.Button(
             btn_frame,
@@ -4001,32 +4183,15 @@ class DoorEntryKiosk:
         
         # Bind Enter and Escape keys
         password_entry.bind('<Return>', on_ok)
-        login_dialog.bind('<Escape>', on_cancel)
+        login_frame.bind('<Escape>', on_cancel)
         
-        # Show keyboard immediately
-        login_dialog.after(5, lambda: self._show_password_keyboard(login_dialog, content, password_entry))
+        # Show on-screen keyboard after a brief delay
+        def show_kb():
+            password_entry.focus_force()
+            show_keyboard(keyboard_container, password_entry, self.root)
         
-        # Wait for dialog to close
-        self.root.wait_window(login_dialog)
-        
-        # Check password using secure hash comparison
-        password = result['password']
-        if password and verify_password(password, Config.ADMIN_PASSWORD_HASH):
-            logger.info("Admin login successful")
-            self.show_admin_panel()
-        elif password is not None:
-            logger.warning("Failed admin login attempt")
-            messagebox.showerror("Error", "Invalid password")
-    
-    def _show_password_keyboard(self, dialog, content, entry):
-        """Display on-screen keyboard for password entry."""
-        dialog.geometry("480x450")
-        dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() - 480) // 2
-        y = (dialog.winfo_screenheight() - 450) // 2
-        dialog.geometry(f"480x450+{x}+{y}")
-        show_keyboard(content, entry, dialog)
-    
+        self.root.after(200, show_kb)
+
     def show_admin_panel(self):
         """
         Display the admin control panel.
@@ -4924,7 +5089,7 @@ class DoorEntryKiosk:
         # Check for duplicate names with case-insensitive comparison
         existing_persons = [p[0].lower() for p in self.face_system.get_registered_persons()]
         if name.lower() in existing_persons:
-            if not messagebox.askyesno(
+            if not self.show_confirm_dialog(
                 "Name Exists", 
                 f"'{name}' already exists. Add more photos to this person?"
             ):
@@ -4957,7 +5122,7 @@ class DoorEntryKiosk:
         """
         # Only block if auto-capture is actively running (not manual capture)
         if self.auto_capture_mode and self.reg_process_locked:
-            messagebox.showwarning("Please Wait", "Auto-capture or encoding in progress. Please wait for completion.")
+            self.show_warning_dialog("Please Wait", "Auto-capture or encoding in progress. Please wait for completion.")
             return
         
         # Save registration info before resetting
@@ -5024,7 +5189,7 @@ class DoorEntryKiosk:
         Photos already captured are kept but training won't auto-start.
         """
         if self.reg_process_locked:
-            if not messagebox.askyesno("Cancel Capture?", 
+            if not self.show_confirm_dialog("Cancel Capture?", 
                 "Are you sure you want to cancel?\nPhotos already captured will be kept but training won't start."):
                 return
         
@@ -5307,9 +5472,9 @@ class DoorEntryKiosk:
             pass
         
         if success:
-            messagebox.showinfo("Training Complete", message)
+            self.show_info_dialog("Training Complete", message)
         else:
-            messagebox.showerror("Training Failed", message)
+            self.show_error_dialog("Training Failed", message)
     
     def _reset_reg_count_label(self):
         """Reset the registration count label to default state."""
@@ -5375,7 +5540,7 @@ class DoorEntryKiosk:
         """
         selection = self.manage_listbox.curselection()
         if not selection:
-            messagebox.showwarning("Warning", "Please select a person")
+            self.show_warning_dialog("Warning", "Please select a person")
             return
         
         selected_index = selection[0]
@@ -5383,14 +5548,14 @@ class DoorEntryKiosk:
         status = self.person_status.get(selected_index, 'active')
         
         if name is None:
-            messagebox.showerror("Error", "Could not identify selected person. Please refresh and try again.")
+            self.show_error_dialog("Error", "Could not identify selected person. Please refresh and try again.")
             return
         
         if status == 'revoked':
-            messagebox.showinfo("Already Revoked", f"'{name}' is already revoked. Use 'Restore Access' to re-enable.")
+            self.show_info_dialog("Already Revoked", f"'{name}' is already revoked. Use 'Restore Access' to re-enable.")
             return
         
-        if messagebox.askyesno("Revoke Access", f"Revoke access for '{name}'?\n\nEncodings will be preserved for easy restoration."):
+        if self.show_confirm_dialog("Revoke Access", f"Revoke access for '{name}'?\n\nEncodings will be preserved for easy restoration."):
             success, message = self.face_system.revoke_person_access(name)
             if success:
                 logger.info(f"Access revoked: {message}")
@@ -5409,7 +5574,7 @@ class DoorEntryKiosk:
         """
         selection = self.manage_listbox.curselection()
         if not selection:
-            messagebox.showwarning("Warning", "Please select a revoked person")
+            self.show_warning_dialog("Warning", "Please select a revoked person")
             return
         
         selected_index = selection[0]
@@ -5417,14 +5582,14 @@ class DoorEntryKiosk:
         status = self.person_status.get(selected_index, 'active')
         
         if name is None:
-            messagebox.showerror("Error", "Could not identify selected person. Please refresh and try again.")
+            self.show_error_dialog("Error", "Could not identify selected person. Please refresh and try again.")
             return
         
         if status == 'active':
-            messagebox.showinfo("Already Active", f"'{name}' already has access.")
+            self.show_info_dialog("Already Active", f"'{name}' already has access.")
             return
         
-        if messagebox.askyesno("Restore Access", f"Restore access for '{name}'?"):
+        if self.show_confirm_dialog("Restore Access", f"Restore access for '{name}'?"):
             success, message = self.face_system.restore_person_access(name)
             if success:
                 logger.info(f"Access restored: {message}")
@@ -5443,7 +5608,7 @@ class DoorEntryKiosk:
         """
         selection = self.manage_listbox.curselection()
         if not selection:
-            messagebox.showwarning("Warning", "Please select a person")
+            self.show_warning_dialog("Warning", "Please select a person")
             return
         
         selected_index = selection[0]
@@ -5451,10 +5616,10 @@ class DoorEntryKiosk:
         status = self.person_status.get(selected_index, 'active')
         
         if name is None:
-            messagebox.showerror("Error", "Could not identify selected person. Please refresh and try again.")
+            self.show_error_dialog("Error", "Could not identify selected person. Please refresh and try again.")
             return
         
-        if messagebox.askyesno("Delete Permanently", f"Permanently delete '{name}' and all their photos?\n\nThis cannot be undone!"):
+        if self.show_confirm_dialog("Delete Permanently", f"Permanently delete '{name}' and all their photos?\n\nThis cannot be undone!"):
             import shutil
             
             # Delete image folder from dataset
@@ -5491,7 +5656,7 @@ class DoorEntryKiosk:
             self.show_toast("Log is already empty", "info")
             return
         
-        if messagebox.askyesno(
+        if self.show_confirm_dialog(
             "Clear Access Log", 
             f"Delete all {entry_count} log entries?\n\nThis action cannot be undone."
         ):
@@ -5519,15 +5684,15 @@ class DoorEntryKiosk:
             if self.registration_mode or self.auto_capture_mode:
                 # Registration/auto-capture in progress - force back to register tab (index 0)
                 self.admin_notebook.select(0)
-                messagebox.showwarning("Registration in Progress", "Please wait for capture and encoding to complete.")
+                self.show_warning_dialog("Registration in Progress", "Please wait for capture and encoding to complete.")
             elif self.is_training:
                 # Full model training from Train tab - force back to train tab (index 1)
                 self.admin_notebook.select(1)
-                messagebox.showwarning("Training in Progress", "Please wait for training to complete.")
+                self.show_warning_dialog("Training in Progress", "Please wait for training to complete.")
             else:
                 # Fallback - force to register tab
                 self.admin_notebook.select(0)
-                messagebox.showwarning("Process in Progress", "Please wait for the current operation to complete.")
+                self.show_warning_dialog("Process in Progress", "Please wait for the current operation to complete.")
     
     def close_admin_panel(self):
         """Close the admin panel and restore the kiosk interface.
@@ -5537,7 +5702,7 @@ class DoorEntryKiosk:
         """
         # Prevent closing during active process
         if self.reg_process_locked:
-            messagebox.showwarning("Process in Progress", "Please wait for capture and encoding to complete.")
+            self.show_warning_dialog("Process in Progress", "Please wait for capture and encoding to complete.")
             return
         
         # Clean up any in-progress registration
@@ -5570,7 +5735,7 @@ class DoorEntryKiosk:
     
     def exit_kiosk(self):
         """Exit the kiosk application after user confirmation."""
-        if messagebox.askyesno("Exit", "Are you sure you want to exit the kiosk?"):
+        if self.show_confirm_dialog("Exit", "Are you sure you want to exit the kiosk?"):
             self.on_closing()
     
     # ==================== APPLICATION CLEANUP ====================
