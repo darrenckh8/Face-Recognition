@@ -1,8 +1,6 @@
-# ==================== STANDARD LIBRARY IMPORTS ====================
 import tkinter as tk
 from tkinter import ttk, messagebox
 import cv2
-import os
 import threading
 from queue import Queue, Empty
 from multiprocessing import Process, Queue as MPQueue, Event as MPEvent
@@ -47,8 +45,21 @@ logger = logging.getLogger('DoorEntry')
 # ==================== OPTIONAL DEPENDENCIES ====================
 # InsightFace: Required for face detection and recognition
 try:
+    # Suppress FutureWarnings from insightface (rcond and estimate deprecation)
+    import warnings
+    warnings.filterwarnings('ignore', category=FutureWarning, module='insightface')
+    warnings.filterwarnings('ignore', category=FutureWarning, module='skimage')
+    
     from insightface.app import FaceAnalysis
     import insightface
+    
+    # Get available ONNX Runtime providers (avoid CUDA warning on CPU-only systems)
+    import onnxruntime as ort
+    AVAILABLE_PROVIDERS = ort.get_available_providers()
+    # Prefer CUDA if available, otherwise use CPU
+    ONNX_PROVIDERS = [p for p in ['CUDAExecutionProvider', 'CPUExecutionProvider'] if p in AVAILABLE_PROVIDERS]
+    if not ONNX_PROVIDERS:
+        ONNX_PROVIDERS = ['CPUExecutionProvider']
 except ImportError:
     logger.error("insightface library not found. Please install it with: pip install insightface onnxruntime")
     exit(1)
@@ -1841,10 +1852,10 @@ class FaceRecognitionSystem:
         try:
             self.face_app = FaceAnalysis(
                 name='buffalo_s',  # Lightweight model suitable for edge devices
-                providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+                providers=ONNX_PROVIDERS
             )
             self.face_app.prepare(ctx_id=0, det_size=(640, 640))
-            logger.info("InsightFace model (buffalo_s) loaded successfully")
+            logger.info(f"InsightFace model (buffalo_s) loaded with providers: {ONNX_PROVIDERS}")
         except Exception as e:
             raise RuntimeError(
                 f"Could not load InsightFace model: {e}\n"
