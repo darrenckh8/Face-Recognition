@@ -3875,14 +3875,10 @@ class DoorEntryKiosk:
         # Result storage for blocking mode
         result = {'value': None, 'done': False}
         
-        # Create overlay that covers the entire window
-        overlay = tk.Frame(self.root, bg='#00000088')
+        # Create overlay that covers the entire window (dark semi-opaque background)
+        # Note: Tkinter doesn't support alpha, so we use a solid dark color
+        overlay = tk.Frame(self.root, bg='#333333')
         overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
-        
-        # Create semi-transparent background effect using a dark frame
-        bg_overlay = tk.Frame(overlay, bg='#000000')
-        bg_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
-        bg_overlay.configure(bg='#333333')
         
         # Center dialog card
         dialog_frame = tk.Frame(overlay, bg=Config.COLOR_CARD, padx=25, pady=20)
@@ -4140,13 +4136,19 @@ class DoorEntryKiosk:
         
         def on_ok(event=None):
             password = password_entry.get()
-            cleanup_and_restore()
             if password and verify_password(password, Config.ADMIN_PASSWORD_HASH):
                 logger.info("Admin login successful")
+                cleanup_and_restore()
                 self.show_admin_panel()
             elif password:
                 logger.warning("Failed admin login attempt")
-                self.show_error_dialog("Error", "Invalid password")
+                # Show error inline without leaving login screen
+                password_entry.delete(0, tk.END)
+                # Flash the entry red briefly to indicate error
+                password_entry.config(bg=Config.COLOR_DENIED)
+                self.root.after(150, lambda: password_entry.config(bg=Config.COLOR_BG))
+                self.root.after(300, lambda: password_entry.config(bg=Config.COLOR_DENIED))
+                self.root.after(450, lambda: password_entry.config(bg=Config.COLOR_BG))
         
         def on_cancel(event=None):
             cleanup_and_restore()
