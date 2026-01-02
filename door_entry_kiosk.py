@@ -3342,7 +3342,7 @@ class DoorEntryKiosk:
             
         elif status == "processing":
             # Face detected but still settling
-            self.status_icon_label.config(text="⏳")
+            self.status_icon_label.config(text="◐")
             self.status_text_label.config(text="Processing...")
             self.status_detail_label.config(text="Please wait")
             update_bg(Config.COLOR_CARD, Config.COLOR_WARNING, Config.COLOR_TEXT, Config.COLOR_TEXT_SECONDARY)
@@ -3350,7 +3350,7 @@ class DoorEntryKiosk:
             
         elif status == "awaiting_blink":
             # Liveness check - waiting for blink
-            self.status_icon_label.config(text="👁")
+            self.status_icon_label.config(text="◆")
             self.status_text_label.config(text="Please Blink")
             self.status_detail_label.config(text="Liveness verification required")
             update_bg(Config.COLOR_CARD, Config.COLOR_SCANNING, Config.COLOR_TEXT, Config.COLOR_TEXT_SECONDARY)
