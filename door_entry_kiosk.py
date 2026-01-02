@@ -53,7 +53,6 @@ try:
     warnings.filterwarnings('ignore', category=FutureWarning, module='skimage')
     
     from insightface.app import FaceAnalysis
-    import insightface
     
     # Get available ONNX Runtime providers (avoid CUDA warning on CPU-only systems)
     import onnxruntime as ort
@@ -205,7 +204,7 @@ class Config:
     ENABLE_BLINK_DETECTION = True          # Enable blink-based liveness detection
     EAR_THRESHOLD = 0.30                   # Default Eye Aspect Ratio threshold (fallback during calibration)
     EAR_BLINK_RATIO = 0.40                 # Blink threshold as ratio of person's baseline EAR (0.40 = 40% of open-eye EAR)
-    EAR_CALIBRATION_FRAMES = 10            # Number of frames to collect for baseline calibration (reduced for faster startup)
+    EAR_CALIBRATION_FRAMES = 5            # Number of frames to collect for baseline calibration (reduced for faster startup)
     EAR_MIN_OPEN = 0.20                    # Minimum EAR to consider eyes "open" for calibration
     EAR_BILATERAL_THRESHOLD = 0.05         # Max difference between left/right EAR for valid blink (stricter = less gaze false positives)
     EAR_MIN_DROP = 0.10                    # Minimum sudden drop from recent EAR average to consider a blink (prevents gradual gaze changes)
@@ -353,50 +352,6 @@ class BackupManager:
                 logger.debug(f"Removed old backup: {old_backup}")
             except OSError as e:
                 logger.warning(f"Failed to remove old backup {old_backup}: {e}")
-    
-    @staticmethod
-    def get_latest_backup(file_path: str) -> Optional[str]:
-        """
-        Find the most recent backup file for a given source file.
-        
-        Args:
-            file_path: Path to the original file
-            
-        Returns:
-            Path to the newest backup, or None if no backups exist
-        """
-        import glob
-        base, ext = os.path.splitext(file_path)
-        pattern = f"{base}_backup_*{ext}"
-        backups = sorted(glob.glob(pattern), reverse=True)
-        return backups[0] if backups else None
-    
-    @staticmethod
-    def restore_from_backup(file_path: str, backup_path: str = None) -> bool:
-        """
-        Restore a file from a backup copy.
-        
-        Args:
-            file_path: Destination path to restore to
-            backup_path: Specific backup to use (defaults to most recent)
-            
-        Returns:
-            True if restore succeeded, False otherwise
-        """
-        if backup_path is None:
-            backup_path = BackupManager.get_latest_backup(file_path)
-        
-        if backup_path is None or not os.path.exists(backup_path):
-            logger.error(f"No backup found for {file_path}")
-            return False
-        
-        try:
-            shutil.copy2(backup_path, file_path)
-            logger.info(f"Restored {file_path} from {backup_path}")
-            return True
-        except (OSError, IOError, shutil.Error) as e:
-            logger.error(f"Failed to restore from backup: {e}", exc_info=True)
-            return False
 
 
 # ==================== FACE STABILITY TRACKER ====================
@@ -481,12 +436,6 @@ class FaceStabilityTracker:
         with self.lock:
             self.last_positions.clear()
             self.stable_count.clear()
-    
-    def remove_face(self, face_id: int):
-        """Remove tracking data for a specific face when it leaves view."""
-        with self.lock:
-            self.last_positions.pop(face_id, None)
-            self.stable_count.pop(face_id, None)
 
 
 # ==================== FACE CACHE ====================
@@ -724,13 +673,6 @@ class FaceCache:
             for key in expired_keys:
                 del self.cache[key]
             return len(expired_keys)
-    
-    def get_all_active(self) -> List[Dict[str, Any]]:
-        """Get all non-expired cached entries for display purposes."""
-        now = time.time()
-        with self.lock:
-            return [entry.copy() for entry in self.cache.values() 
-                    if now - entry['timestamp'] <= self.ttl]
 
 
 # ==================== HARDWARE ABSTRACTION LAYER ====================
@@ -1000,14 +942,6 @@ class AccessLog:
         """Property to access cache (for backward compatibility)."""
         return self._cache
     
-    def load(self) -> None:
-        """Reload cache from database (for backward compatibility)."""
-        self._load_cache()
-    
-    def save(self) -> None:
-        """No-op for backward compatibility - SQLite writes are immediate."""
-        pass
-    
     def add_entry(self, name: str, access_granted: bool, confidence: float = 0.0) -> Dict[str, Any]:
         """
         Record a new access event atomically to SQLite.
@@ -1159,80 +1093,6 @@ class AccessLog:
         except sqlite3.Error as e:
             logger.error(f"Failed to get paginated entries: {e}")
             return [], 0, 1
-    
-    def get_filtered(self, date_from: Optional[Any] = None, date_to: Optional[Any] = None, 
-                     name_filter: Optional[str] = None, count: int = 100) -> List[Dict[str, Any]]:
-        """
-        Query log entries with optional filters using SQL.
-        
-        Args:
-            date_from: Earliest date to include (inclusive)
-            date_to: Latest date to include (inclusive)
-            name_filter: Partial name match (case-insensitive)
-            count: Maximum entries to return
-            
-        Returns:
-            List of matching entries in reverse chronological order
-        """
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            
-            # Build WHERE clause dynamically
-            conditions = []
-            params: List[Any] = []
-            
-            if date_from:
-                conditions.append("date(timestamp) >= ?")
-                params.append(date_from.isoformat() if hasattr(date_from, 'isoformat') else str(date_from))
-            
-            if date_to:
-                conditions.append("date(timestamp) <= ?")
-                params.append(date_to.isoformat() if hasattr(date_to, 'isoformat') else str(date_to))
-            
-            if name_filter:
-                conditions.append("name LIKE ?")
-                params.append(f"%{name_filter}%")
-            
-            where_clause = " AND ".join(conditions) if conditions else "1=1"
-            
-            cursor.execute(f"""
-                SELECT timestamp, name, access_granted, confidence 
-                FROM access_log 
-                WHERE {where_clause}
-                ORDER BY timestamp DESC 
-                LIMIT ?
-            """, params + [count])
-            
-            rows = cursor.fetchall()
-            conn.close()
-            
-            return [
-                {
-                    "timestamp": row["timestamp"],
-                    "name": row["name"],
-                    "access_granted": bool(row["access_granted"]),
-                    "confidence": row["confidence"]
-                }
-                for row in rows
-            ]
-            
-        except sqlite3.Error as e:
-            logger.error(f"Failed to get filtered entries: {e}")
-            return []
-    
-    def get_unique_names(self) -> List[str]:
-        """Get sorted list of all unique names in the access log."""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT name FROM access_log ORDER BY name")
-            names = [row[0] for row in cursor.fetchall()]
-            conn.close()
-            return names
-        except sqlite3.Error as e:
-            logger.error(f"Failed to get unique names: {e}")
-            return sorted(set(entry['name'] for entry in self._cache))
     
     def get_total_count(self) -> int:
         """Get total number of log entries in database."""
@@ -1870,28 +1730,12 @@ class BlinkDetector:
             logger.error(f"Blink detection error: {e}")
             return False, state['blink_count'], state['last_ear'], state['awaiting_blink']
     
-    def reset_face(self, bbox: Tuple[int, int, int, int]) -> None:
-        """Reset tracking state for a specific face."""
-        face_id = self._get_face_id(bbox)
-        if face_id in self._tracking:
-            del self._tracking[face_id]
-    
     def is_calibrated(self, bbox: Tuple[int, int, int, int], name: Optional[str] = None) -> bool:
         """Check if calibration is complete for a face."""
         face_id = self._get_face_id(bbox, name)
         if face_id in self._tracking:
             return self._tracking[face_id].get('baseline_ear') is not None
         return False
-    
-    def cleanup_stale(self, max_age_seconds: float = 10.0) -> None:
-        """Remove tracking state for faces not seen recently."""
-        now = time.time()
-        stale_ids = [
-            fid for fid, state in self._tracking.items()
-            if now - state.get('last_seen', state['start_time']) > max_age_seconds
-        ]
-        for fid in stale_ids:
-            del self._tracking[fid]
     
     def close(self) -> None:
         """Release MediaPipe resources."""
