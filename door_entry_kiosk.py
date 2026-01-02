@@ -207,7 +207,8 @@ class Config:
     EAR_BLINK_RATIO = 0.60                 # Blink threshold as ratio of person's baseline EAR (0.60 = 60% of open-eye EAR)
     EAR_CALIBRATION_FRAMES = 35            # Number of frames to collect for baseline calibration
     EAR_MIN_OPEN = 0.20                    # Minimum EAR to consider eyes "open" for calibration
-    EAR_BILATERAL_THRESHOLD = 0.08         # Max difference between left/right EAR for valid blink (prevents gaze triggering)
+    EAR_BILATERAL_THRESHOLD = 0.05         # Max difference between left/right EAR for valid blink (stricter = less gaze false positives)
+    EAR_MIN_DROP = 0.06                    # Minimum sudden drop from recent EAR average to consider a blink (prevents gradual gaze changes)
     BLINK_CONSEC_FRAMES = 2                # Consecutive frames below threshold to count as blink
     BLINK_REQUIRED_COUNT = 1               # Number of blinks required to pass liveness
     BLINK_TIMEOUT_SECONDS = 5.0            # Time window to detect required blinks
@@ -1706,7 +1707,8 @@ class BlinkDetector:
                 'threshold': None,        # Personalized blink threshold
                 # Blink cycle tracking
                 'blink_in_progress': False,  # True when eyes are closed (waiting for open)
-                'recent_ears': []         # Recent EAR values for gaze filtering
+                'recent_ears': [],        # Recent EAR values for gaze filtering
+                'pre_blink_ear': None     # EAR value just before blink started (to verify sudden drop)
             }
         
         state = self._tracking[face_id]
@@ -1807,11 +1809,28 @@ class BlinkDetector:
                 blink_threshold = Config.EAR_THRESHOLD
             
             # Blink detection with complete cycle verification:
-            # 1. Eyes must close bilaterally (both eyes, symmetric)
-            # 2. Must stay closed for consecutive frames
-            # 3. Must open again to count as complete blink
+            # 1. BOTH eyes must be individually below threshold (not just average)
+            # 2. Eyes must close bilaterally (symmetric)
+            # 3. Must be a sudden drop from recent EAR (gaze is gradual, blink is fast)
+            # 4. Must stay closed for consecutive frames
+            # 5. Must open again to count as complete blink
             
-            eyes_closed = avg_ear < blink_threshold and is_bilateral
+            # Calculate individual eye thresholds
+            individual_threshold = blink_threshold * 1.1  # Slightly higher for individual check
+            both_eyes_closed = left_ear < individual_threshold and right_ear < individual_threshold
+            
+            # Calculate recent average EAR (excluding current frame) for sudden drop detection
+            if len(state['recent_ears']) >= 3:
+                recent_avg = sum(state['recent_ears'][:-1]) / len(state['recent_ears'][:-1])
+            else:
+                recent_avg = state['baseline_ear'] if state['baseline_ear'] else 0.35
+            
+            # Check for sudden drop (blink is fast, gaze is gradual)
+            ear_drop = recent_avg - avg_ear
+            is_sudden_drop = ear_drop >= Config.EAR_MIN_DROP
+            
+            eyes_closed = both_eyes_closed and is_bilateral and (is_sudden_drop or state['blink_in_progress'])
+            
             # Eyes open = 80% of calibrated baseline (or fallback if not calibrated)
             open_threshold = state['baseline_ear'] * 0.80 if state['baseline_ear'] else blink_threshold * 1.2
             eyes_open = avg_ear >= open_threshold
@@ -1823,6 +1842,7 @@ class BlinkDetector:
                     if state['consec_frames'] >= Config.BLINK_CONSEC_FRAMES:
                         # Eyes have been closed long enough - blink in progress
                         state['blink_in_progress'] = True
+                        state['pre_blink_ear'] = recent_avg  # Store for verification
                 else:
                     state['consec_frames'] = 0
             else:
