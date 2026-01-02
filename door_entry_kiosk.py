@@ -204,10 +204,11 @@ class Config:
     # ----- Liveness Detection (Blink) -----
     ENABLE_BLINK_DETECTION = True          # Enable blink-based liveness detection
     EAR_THRESHOLD = 0.30                   # Default Eye Aspect Ratio threshold (fallback during calibration)
-    EAR_BLINK_RATIO = 0.60                 # Blink threshold as ratio of person's baseline EAR (0.75 = 75% of open-eye EAR)
+    EAR_BLINK_RATIO = 0.60                 # Blink threshold as ratio of person's baseline EAR (0.60 = 60% of open-eye EAR)
     EAR_CALIBRATION_FRAMES = 35            # Number of frames to collect for baseline calibration
     EAR_MIN_OPEN = 0.20                    # Minimum EAR to consider eyes "open" for calibration
-    BLINK_CONSEC_FRAMES = 2                # Consecutive frames below threshold to count as blink (1 = most responsive)
+    EAR_BILATERAL_THRESHOLD = 0.08         # Max difference between left/right EAR for valid blink (prevents gaze triggering)
+    BLINK_CONSEC_FRAMES = 2                # Consecutive frames below threshold to count as blink
     BLINK_REQUIRED_COUNT = 1               # Number of blinks required to pass liveness
     BLINK_TIMEOUT_SECONDS = 5.0            # Time window to detect required blinks
     
@@ -1702,7 +1703,10 @@ class BlinkDetector:
                 # Per-person calibration
                 'ear_samples': [],        # Collected EAR samples for baseline
                 'baseline_ear': None,     # Calibrated baseline EAR (eyes open)
-                'threshold': None         # Personalized blink threshold
+                'threshold': None,        # Personalized blink threshold
+                # Blink cycle tracking
+                'blink_in_progress': False,  # True when eyes are closed (waiting for open)
+                'recent_ears': []         # Recent EAR values for gaze filtering
             }
         
         state = self._tracking[face_id]
@@ -1769,10 +1773,20 @@ class BlinkDetector:
             avg_ear = (left_ear + right_ear) / 2.0
             state['last_ear'] = avg_ear
             
+            # Track recent EAR values for stability
+            state['recent_ears'].append(avg_ear)
+            if len(state['recent_ears']) > 10:
+                state['recent_ears'].pop(0)
+            
+            # Check bilateral symmetry - both eyes should close together for a real blink
+            # Looking sideways causes asymmetric EAR values
+            ear_difference = abs(left_ear - right_ear)
+            is_bilateral = ear_difference <= Config.EAR_BILATERAL_THRESHOLD
+            
             # Per-person calibration: collect baseline EAR samples when eyes are open
             if state['baseline_ear'] is None:
-                # Still calibrating - collect samples of open-eye EAR
-                if avg_ear >= Config.EAR_MIN_OPEN:
+                # Still calibrating - collect samples of open-eye EAR (only when bilateral/symmetric)
+                if avg_ear >= Config.EAR_MIN_OPEN and is_bilateral:
                     state['ear_samples'].append(avg_ear)
                     
                     if len(state['ear_samples']) >= Config.EAR_CALIBRATION_FRAMES:
@@ -1792,15 +1806,36 @@ class BlinkDetector:
                 # Still calibrating or calibration failed - use default
                 blink_threshold = Config.EAR_THRESHOLD
             
-            # Check for blink (EAR below personalized threshold)
-            if avg_ear < blink_threshold:
-                state['consec_frames'] += 1
+            # Blink detection with complete cycle verification:
+            # 1. Eyes must close bilaterally (both eyes, symmetric)
+            # 2. Must stay closed for consecutive frames
+            # 3. Must open again to count as complete blink
+            
+            eyes_closed = avg_ear < blink_threshold and is_bilateral
+            # Eyes open = 80% of calibrated baseline (or fallback if not calibrated)
+            open_threshold = state['baseline_ear'] * 0.80 if state['baseline_ear'] else blink_threshold * 1.2
+            eyes_open = avg_ear >= open_threshold
+            
+            if not state['blink_in_progress']:
+                # Waiting for eyes to close
+                if eyes_closed:
+                    state['consec_frames'] += 1
+                    if state['consec_frames'] >= Config.BLINK_CONSEC_FRAMES:
+                        # Eyes have been closed long enough - blink in progress
+                        state['blink_in_progress'] = True
+                else:
+                    state['consec_frames'] = 0
             else:
-                # If we had enough consecutive low-EAR frames, count it as a blink
-                if state['consec_frames'] >= Config.BLINK_CONSEC_FRAMES:
+                # Blink in progress - waiting for eyes to open again
+                if eyes_open:
+                    # Complete blink cycle detected!
                     state['blink_count'] += 1
+                    state['blink_in_progress'] = False
+                    state['consec_frames'] = 0
                     logger.info(f"Blink detected for {face_id}, count: {state['blink_count']}")
-                state['consec_frames'] = 0
+                elif not eyes_closed:
+                    # Eyes partially open but not fully - still waiting
+                    pass
             
             # Check if liveness passed
             if state['blink_count'] >= Config.BLINK_REQUIRED_COUNT:
