@@ -23,6 +23,7 @@ Cython                 3.2.3
 dbus-python            1.3.2
 distro                 1.8.0
 easydict               1.13
+faiss-cpu              1.8.0.post1
 Flask                  2.2.2
 flatbuffers            20181003210633
 fonttools              4.61.1
