@@ -204,8 +204,8 @@ class Config:
     # ----- Liveness Detection (Blink) -----
     ENABLE_BLINK_DETECTION = True          # Enable blink-based liveness detection
     EAR_THRESHOLD = 0.30                   # Default Eye Aspect Ratio threshold (fallback during calibration)
-    EAR_BLINK_RATIO = 0.40                 # Blink threshold as ratio of person's baseline EAR (0.60 = 60% of open-eye EAR)
-    EAR_CALIBRATION_FRAMES = 30            # Number of frames to collect for baseline calibration
+    EAR_BLINK_RATIO = 0.40                 # Blink threshold as ratio of person's baseline EAR (0.40 = 40% of open-eye EAR)
+    EAR_CALIBRATION_FRAMES = 10            # Number of frames to collect for baseline calibration (reduced for faster startup)
     EAR_MIN_OPEN = 0.20                    # Minimum EAR to consider eyes "open" for calibration
     EAR_BILATERAL_THRESHOLD = 0.05         # Max difference between left/right EAR for valid blink (stricter = less gaze false positives)
     EAR_MIN_DROP = 0.10                    # Minimum sudden drop from recent EAR average to consider a blink (prevents gradual gaze changes)
@@ -1876,6 +1876,13 @@ class BlinkDetector:
         if face_id in self._tracking:
             del self._tracking[face_id]
     
+    def is_calibrated(self, bbox: Tuple[int, int, int, int], name: Optional[str] = None) -> bool:
+        """Check if calibration is complete for a face."""
+        face_id = self._get_face_id(bbox, name)
+        if face_id in self._tracking:
+            return self._tracking[face_id].get('baseline_ear') is not None
+        return False
+    
     def cleanup_stale(self, max_age_seconds: float = 10.0) -> None:
         """Remove tracking state for faces not seen recently."""
         now = time.time()
@@ -3531,7 +3538,7 @@ class DoorEntryKiosk:
                                 )
                                 
                                 if liveness_passed:
-                                    # Blink detected! Record verification and grant access
+                                    # Blink detected! Record verification and grant access immediately
                                     now = time.time()
                                     name = self.awaiting_blink_name
                                     
@@ -3551,8 +3558,8 @@ class DoorEntryKiosk:
                                     
                                     if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
                                         self.last_access[name] = now
-                                        # Use high confidence since they were already recognized
-                                        self.root.after(0, lambda n=name: self.grant_access(n, 0.95))
+                                        # Grant access immediately - don't wait for next UI cycle
+                                        self.root.after_idle(lambda n=name: self.grant_access(n, 0.95))
                                 # else: keep waiting for blink, status already shows "Please Blink"
                             else:
                                 # Face disappeared - exit blink mode and return to scanning
@@ -3573,6 +3580,18 @@ class DoorEntryKiosk:
                         is_idle = self.no_face_frames >= self.idle_threshold_frames
                         _, results = self.face_system.recognize_faces(frame, idle_mode=is_idle)
                         self.faces_detected = len(results)
+                        
+                        # Pre-calibrate blink detection on any detected face (before recognition completes)
+                        # This eliminates calibration delay when entering blink mode
+                        if self.face_system.blink_detector and self.face_system.blink_detector.available:
+                            for result in results:
+                                location = result.get('location', (0, 0, 0, 0))
+                                if location != (0, 0, 0, 0):
+                                    top, right, bottom, left = location
+                                    bbox = (left, top, right, bottom)
+                                    # Call check_blink just for calibration - ignore result
+                                    # Use a generic face_id during scanning, will be replaced with name later
+                                    self.face_system.blink_detector.check_blink(frame, bbox, result.get('name'))
                         
                         # Track if any face is awaiting blink verification
                         any_awaiting_blink = False
@@ -3598,8 +3617,14 @@ class DoorEntryKiosk:
                                 if self.face_system.blink_detector and self.face_system.blink_detector.available:
                                     top, right, bottom, left = location
                                     bbox = (left, top, right, bottom)
+                                    
+                                    # Check if calibration is complete before requesting blink
+                                    is_calibrated = self.face_system.blink_detector.is_calibrated(bbox, name)
+                                    
                                     liveness_passed, _, _, awaiting = self.face_system.blink_detector.check_blink(frame, bbox, name)
-                                    if not liveness_passed and awaiting:
+                                    
+                                    # Only show "Please Blink" after calibration is complete
+                                    if not liveness_passed and awaiting and is_calibrated:
                                         any_awaiting_blink = True
                                         pending_blink_name = name
                                         pending_blink_location = location
