@@ -4592,7 +4592,7 @@ class DoorEntryKiosk:
         self.users_total_count = 0
         self.users_all_items = []  # Cache of all user items for pagination
         
-        # Header with title and refresh button
+        # Header with title (auto-refreshes on tab switch)
         header = tk.Frame(parent, bg=Config.COLOR_BG)
         header.pack(fill=tk.X, padx=10, pady=(10, 5))
         
@@ -4603,18 +4603,6 @@ class DoorEntryKiosk:
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_BG
         ).pack(side=tk.LEFT)
-        
-        tk.Button(
-            header,
-            text="Refresh",
-            font=(Config.FONT_FAMILY, 9),
-            fg=Config.COLOR_SCANNING,
-            bg=Config.COLOR_BG,
-            activeforeground=Config.COLOR_SCANNING,
-            bd=0,
-            cursor="hand2",
-            command=self.refresh_manage_list
-        ).pack(side=tk.RIGHT)
         
         # User list container
         card = tk.Frame(parent, bg=Config.COLOR_CARD, highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
@@ -5184,6 +5172,7 @@ class DoorEntryKiosk:
         self.auto_capture_mode = False
         self.zone_captures = {'center': 0, 'left': 0, 'right': 0, 'up': 0, 'down': 0}
         self.reg_process_locked = True  # Lock tab navigation during registration
+        self.already_trained = False  # Reset for new registration
         
         # Transition UI from setup panel to capture panel
         self.reg_setup_panel.pack_forget()
