@@ -5,7 +5,6 @@ import cv2
 import os
 import threading
 from queue import Queue, Empty
-import multiprocessing as mp
 from multiprocessing import Process, Queue as MPQueue, Event as MPEvent
 import time
 from datetime import datetime
