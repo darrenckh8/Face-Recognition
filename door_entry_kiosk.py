@@ -1701,16 +1701,9 @@ class BlinkDetector:
         state = self._tracking[face_id]
         state['last_seen'] = now  # Update last seen time
         
-        # Already passed liveness - stay passed until timeout
-        if state['passed']:
-            # Reset passed state after cooldown (allow re-verification for next access)
-            if now - state['start_time'] > Config.COOLDOWN_SECONDS + 2.0:
-                state['passed'] = False
-                state['blink_count'] = 0
-                state['start_time'] = now
-                state['awaiting_blink'] = True
-            else:
-                return True, state['blink_count'], state['last_ear'], False
+        # Note: We no longer cache 'passed' state here - blink verification is tracked
+        # at the app level in self.blink_verified to ensure each access attempt 
+        # requires a fresh blink verification
         
         # Check timeout for blink detection window
         if now - state['start_time'] > Config.BLINK_TIMEOUT_SECONDS:
@@ -1781,7 +1774,7 @@ class BlinkDetector:
             
             # Check if liveness passed
             if state['blink_count'] >= Config.BLINK_REQUIRED_COUNT:
-                state['passed'] = True
+                # Don't cache 'passed' state - let the app level handle it
                 state['awaiting_blink'] = False
                 logger.info(f"Liveness verified for {face_id} ({state['blink_count']} blinks)")
                 return True, state['blink_count'], avg_ear, False
@@ -3040,6 +3033,7 @@ class DoorEntryKiosk:
         self.camera_thread = None
         self.current_status = "scanning"  # States: scanning, granted, denied
         self.status_message = ""
+        self.status_set_time = 0  # Timestamp when status was set (to protect granted/denied)
         self.last_access = {}  # Cooldown tracking per person
         self.admin_mode = False
         
@@ -3047,6 +3041,11 @@ class DoorEntryKiosk:
         self.awaiting_blink_mode = False
         self.awaiting_blink_name = None  # Name of person awaiting blink verification
         self.awaiting_blink_location = None  # Last known face location
+        
+        # Track who has verified blink for current access attempt
+        # Key: name, Value: timestamp when blink was verified
+        # This prevents granting access without blink verification
+        self.blink_verified = {}  # {name: verification_timestamp}
         
         # ========== Registration State ==========
         self.registration_mode = False
@@ -3319,6 +3318,7 @@ class DoorEntryKiosk:
             confidence: Recognition confidence for display
         """
         self.current_status = status
+        self.status_set_time = time.time()  # Record when status was set
         
         # Cancel any pending status reset
         if hasattr(self, '_status_reset_id') and self._status_reset_id:
@@ -3446,12 +3446,23 @@ class DoorEntryKiosk:
                                 )
                                 
                                 if liveness_passed:
-                                    # Blink detected! Grant access and exit blink mode
+                                    # Blink detected! Record verification and grant access
                                     now = time.time()
                                     name = self.awaiting_blink_name
+                                    
+                                    # Record blink verification timestamp
+                                    self.blink_verified[name] = now
+                                    
+                                    # Exit blink mode
                                     self.awaiting_blink_mode = False
                                     self.awaiting_blink_name = None
                                     self.awaiting_blink_location = None
+                                    
+                                    # Reset blink detector state for this person so next time requires fresh blink
+                                    if self.face_system.blink_detector:
+                                        face_id = f"name_{name}"
+                                        if face_id in self.face_system.blink_detector._tracking:
+                                            del self.face_system.blink_detector._tracking[face_id]
                                     
                                     if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
                                         self.last_access[name] = now
@@ -3464,6 +3475,12 @@ class DoorEntryKiosk:
                                 self.awaiting_blink_name = None
                                 self.awaiting_blink_location = None
                                 self.root.after(0, self._set_status_scanning)
+                        
+                        # Clean up stale blink verifications (older than 5 seconds)
+                        now = time.time()
+                        stale_blinks = [n for n, t in self.blink_verified.items() if now - t > 5.0]
+                        for n in stale_blinks:
+                            del self.blink_verified[n]
                     
                     else:
                         # ========== NORMAL RECOGNITION MODE ==========
@@ -3488,6 +3505,11 @@ class DoorEntryKiosk:
                                 continue
                             
                             if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
+                                # Skip blink check if person is within cooldown - they already passed
+                                now = time.time()
+                                if name in self.last_access and (now - self.last_access[name]) <= Config.COOLDOWN_SECONDS:
+                                    continue  # Still in cooldown, don't request blink
+                                
                                 if self.face_system.blink_detector and self.face_system.blink_detector.available:
                                     top, right, bottom, left = location
                                     bbox = (left, top, right, bottom)
@@ -3511,14 +3533,19 @@ class DoorEntryKiosk:
                             any_unstable = any(not r.get('is_stable', True) for r in results)
                             any_stable = any(r.get('is_stable', True) for r in results)
                             
-                            # Update UI status based on face detection
-                            if len(results) > 0 and self.current_status not in ("granted", "denied"):
-                                if any_unstable and not any_stable:
-                                    self.root.after(0, lambda: self.set_status("processing"))
-                                else:
-                                    self.root.after(0, self._set_status_active_scanning)
-                            elif len(results) == 0 and self.current_status in ("active_scanning", "processing", "awaiting_blink"):
-                                self.root.after(0, self._set_status_scanning)
+                            # Protect granted/denied status from being overwritten too quickly
+                            status_age = time.time() - self.status_set_time
+                            status_protected = self.current_status in ("granted", "denied") and status_age < 2.0
+                            
+                            # Update UI status based on face detection (only if not protected)
+                            if not status_protected:
+                                if len(results) > 0 and self.current_status not in ("granted", "denied"):
+                                    if any_unstable and not any_stable:
+                                        self.root.after(0, lambda: self.set_status("processing"))
+                                    else:
+                                        self.root.after(0, self._set_status_active_scanning)
+                                elif len(results) == 0 and self.current_status in ("active_scanning", "processing", "awaiting_blink"):
+                                    self.root.after(0, self._set_status_scanning)
                         
                         # Process each recognized face (only if not in blink-waiting mode)
                         if not any_awaiting_blink:
@@ -3535,12 +3562,32 @@ class DoorEntryKiosk:
                                 
                                 # Handle recognized faces
                                 if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
-                                    # Blink already passed if we're here (checked in first pass)
                                     now = time.time()
-                                    # Apply cooldown to prevent duplicate logs
-                                    if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
-                                        self.last_access[name] = now
-                                        self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
+                                    
+                                    # Check if this is a new access attempt (past cooldown)
+                                    is_new_access_attempt = (name not in self.last_access or 
+                                                             (now - self.last_access[name]) > Config.COOLDOWN_SECONDS)
+                                    
+                                    if is_new_access_attempt:
+                                        # For new access attempts, require blink verification
+                                        if self.face_system.blink_detector and self.face_system.blink_detector.available and Config.ENABLE_BLINK_DETECTION:
+                                            # Check if they have a valid (recent) blink verification
+                                            blink_time = self.blink_verified.get(name, 0)
+                                            blink_valid = (now - blink_time) < 3.0  # Blink must be within 3 seconds
+                                            
+                                            if blink_valid:
+                                                # Blink was verified recently, grant access
+                                                self.last_access[name] = now
+                                                # Clear blink verification so next access requires new blink
+                                                if name in self.blink_verified:
+                                                    del self.blink_verified[name]
+                                                self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
+                                            # else: awaiting blink - handled by first pass that sets awaiting_blink_mode
+                                        else:
+                                            # Blink detection disabled, grant access directly
+                                            self.last_access[name] = now
+                                            self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
+                                    # else: still in cooldown, don't grant again
                                 else:
                                     # Log unknown faces (with cooldown)
                                     if name == "Unknown" and self.current_status in ("scanning", "active_scanning") and not from_cache:
