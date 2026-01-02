@@ -1,6 +1,8 @@
+# ==================== STANDARD LIBRARY IMPORTS ====================
 import tkinter as tk
 from tkinter import ttk, messagebox
 import cv2
+import os
 import threading
 from queue import Queue, Empty
 from multiprocessing import Process, Queue as MPQueue, Event as MPEvent
