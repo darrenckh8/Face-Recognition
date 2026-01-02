@@ -5,21 +5,17 @@ import cv2
 import os
 import threading
 from queue import Queue, Empty
-import multiprocessing as mp
-from multiprocessing import Process, Queue as MPQueue, Event as MPEvent
 import time
 from datetime import datetime
 import pickle
 import numpy as np
 from PIL import Image, ImageTk
 import json
-import sqlite3
 import gc
 import hashlib
 import logging
 import shutil
-from typing import Optional, List, Tuple, Dict, Any, Callable
-from abc import ABC, abstractmethod
+from typing import Optional, List, Tuple, Dict, Any
 
 # ==================== LOGGING CONFIGURATION ====================
 # Configure application-wide logging with timestamp and level information
@@ -56,16 +52,6 @@ try:
     logger.info("RPi.GPIO available - Door control enabled")
 except ImportError:
     USE_GPIO = False
-
-# FAISS: Optional - enables fast vector similarity search for large user databases
-USE_FAISS = False
-try:
-    import faiss
-    USE_FAISS = True
-    logger.info("FAISS available - Fast vector search enabled")
-except ImportError:
-    USE_FAISS = False
-    logger.info("FAISS not available - using linear search (install with: pip install faiss-cpu)")
 
 
 # ==================== SECURITY UTILITIES ====================
@@ -129,28 +115,10 @@ class Config:
     USE_FAST_DETECTION = False            # Use Haar cascade (faster but less accurate)
     EMBEDDING_CACHE_THRESHOLD = 0.6       # Similarity threshold for cache matching
     
-    # ----- Power/Compute Optimization -----
-    IDLE_FPS = 10                          # Lower frame rate when no faces detected
-    ACTIVE_FPS = 30                        # Higher frame rate when faces detected
-    IDLE_RECOGNITION_INTERVAL = 4          # Process every Nth frame when idle (less frequent)
-    CAPTURE_THREAD_SLEEP_MS = 5            # Milliseconds to sleep between captures (reduce CPU spin)
-    GC_INTERVAL_SECONDS = 120              # Garbage collection interval (seconds)
-    USE_MULTIPROCESSING = True             # Use separate process for recognition (bypasses GIL)
-    FAISS_INDEX_THRESHOLD = 50             # Use FAISS index when user count exceeds this
-    
-    # ----- Liveness Detection (Anti-Spoofing) -----
-    LIVENESS_ENABLED = True                # Require blink to confirm liveness
-    LIVENESS_EAR_THRESHOLD = 0.21          # Eye Aspect Ratio below this = eye closed
-    LIVENESS_BLINK_FRAMES = 2              # Consecutive frames with closed eyes = blink
-    LIVENESS_TIMEOUT_SECONDS = 10.0        # Time allowed to complete liveness check
-    LIVENESS_COOLDOWN_SECONDS = 30.0       # Cooldown before requiring liveness again for same person
-    
     # ----- Memory Management Settings -----
     MAX_CACHE_ENTRIES = 20  # Maximum faces to keep in cache
     ACCESS_LOG_MAX_MEMORY_ENTRIES = 1000  # Max entries to keep in memory (older are on disk only)
     FRAME_POOL_SIZE = 3  # Number of pre-allocated frames for recognition queue
-    LOG_PAGE_SIZE = 50  # Number of log entries per page in admin panel
-    USERS_PAGE_SIZE = 20  # Number of users per page in admin panel
     
     # Door Control (GPIO Pin for Raspberry Pi)
     DOOR_RELAY_PIN = 17
@@ -160,7 +128,7 @@ class Config:
     DATASET_PATH = "dataset"
     ENCODINGS_PATH = "encodings.pickle"
     DISABLED_ENCODINGS_PATH = "disabled_encodings.pickle"  # Revoked users stored here
-    ACCESS_LOG_PATH = "access_log.db"  # SQLite database for atomic writes
+    ACCESS_LOG_PATH = "access_log.json"
     
     # Apple-like Clean Design Colors
     COLOR_GRANTED = "#34C759"    # Apple Green
@@ -264,8 +232,8 @@ class BackupManager:
             BackupManager._cleanup_old_backups(base, ext, max_backups)
             
             return backup_path
-        except (OSError, IOError, shutil.Error) as e:
-            logger.error(f"Failed to create backup of {file_path}: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Failed to create backup of {file_path}: {e}")
             return None
     
     @staticmethod
@@ -283,7 +251,7 @@ class BackupManager:
             try:
                 os.remove(old_backup)
                 logger.debug(f"Removed old backup: {old_backup}")
-            except OSError as e:
+            except Exception as e:
                 logger.warning(f"Failed to remove old backup {old_backup}: {e}")
     
     @staticmethod
@@ -326,8 +294,8 @@ class BackupManager:
             shutil.copy2(backup_path, file_path)
             logger.info(f"Restored {file_path} from {backup_path}")
             return True
-        except (OSError, IOError, shutil.Error) as e:
-            logger.error(f"Failed to restore from backup: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Failed to restore from backup: {e}")
             return False
 
 
@@ -419,242 +387,6 @@ class FaceStabilityTracker:
         with self.lock:
             self.last_positions.pop(face_id, None)
             self.stable_count.pop(face_id, None)
-
-
-# ==================== LIVENESS DETECTOR ====================
-class LivenessDetector:
-    """
-    Detects liveness via blink detection to prevent photo-based spoofing.
-    
-    Uses Eye Aspect Ratio (EAR) calculated from InsightFace's 106-point
-    facial landmarks. A blink is detected when EAR drops below threshold
-    for consecutive frames, then returns to normal.
-    
-    Attributes:
-        ear_threshold: EAR value below which eyes are considered closed
-        blink_frames: Consecutive closed-eye frames to register a blink
-    """
-    
-    # Eye landmark indices from InsightFace's 106-point model
-    # Left eye: indices 33-41 (upper) and 42-46 (lower) - 8 contour points total
-    # Right eye: indices 87-95 (upper) and 96-100 (lower) - 8 contour points total
-    LEFT_EYE_INDICES = [33, 34, 35, 36, 37, 42, 43, 44]  # Top and bottom points
-    RIGHT_EYE_INDICES = [87, 88, 89, 90, 91, 96, 97, 98]  # Top and bottom points
-    
-    def __init__(self, ear_threshold: float = None, blink_frames: int = None):
-        """
-        Initialize the liveness detector.
-        
-        Args:
-            ear_threshold: EAR value below which eyes are considered closed
-            blink_frames: Consecutive frames with closed eyes to count as blink
-        """
-        self.ear_threshold = ear_threshold or Config.LIVENESS_EAR_THRESHOLD
-        self.blink_frames = blink_frames or Config.LIVENESS_BLINK_FRAMES
-        self.timeout = Config.LIVENESS_TIMEOUT_SECONDS
-        self.cooldown = Config.LIVENESS_COOLDOWN_SECONDS
-        
-        # Track state per person (by name)
-        self._pending_checks: Dict[str, Dict[str, Any]] = {}  # {name: {start_time, closed_frames, blink_detected}}
-        self._verified: Dict[str, float] = {}  # {name: verification_timestamp}
-        self._lock = threading.Lock()
-    
-    def _calculate_ear(self, eye_landmarks: np.ndarray) -> float:
-        """
-        Calculate Eye Aspect Ratio from landmark points.
-        
-        EAR = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
-        
-        For 8-point eye contour, we approximate using vertical vs horizontal distances.
-        
-        Args:
-            eye_landmarks: Array of (x, y) coordinates for eye contour
-            
-        Returns:
-            Eye aspect ratio (lower = more closed)
-        """
-        if len(eye_landmarks) < 6:
-            return 1.0  # Default to "open" if insufficient points
-        
-        # Use points at roughly: left corner, upper lid center, upper lid, 
-        # right corner, lower lid center, lower lid
-        # For 8-point contour: [0]=left, [2]=upper-mid, [4]=right, [6]=lower-mid
-        
-        # Calculate vertical eye opening (average of two vertical distances)
-        # Upper to lower lid distance
-        vertical_1 = np.linalg.norm(eye_landmarks[1] - eye_landmarks[5])
-        vertical_2 = np.linalg.norm(eye_landmarks[2] - eye_landmarks[6])
-        
-        # Horizontal eye width (corner to corner)
-        horizontal = np.linalg.norm(eye_landmarks[0] - eye_landmarks[4])
-        
-        if horizontal < 1e-6:
-            return 1.0  # Avoid division by zero
-        
-        # EAR formula
-        ear = (vertical_1 + vertical_2) / (2.0 * horizontal)
-        return ear
-    
-    def get_ear_from_face(self, face) -> Tuple[float, float]:
-        """
-        Extract EAR for both eyes from an InsightFace detection result.
-        
-        Args:
-            face: InsightFace Face object with landmark_2d_106 attribute
-            
-        Returns:
-            Tuple of (left_ear, right_ear), or (1.0, 1.0) if landmarks unavailable
-        """
-        # Check for 106-point landmarks
-        landmarks = getattr(face, 'landmark_2d_106', None)
-        if landmarks is None:
-            # Try alternative attribute names
-            landmarks = getattr(face, 'landmark', None)
-        
-        if landmarks is None or len(landmarks) < 100:
-            # Fall back to kps (5-point) - can't calculate EAR properly
-            return 1.0, 1.0
-        
-        try:
-            left_eye = landmarks[self.LEFT_EYE_INDICES]
-            right_eye = landmarks[self.RIGHT_EYE_INDICES]
-            
-            left_ear = self._calculate_ear(left_eye)
-            right_ear = self._calculate_ear(right_eye)
-            
-            return left_ear, right_ear
-        except (IndexError, TypeError):
-            return 1.0, 1.0
-    
-    def is_verified(self, name: str) -> bool:
-        """
-        Check if a person has passed liveness verification recently.
-        
-        Args:
-            name: Person's name
-            
-        Returns:
-            True if verified within cooldown period
-        """
-        if not Config.LIVENESS_ENABLED:
-            return True  # Liveness disabled, always verified
-        
-        with self._lock:
-            if name in self._verified:
-                elapsed = time.time() - self._verified[name]
-                if elapsed < self.cooldown:
-                    return True
-                else:
-                    # Verification expired
-                    del self._verified[name]
-            return False
-    
-    def start_check(self, name: str) -> None:
-        """
-        Start a liveness check for a recognized person.
-        
-        Args:
-            name: Person's name
-        """
-        if not Config.LIVENESS_ENABLED:
-            return
-        
-        with self._lock:
-            if name not in self._pending_checks:
-                self._pending_checks[name] = {
-                    'start_time': time.time(),
-                    'closed_frames': 0,
-                    'was_closed': False,
-                    'blink_detected': False
-                }
-                logger.debug(f"Started liveness check for {name}")
-    
-    def update_check(self, name: str, left_ear: float, right_ear: float) -> str:
-        """
-        Update liveness check with new EAR values.
-        
-        Args:
-            name: Person's name
-            left_ear: Left eye aspect ratio
-            right_ear: Right eye aspect ratio
-            
-        Returns:
-            Status string: 'pending', 'verified', 'timeout', or 'not_started'
-        """
-        if not Config.LIVENESS_ENABLED:
-            return 'verified'
-        
-        with self._lock:
-            if name not in self._pending_checks:
-                return 'not_started'
-            
-            check = self._pending_checks[name]
-            
-            # Check timeout
-            elapsed = time.time() - check['start_time']
-            if elapsed > self.timeout:
-                del self._pending_checks[name]
-                logger.debug(f"Liveness check timed out for {name}")
-                return 'timeout'
-            
-            # Average EAR from both eyes
-            avg_ear = (left_ear + right_ear) / 2.0
-            
-            # Detect blink: eyes must close then reopen
-            if avg_ear < self.ear_threshold:
-                check['closed_frames'] += 1
-                if check['closed_frames'] >= self.blink_frames:
-                    check['was_closed'] = True
-            else:
-                # Eyes are open
-                if check['was_closed']:
-                    # Blink completed (was closed, now open)
-                    check['blink_detected'] = True
-                check['closed_frames'] = 0
-            
-            if check['blink_detected']:
-                # Verification successful
-                self._verified[name] = time.time()
-                del self._pending_checks[name]
-                logger.info(f"Liveness verified for {name} (blink detected)")
-                return 'verified'
-            
-            return 'pending'
-    
-    def cancel_check(self, name: str) -> None:
-        """Cancel an ongoing liveness check."""
-        with self._lock:
-            self._pending_checks.pop(name, None)
-    
-    def get_pending_names(self) -> List[str]:
-        """Get list of names with pending liveness checks."""
-        with self._lock:
-            return list(self._pending_checks.keys())
-    
-    def clear_expired(self) -> None:
-        """Remove expired verification records."""
-        now = time.time()
-        with self._lock:
-            expired = [
-                name for name, ts in self._verified.items()
-                if now - ts > self.cooldown
-            ]
-            for name in expired:
-                del self._verified[name]
-            
-            # Also clear timed-out pending checks
-            timed_out = [
-                name for name, check in self._pending_checks.items()
-                if now - check['start_time'] > self.timeout
-            ]
-            for name in timed_out:
-                del self._pending_checks[name]
-    
-    def reset(self) -> None:
-        """Clear all liveness tracking state."""
-        with self._lock:
-            self._pending_checks.clear()
-            self._verified.clear()
 
 
 # ==================== FACE CACHE ====================
@@ -901,152 +633,27 @@ class FaceCache:
                     if now - entry['timestamp'] <= self.ttl]
 
 
-# ==================== HARDWARE ABSTRACTION LAYER ====================
-class HardwareInterface(ABC):
-    """
-    Abstract base class for hardware control.
-    
-    Provides a clean interface for door control operations,
-    allowing different implementations for real hardware vs simulation.
-    """
-    
-    @abstractmethod
-    def initialize(self) -> None:
-        """Initialize hardware resources."""
-        pass
-    
-    @abstractmethod
-    def unlock_door(self, duration: float) -> None:
-        """Unlock the door for specified duration in seconds."""
-        pass
-    
-    @abstractmethod
-    def is_door_unlocked(self) -> bool:
-        """Check if door is currently unlocked."""
-        pass
-    
-    @abstractmethod
-    def cleanup(self) -> None:
-        """Release hardware resources."""
-        pass
-
-
-class RealHardware(HardwareInterface):
-    """
-    Real GPIO-based hardware control for Raspberry Pi.
-    Controls physical door relay via GPIO pins.
-    """
-    
-    def __init__(self, relay_pin: int = Config.DOOR_RELAY_PIN):
-        self.relay_pin = relay_pin
-        self._is_unlocked = False
-        self._unlock_thread: Optional[threading.Thread] = None
-    
-    def initialize(self) -> None:
-        """Set up GPIO pins for relay control."""
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(self.relay_pin, GPIO.OUT)
-        GPIO.output(self.relay_pin, GPIO.LOW)  # Start locked
-        logger.info(f"GPIO initialized on pin {self.relay_pin}")
-    
-    def unlock_door(self, duration: float) -> None:
-        """Activate relay to unlock door for specified duration."""
-        if self._unlock_thread and self._unlock_thread.is_alive():
-            return
-        
-        self._unlock_thread = threading.Thread(
-            target=self._unlock_sequence, 
-            args=(duration,),
-            daemon=True
-        )
-        self._unlock_thread.start()
-    
-    def _unlock_sequence(self, duration: float) -> None:
-        """Execute timed unlock sequence in separate thread."""
-        self._is_unlocked = True
-        GPIO.output(self.relay_pin, GPIO.HIGH)
-        logger.info(f"Door unlocked for {duration} seconds")
-        
-        time.sleep(duration)
-        
-        GPIO.output(self.relay_pin, GPIO.LOW)
-        self._is_unlocked = False
-        logger.info("Door locked")
-    
-    def is_door_unlocked(self) -> bool:
-        """Return current door lock state."""
-        return self._is_unlocked
-    
-    def cleanup(self) -> None:
-        """Release GPIO resources."""
-        GPIO.cleanup()
-        logger.info("GPIO cleanup complete")
-
-
-class MockHardware(HardwareInterface):
-    """
-    Simulated hardware for development and testing.
-    Logs actions without requiring actual GPIO hardware.
-    """
-    
-    def __init__(self):
-        self._is_unlocked = False
-        self._unlock_thread: Optional[threading.Thread] = None
-    
-    def initialize(self) -> None:
-        """Simulated initialization - just log."""
-        logger.info("Mock hardware initialized (simulation mode)")
-    
-    def unlock_door(self, duration: float) -> None:
-        """Simulate door unlock with timing."""
-        if self._unlock_thread and self._unlock_thread.is_alive():
-            return
-        
-        self._unlock_thread = threading.Thread(
-            target=self._unlock_sequence,
-            args=(duration,),
-            daemon=True
-        )
-        self._unlock_thread.start()
-    
-    def _unlock_sequence(self, duration: float) -> None:
-        """Simulate timed unlock sequence."""
-        self._is_unlocked = True
-        logger.info(f"[SIMULATED] Door unlocked for {duration} seconds")
-        
-        time.sleep(duration)
-        
-        self._is_unlocked = False
-        logger.info("[SIMULATED] Door locked")
-    
-    def is_door_unlocked(self) -> bool:
-        """Return simulated door lock state."""
-        return self._is_unlocked
-    
-    def cleanup(self) -> None:
-        """Simulated cleanup - nothing to release."""
-        logger.info("Mock hardware cleanup complete")
-
-
+# ==================== DOOR CONTROLLER ====================
 class DoorController:
     """
-    High-level door control interface.
+    Controls the physical door lock mechanism.
     
-    Automatically selects RealHardware or MockHardware based on
-    GPIO availability. Provides a consistent API regardless of
-    the underlying hardware implementation.
+    Supports GPIO-based relay control for Raspberry Pi deployments,
+    with automatic fallback to simulation mode on non-Pi systems.
     """
     
     def __init__(self):
-        """Initialize door controller with appropriate hardware backend."""
-        if USE_GPIO:
-            self.hardware: HardwareInterface = RealHardware()
-        else:
-            self.hardware: HardwareInterface = MockHardware()
+        """Initialize door controller and set up GPIO if available."""
+        self.is_unlocked = False
+        self.unlock_thread = None
         
-        self.hardware.initialize()
+        # Configure GPIO for relay control on Raspberry Pi
+        if USE_GPIO:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(Config.DOOR_RELAY_PIN, GPIO.OUT)
+            GPIO.output(Config.DOOR_RELAY_PIN, GPIO.LOW)  # Start locked
     
-    def unlock(self, duration: Optional[float] = None) -> None:
+    def unlock(self, duration=None):
         """
         Unlock the door for a specified duration.
         
@@ -1055,130 +662,112 @@ class DoorController:
         """
         if duration is None:
             duration = Config.DOOR_UNLOCK_DURATION
-        self.hardware.unlock_door(duration)
+        
+        # Prevent overlapping unlock operations
+        if self.unlock_thread and self.unlock_thread.is_alive():
+            return
+        
+        self.unlock_thread = threading.Thread(target=self._unlock_sequence, args=(duration,))
+        self.unlock_thread.start()
     
-    @property
-    def is_unlocked(self) -> bool:
-        """Check if door is currently unlocked."""
-        return self.hardware.is_door_unlocked()
+    def _unlock_sequence(self, duration):
+        """
+        Execute the timed unlock sequence.
+        Runs in a separate thread to avoid blocking the main loop.
+        """
+        self.is_unlocked = True
+        
+        if USE_GPIO:
+            GPIO.output(Config.DOOR_RELAY_PIN, GPIO.HIGH)  # Activate relay
+        
+        logger.info(f"Door unlocked for {duration} seconds")
+        time.sleep(duration)
+        
+        if USE_GPIO:
+            GPIO.output(Config.DOOR_RELAY_PIN, GPIO.LOW)  # Deactivate relay
+        
+        self.is_unlocked = False
+        logger.info("Door locked")
     
-    def cleanup(self) -> None:
-        """Release hardware resources on application exit."""
-        self.hardware.cleanup()
+    def cleanup(self):
+        """Release GPIO resources on application exit."""
+        if USE_GPIO:
+            GPIO.cleanup()
 
 
 # ==================== ACCESS LOG ====================
 class AccessLog:
     """
-    Manages access event logging with persistent SQLite storage.
+    Manages access event logging with persistent storage.
     
-    Stores access attempts (granted/denied) with timestamps using SQLite
-    for atomic writes (safe against power loss) and efficient SQL queries.
-    Maintains a small in-memory cache for fast recent entry access.
+    Stores access attempts (granted/denied) with timestamps.
+    Uses memory-efficient storage keeping only recent entries in RAM
+    while maintaining full history on disk.
     """
     
-    def __init__(self, log_path: Optional[str] = None):
+    def __init__(self, log_path=None):
         """
-        Initialize access log with SQLite database.
+        Initialize access log.
         
         Args:
-            log_path: Path to SQLite database file (uses config default if None)
+            log_path: Path to JSON log file (uses config default if None)
         """
         self.log_path = log_path or Config.ACCESS_LOG_PATH
         self.max_memory_entries = getattr(Config, 'ACCESS_LOG_MAX_MEMORY_ENTRIES', 1000)
-        self._cache: List[Dict[str, Any]] = []  # Recent entries cache
-        self._cache_dirty = False
-        self._init_database()
-        self._load_cache()
+        self.entries = []  # Recent entries kept in memory
+        self._total_entries = 0  # Total count including on-disk entries
+        self.load()
     
-    def _get_connection(self) -> sqlite3.Connection:
+    def load(self):
         """
-        Get a database connection with optimized settings.
-        
-        Returns:
-            SQLite connection with WAL mode for concurrent reads
+        Load log entries from disk.
+        Only keeps the most recent entries in memory to limit RAM usage.
         """
-        conn = sqlite3.connect(self.log_path, timeout=10.0)
-        conn.row_factory = sqlite3.Row  # Enable dict-like row access
-        # WAL mode for better concurrent access and crash recovery
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")  # Balance between safety and speed
-        return conn
+        if os.path.exists(self.log_path):
+            try:
+                with open(self.log_path, 'r') as f:
+                    all_entries = json.load(f)
+                    self._total_entries = len(all_entries)
+                    # Keep only recent entries in memory
+                    self.entries = all_entries[-self.max_memory_entries:]
+            except (json.JSONDecodeError, IOError):
+                self.entries = []
+                self._total_entries = 0
+        else:
+            self.entries = []
+            self._total_entries = 0
     
-    def _init_database(self) -> None:
-        """Create the access_log table if it doesn't exist."""
+    def save(self):
+        """
+        Persist log entries to disk.
+        Merges in-memory entries with existing disk entries to prevent duplicates.
+        """
         try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS access_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    access_granted INTEGER NOT NULL,
-                    confidence REAL NOT NULL
-                )
-            """)
-            # Create index on timestamp for efficient date range queries
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_access_log_timestamp 
-                ON access_log(timestamp DESC)
-            """)
-            # Create index on name for filtered queries
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_access_log_name 
-                ON access_log(name)
-            """)
-            conn.commit()
-            conn.close()
-            logger.info(f"AccessLog database initialized: {self.log_path}")
-        except sqlite3.Error as e:
-            logger.error(f"Failed to initialize access log database: {e}")
-    
-    def _load_cache(self) -> None:
-        """Load recent entries into memory cache for fast access."""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT timestamp, name, access_granted, confidence 
-                FROM access_log 
-                ORDER BY timestamp DESC 
-                LIMIT ?
-            """, (self.max_memory_entries,))
+            # Load existing entries from disk
+            if os.path.exists(self.log_path):
+                with open(self.log_path, 'r') as f:
+                    try:
+                        all_entries = json.load(f)
+                    except (json.JSONDecodeError, IOError):
+                        all_entries = []
+            else:
+                all_entries = []
             
-            rows = cursor.fetchall()
-            # Reverse to get chronological order (oldest first in cache)
-            self._cache = [
-                {
-                    "timestamp": row["timestamp"],
-                    "name": row["name"],
-                    "access_granted": bool(row["access_granted"]),
-                    "confidence": row["confidence"]
-                }
-                for row in reversed(rows)
-            ]
-            conn.close()
-        except sqlite3.Error as e:
-            logger.error(f"Failed to load access log cache: {e}")
-            self._cache = []
+            # Merge: deduplicate by timestamp to avoid duplicate entries
+            existing_timestamps = {e['timestamp'] for e in all_entries}
+            new_entries = [e for e in self.entries if e['timestamp'] not in existing_timestamps]
+            all_entries.extend(new_entries)
+            
+            with open(self.log_path, 'w') as f:
+                json.dump(all_entries, f, indent=2)
+            
+            self._total_entries = len(all_entries)
+        except IOError as e:
+            logger.error(f"Failed to save access log: {e}")
     
-    @property
-    def entries(self) -> List[Dict[str, Any]]:
-        """Property to access cache (for backward compatibility)."""
-        return self._cache
-    
-    def load(self) -> None:
-        """Reload cache from database (for backward compatibility)."""
-        self._load_cache()
-    
-    def save(self) -> None:
-        """No-op for backward compatibility - SQLite writes are immediate."""
-        pass
-    
-    def add_entry(self, name: str, access_granted: bool, confidence: float = 0.0) -> Dict[str, Any]:
+    def add_entry(self, name, access_granted, confidence=0.0):
         """
-        Record a new access event atomically to SQLite.
+        Record a new access event.
         
         Args:
             name: Name of person attempting access
@@ -1194,144 +783,23 @@ class AccessLog:
             "access_granted": access_granted,
             "confidence": round(confidence, 3)
         }
+        self.entries.append(entry)
+        self._total_entries += 1
         
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO access_log (timestamp, name, access_granted, confidence)
-                VALUES (?, ?, ?, ?)
-            """, (entry["timestamp"], entry["name"], int(entry["access_granted"]), entry["confidence"]))
-            conn.commit()
-            conn.close()
-            
-            # Update cache
-            self._cache.append(entry)
-            if len(self._cache) > self.max_memory_entries:
-                self._cache = self._cache[-self.max_memory_entries:]
-                
-        except sqlite3.Error as e:
-            logger.error(f"Failed to add access log entry: {e}")
+        # Limit memory usage by trimming old entries
+        if len(self.entries) > self.max_memory_entries:
+            self.entries = self.entries[-self.max_memory_entries:]
         
+        self.save()
         return entry
     
-    def get_recent(self, count: int = 50) -> List[Dict[str, Any]]:
-        """
-        Get the most recent N log entries in reverse chronological order.
-        
-        Args:
-            count: Number of entries to retrieve
-            
-        Returns:
-            List of entries, newest first
-        """
-        # Use cache if sufficient
-        if count <= len(self._cache):
-            return list(reversed(self._cache[-count:]))
-        
-        # Query database for larger requests
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT timestamp, name, access_granted, confidence 
-                FROM access_log 
-                ORDER BY timestamp DESC 
-                LIMIT ?
-            """, (count,))
-            
-            rows = cursor.fetchall()
-            conn.close()
-            
-            return [
-                {
-                    "timestamp": row["timestamp"],
-                    "name": row["name"],
-                    "access_granted": bool(row["access_granted"]),
-                    "confidence": row["confidence"]
-                }
-                for row in rows
-            ]
-        except sqlite3.Error as e:
-            logger.error(f"Failed to get recent entries: {e}")
-            return list(reversed(self._cache[-count:]))
+    def get_recent(self, count=50):
+        """Get the most recent N log entries in reverse chronological order."""
+        return list(reversed(self.entries[-count:]))
     
-    def get_paginated(self, page: int = 0, page_size: int = 50, 
-                      date_from: Optional[Any] = None, date_to: Optional[Any] = None, 
-                      name_filter: Optional[str] = None) -> Tuple[List[Dict[str, Any]], int, int]:
+    def get_filtered(self, date_from=None, date_to=None, name_filter=None, count=100):
         """
-        Get a page of log entries with optional filters using SQL.
-        
-        Args:
-            page: Zero-indexed page number
-            page_size: Number of entries per page
-            date_from: Earliest date to include (inclusive)
-            date_to: Latest date to include (inclusive)
-            name_filter: Partial name match (case-insensitive)
-            
-        Returns:
-            Tuple of (entries_list, total_matching_count, total_pages)
-        """
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            
-            # Build WHERE clause dynamically
-            conditions = []
-            params: List[Any] = []
-            
-            if date_from:
-                conditions.append("date(timestamp) >= ?")
-                params.append(date_from.isoformat() if hasattr(date_from, 'isoformat') else str(date_from))
-            
-            if date_to:
-                conditions.append("date(timestamp) <= ?")
-                params.append(date_to.isoformat() if hasattr(date_to, 'isoformat') else str(date_to))
-            
-            if name_filter:
-                conditions.append("name LIKE ?")
-                params.append(f"%{name_filter}%")
-            
-            where_clause = " AND ".join(conditions) if conditions else "1=1"
-            
-            # Get total count
-            cursor.execute(f"SELECT COUNT(*) FROM access_log WHERE {where_clause}", params)
-            total_count = cursor.fetchone()[0]
-            total_pages = max(1, (total_count + page_size - 1) // page_size)
-            
-            # Get page data
-            offset = page * page_size
-            cursor.execute(f"""
-                SELECT timestamp, name, access_granted, confidence 
-                FROM access_log 
-                WHERE {where_clause}
-                ORDER BY timestamp DESC 
-                LIMIT ? OFFSET ?
-            """, params + [page_size, offset])
-            
-            rows = cursor.fetchall()
-            conn.close()
-            
-            entries = [
-                {
-                    "timestamp": row["timestamp"],
-                    "name": row["name"],
-                    "access_granted": bool(row["access_granted"]),
-                    "confidence": row["confidence"]
-                }
-                for row in rows
-            ]
-            
-            return entries, total_count, total_pages
-            
-        except sqlite3.Error as e:
-            logger.error(f"Failed to get paginated entries: {e}")
-            return [], 0, 1
-    
-    def get_filtered(self, date_from: Optional[Any] = None, date_to: Optional[Any] = None, 
-                     name_filter: Optional[str] = None, count: int = 100) -> List[Dict[str, Any]]:
-        """
-        Query log entries with optional filters using SQL.
+        Query log entries with optional filters.
         
         Args:
             date_from: Earliest date to include (inclusive)
@@ -1342,149 +810,43 @@ class AccessLog:
         Returns:
             List of matching entries in reverse chronological order
         """
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
+        filtered = []
+        for entry in reversed(self.entries):
+            entry_date = datetime.fromisoformat(entry['timestamp']).date()
             
-            # Build WHERE clause dynamically
-            conditions = []
-            params: List[Any] = []
+            # Apply date range filter
+            if date_from and entry_date < date_from:
+                continue
+            if date_to and entry_date > date_to:
+                continue
             
-            if date_from:
-                conditions.append("date(timestamp) >= ?")
-                params.append(date_from.isoformat() if hasattr(date_from, 'isoformat') else str(date_from))
+            # Apply name filter (case-insensitive substring match)
+            if name_filter and name_filter.lower() not in entry['name'].lower():
+                continue
             
-            if date_to:
-                conditions.append("date(timestamp) <= ?")
-                params.append(date_to.isoformat() if hasattr(date_to, 'isoformat') else str(date_to))
-            
-            if name_filter:
-                conditions.append("name LIKE ?")
-                params.append(f"%{name_filter}%")
-            
-            where_clause = " AND ".join(conditions) if conditions else "1=1"
-            
-            cursor.execute(f"""
-                SELECT timestamp, name, access_granted, confidence 
-                FROM access_log 
-                WHERE {where_clause}
-                ORDER BY timestamp DESC 
-                LIMIT ?
-            """, params + [count])
-            
-            rows = cursor.fetchall()
-            conn.close()
-            
-            return [
-                {
-                    "timestamp": row["timestamp"],
-                    "name": row["name"],
-                    "access_granted": bool(row["access_granted"]),
-                    "confidence": row["confidence"]
-                }
-                for row in rows
-            ]
-            
-        except sqlite3.Error as e:
-            logger.error(f"Failed to get filtered entries: {e}")
-            return []
+            filtered.append(entry)
+            if len(filtered) >= count:
+                break
+        
+        return filtered
     
-    def get_unique_names(self) -> List[str]:
+    def get_unique_names(self):
         """Get sorted list of all unique names in the access log."""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT name FROM access_log ORDER BY name")
-            names = [row[0] for row in cursor.fetchall()]
-            conn.close()
-            return names
-        except sqlite3.Error as e:
-            logger.error(f"Failed to get unique names: {e}")
-            return sorted(set(entry['name'] for entry in self._cache))
+        names = set()
+        for entry in self.entries:
+            names.add(entry['name'])
+        return sorted(list(names))
     
-    def get_total_count(self) -> int:
-        """Get total number of log entries in database."""
+    def clear(self):
+        """Delete all log entries from memory and disk."""
+        self.entries = []
+        self._total_entries = 0
+        # Overwrite the JSON file with empty array (don't use save() which merges)
         try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM access_log")
-            count = cursor.fetchone()[0]
-            conn.close()
-            return count
-        except sqlite3.Error as e:
-            logger.error(f"Failed to get total count: {e}")
-            return len(self._cache)
-    
-    def clear(self) -> None:
-        """Delete all log entries from database."""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM access_log")
-            conn.commit()
-            # Reset auto-increment counter
-            cursor.execute("DELETE FROM sqlite_sequence WHERE name='access_log'")
-            conn.commit()
-            conn.close()
-            self._cache = []
-            logger.info("Access log cleared")
-        except sqlite3.Error as e:
-            logger.error(f"Failed to clear access log: {e}")
-    
-    def migrate_from_json(self, json_path: str) -> int:
-        """
-        Import entries from an existing JSON log file.
-        
-        Args:
-            json_path: Path to the JSON log file to migrate
-            
-        Returns:
-            Number of entries imported
-        """
-        if not os.path.exists(json_path):
-            logger.warning(f"JSON log file not found: {json_path}")
-            return 0
-        
-        try:
-            with open(json_path, 'r') as f:
-                json_entries = json.load(f)
-            
-            if not json_entries:
-                return 0
-            
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            
-            # Get existing timestamps to avoid duplicates
-            cursor.execute("SELECT timestamp FROM access_log")
-            existing = {row[0] for row in cursor.fetchall()}
-            
-            imported = 0
-            for entry in json_entries:
-                if entry['timestamp'] not in existing:
-                    cursor.execute("""
-                        INSERT INTO access_log (timestamp, name, access_granted, confidence)
-                        VALUES (?, ?, ?, ?)
-                    """, (
-                        entry['timestamp'],
-                        entry['name'],
-                        int(entry['access_granted']),
-                        entry.get('confidence', 0.0)
-                    ))
-                    imported += 1
-            
-            conn.commit()
-            conn.close()
-            
-            # Reload cache
-            self._load_cache()
-            
-            logger.info(f"Migrated {imported} entries from JSON to SQLite")
-            return imported
-            
-        except (json.JSONDecodeError, IOError, sqlite3.Error) as e:
-            logger.error(f"Failed to migrate from JSON: {e}")
-            return 0
+            with open(self.log_path, 'w') as f:
+                json.dump([], f)
+        except IOError as e:
+            logger.error(f"Failed to clear access log file: {e}")
 
 
 # ==================== CAMERA MANAGER ====================
@@ -1566,7 +928,6 @@ class CameraManager:
         """
         Continuous frame capture running in background thread.
         Ensures latest frame is always available for the main loop.
-        Includes small sleep to reduce CPU spinning.
         """
         while self.is_running:
             try:
@@ -1576,22 +937,15 @@ class CameraManager:
                 else:
                     ret, frame = self.camera.read()
                     if not ret:
-                        time.sleep(0.01)  # Brief sleep on failed read
                         continue
                 
                 # Thread-safe frame update
                 with self.frame_lock:
                     self.current_frame = frame
-                
-                # Small sleep to reduce CPU usage (configurable)
-                time.sleep(Config.CAPTURE_THREAD_SLEEP_MS / 1000.0)
                     
-            except cv2.error as e:
-                logger.warning(f"OpenCV camera error: {e}")
+            except Exception as e:
+                logger.warning(f"Camera capture error: {e}")
                 time.sleep(0.1)
-            except OSError as e:
-                logger.error(f"Camera OS error: {e}", exc_info=True)
-                time.sleep(0.5)
     
     def capture_frame(self):
         """
@@ -1622,134 +976,6 @@ class CameraManager:
             self.camera = None
 
 
-# ==================== EMBEDDING MATCHING WORKER (MULTIPROCESSING) ====================
-def _embedding_worker_process(
-    input_queue,
-    output_queue,
-    stop_event,
-    encodings_path: str,
-    threshold: float,
-    faiss_threshold: int
-):
-    """
-    Standalone worker process for embedding similarity matching.
-    
-    Runs in a separate process to bypass GIL, enabling true parallel computation.
-    Receives face embeddings from the main process and returns match results.
-    
-    Args:
-        input_queue: Queue receiving (request_id, embeddings_list) tuples
-        output_queue: Queue sending (request_id, results_list) tuples
-        stop_event: Event to signal worker shutdown
-        encodings_path: Path to encodings pickle file
-        threshold: Recognition similarity threshold
-        faiss_threshold: User count threshold for FAISS index
-    """
-    import numpy as np
-    import pickle
-    import os
-    
-    # Try to import FAISS in the worker process
-    faiss_available = False
-    faiss_index = None
-    try:
-        import faiss
-        faiss_available = True
-    except ImportError:
-        pass
-    
-    # Load encodings in worker process
-    known_encodings_normalized = None
-    known_names = []
-    
-    def load_encodings():
-        nonlocal known_encodings_normalized, known_names, faiss_index
-        if os.path.exists(encodings_path):
-            try:
-                with open(encodings_path, "rb") as f:
-                    data = pickle.loads(f.read())
-                known_encodings = [np.array(enc, dtype=np.float32) for enc in data["encodings"]]
-                known_names = data["names"]
-                
-                if len(known_encodings) > 0:
-                    encodings_matrix = np.array(known_encodings, dtype=np.float32)
-                    norms = np.linalg.norm(encodings_matrix, axis=1, keepdims=True)
-                    known_encodings_normalized = (encodings_matrix / norms).astype(np.float32)
-                    
-                    # Build FAISS index if appropriate
-                    if faiss_available and len(set(known_names)) >= faiss_threshold:
-                        d = known_encodings_normalized.shape[1]
-                        faiss_index = faiss.IndexFlatIP(d)
-                        faiss_index.add(known_encodings_normalized)
-                    else:
-                        faiss_index = None
-                else:
-                    known_encodings_normalized = None
-                    faiss_index = None
-            except Exception:
-                known_encodings_normalized = None
-                faiss_index = None
-    
-    load_encodings()
-    last_encodings_mtime = os.path.getmtime(encodings_path) if os.path.exists(encodings_path) else 0
-    
-    while not stop_event.is_set():
-        try:
-            # Check for encodings file update (reload if changed)
-            if os.path.exists(encodings_path):
-                current_mtime = os.path.getmtime(encodings_path)
-                if current_mtime > last_encodings_mtime:
-                    load_encodings()
-                    last_encodings_mtime = current_mtime
-            
-            # Get work from queue with timeout
-            try:
-                request_id, embeddings = input_queue.get(timeout=0.1)
-            except:
-                continue
-            
-            results = []
-            
-            if known_encodings_normalized is None or len(embeddings) == 0:
-                output_queue.put((request_id, results))
-                continue
-            
-            for face_data in embeddings:
-                face_encoding = np.array(face_data['embedding'], dtype=np.float32)
-                face_norm = face_encoding / np.linalg.norm(face_encoding)
-                
-                # Use FAISS or linear search
-                if faiss_index is not None:
-                    query = face_norm.reshape(1, -1).astype(np.float32)
-                    similarities, indices = faiss_index.search(query, 1)
-                    best_match_index = int(indices[0][0])
-                    best_similarity = float(similarities[0][0])
-                else:
-                    similarities = np.dot(known_encodings_normalized, face_norm)
-                    best_match_index = np.argmax(similarities)
-                    best_similarity = float(similarities[best_match_index])
-                
-                if best_similarity > threshold:
-                    name = known_names[best_match_index]
-                    confidence = best_similarity
-                else:
-                    name = "Unknown"
-                    confidence = 0.0
-                
-                results.append({
-                    'name': name,
-                    'confidence': confidence,
-                    'location': face_data['location'],
-                    'is_stable': face_data['is_stable']
-                })
-            
-            output_queue.put((request_id, results))
-            
-        except Exception as e:
-            # Don't crash the worker on errors
-            continue
-
-
 # ==================== FACE RECOGNITION SYSTEM ====================
 class FaceRecognitionSystem:
     """
@@ -1777,15 +1003,11 @@ class FaceRecognitionSystem:
         self.known_encodings = []
         self.known_names = []
         self.known_encodings_normalized = None  # Pre-computed for fast matching
-        self.faiss_index = None  # FAISS index for fast vector search (built when user count is high)
         self.disabled_encodings = {}  # {name: [encodings]} for revoked users
         self.cv_scaler = Config.DETECTION_SCALE_FACTOR
         
         # Face stability tracking - wait for face to settle before recognizing
         self.stability_tracker = FaceStabilityTracker()
-        
-        # Liveness detection - anti-spoofing via blink detection
-        self.liveness_detector = LivenessDetector()
         
         # Initialize InsightFace model
         try:
@@ -1817,8 +1039,8 @@ class FaceRecognitionSystem:
         # Frame skip counter for performance
         self.frame_count = 0
         
-        # ========== THREADED/MULTIPROCESS RECOGNITION ==========
-        # Background thread/process prevents recognition from blocking the camera loop
+        # ========== THREADED RECOGNITION ==========
+        # Background thread prevents recognition from blocking the camera loop
         self._recognition_thread = None
         self._recognition_lock = threading.Lock()
         self._frame_queue = Queue(maxsize=2)  # Limit queue size to prevent memory buildup
@@ -1826,15 +1048,6 @@ class FaceRecognitionSystem:
         self._last_results_lock = threading.Lock()
         self._recognition_running = False
         self._stop_recognition = threading.Event()
-        
-        # Multiprocessing components (used if USE_MULTIPROCESSING is True)
-        self._use_multiprocessing = Config.USE_MULTIPROCESSING
-        self._mp_worker = None
-        self._mp_input_queue = None
-        self._mp_output_queue = None
-        self._mp_stop_event = None
-        self._mp_request_id = 0
-        self._mp_pending_requests = {}
         
         # Ensure dataset directory exists
         if not os.path.exists(self.dataset_path):
@@ -1850,8 +1063,8 @@ class FaceRecognitionSystem:
                 with open(self.disabled_encodings_path, "rb") as f:
                     self.disabled_encodings = pickle.loads(f.read())
                 logger.info(f"Loaded {len(self.disabled_encodings)} disabled users")
-            except (OSError, IOError, pickle.UnpicklingError, KeyError) as e:
-                logger.warning(f"Could not load disabled encodings: {e}", exc_info=True)
+            except Exception as e:
+                logger.warning(f"Could not load disabled encodings: {e}")
                 self.disabled_encodings = {}
         else:
             self.disabled_encodings = {}
@@ -1882,76 +1095,24 @@ class FaceRecognitionSystem:
                 self._update_normalized_encodings()
                 logger.info(f"Loaded {len(self.known_encodings)} encodings for {len(set(self.known_names))} persons")
                 return True
-            except (OSError, IOError, pickle.UnpicklingError, KeyError) as e:
-                logger.error(f"Failed to load encodings: {e}", exc_info=True)
+            except Exception as e:
+                logger.error(f"Failed to load encodings: {e}")
                 return False
         return False
     
-    def _update_normalized_encodings(self) -> None:
+    def _update_normalized_encodings(self):
         """
         Pre-compute normalized encoding matrix for fast similarity.
         Normalizing once here avoids per-comparison normalization overhead.
-        Also builds FAISS index if available and user count exceeds threshold.
         """
         if len(self.known_encodings) > 0:
             encodings_matrix = np.array(self.known_encodings, dtype=np.float32)
             norms = np.linalg.norm(encodings_matrix, axis=1, keepdims=True)
             self.known_encodings_normalized = (encodings_matrix / norms).astype(np.float32)
-            
-            # Build FAISS index for fast similarity search with large user counts
-            self._build_faiss_index()
         else:
             self.known_encodings_normalized = None
-            self.faiss_index = None
     
-    def _build_faiss_index(self) -> None:
-        """
-        Build FAISS index for fast vector similarity search.
-        Uses Inner Product (IP) index since embeddings are pre-normalized (IP = cosine similarity).
-        Falls back to linear search if FAISS unavailable or user count is below threshold.
-        """
-        if not USE_FAISS:
-            self.faiss_index = None
-            return
-        
-        num_users = len(set(self.known_names))
-        if num_users < Config.FAISS_INDEX_THRESHOLD:
-            self.faiss_index = None
-            logger.debug(f"FAISS index not built: {num_users} users below threshold {Config.FAISS_INDEX_THRESHOLD}")
-            return
-        
-        try:
-            # Embedding dimension (InsightFace buffalo_s uses 512-dim embeddings)
-            d = self.known_encodings_normalized.shape[1]
-            
-            # Use IndexFlatIP for exact inner product (cosine similarity for normalized vectors)
-            self.faiss_index = faiss.IndexFlatIP(d)
-            self.faiss_index.add(self.known_encodings_normalized)
-            
-            logger.info(f"Built FAISS index with {len(self.known_encodings)} encodings (dim={d})")
-        except Exception as e:
-            logger.warning(f"Failed to build FAISS index, falling back to linear search: {e}")
-            self.faiss_index = None
-    
-    def _search_faiss(self, face_encoding: np.ndarray) -> Tuple[int, float]:
-        """
-        Search FAISS index for best matching face.
-        
-        Args:
-            face_encoding: Normalized face embedding vector
-            
-        Returns:
-            Tuple of (best_match_index, similarity_score)
-        """
-        # Reshape for FAISS query (expects 2D array)
-        query = face_encoding.reshape(1, -1).astype(np.float32)
-        
-        # Search for top-1 match
-        similarities, indices = self.faiss_index.search(query, 1)
-        
-        return int(indices[0][0]), float(similarities[0][0])
-    
-    def get_registered_persons(self) -> List[Tuple[str, int]]:
+    def get_registered_persons(self):
         """
         Get list of all persons with face images in the dataset folder.
         
@@ -1968,18 +1129,18 @@ class FaceRecognitionSystem:
                     persons.append((name, image_count))
         return persons
     
-    def get_trained_persons(self) -> List[str]:
+    def get_trained_persons(self):
         """Get list of unique names that have been trained (have encodings)."""
         return list(set(self.known_names))
     
-    def create_person_folder(self, name: str) -> str:
+    def create_person_folder(self, name):
         """Create a directory for storing a person's face images."""
         person_folder = os.path.join(self.dataset_path, name)
         if not os.path.exists(person_folder):
             os.makedirs(person_folder)
         return person_folder
     
-    def save_face_image(self, frame: np.ndarray, name: str) -> str:
+    def save_face_image(self, frame, name):
         """
         Save a captured face image to the person's folder.
         
@@ -1997,7 +1158,7 @@ class FaceRecognitionSystem:
         cv2.imwrite(filepath, frame)
         return filepath
     
-    def train_model(self, progress_callback: Optional[Callable[[int, int, str], None]] = None) -> Tuple[bool, str]:
+    def train_model(self, progress_callback=None):
         """
         Train face recognition on all images in the dataset.
         
@@ -2128,7 +1289,7 @@ class FaceRecognitionSystem:
         
         return True, f"Added {len(new_encodings)} encodings for {person_name}"
     
-    def remove_person_from_model(self, person_name: str) -> Tuple[bool, str]:
+    def remove_person_from_model(self, person_name):
         """
         Remove all encodings for a person from the trained model.
         
@@ -2173,7 +1334,7 @@ class FaceRecognitionSystem:
         
         return True, f"Removed {count_removed} encodings for {person_name}"
     
-    def revoke_person_access(self, person_name: str) -> Tuple[bool, str]:
+    def revoke_person_access(self, person_name):
         """
         Revoke access for a person by moving their encodings to disabled list.
         Encodings are preserved and can be restored later without retraining.
@@ -2220,7 +1381,7 @@ class FaceRecognitionSystem:
         
         return True, f"Revoked access for {person_name} ({len(person_encodings)} encodings preserved)"
     
-    def restore_person_access(self, person_name: str) -> Tuple[bool, str]:
+    def restore_person_access(self, person_name):
         """
         Restore access for a previously revoked person.
         Moves their encodings back from disabled list to active model.
@@ -2263,7 +1424,7 @@ class FaceRecognitionSystem:
         """Get list of revoked users with their encoding counts."""
         return [(name, len(encodings)) for name, encodings in self.disabled_encodings.items()]
     
-    def detect_faces_fast(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    def detect_faces_fast(self, frame):
         """
         Fast face detection using Haar cascade.
         Less accurate but faster than InsightFace detection.
@@ -2294,7 +1455,7 @@ class FaceRecognitionSystem:
         
         return locations
     
-    def detect_faces_robust(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    def detect_faces_robust(self, frame):
         """
         Robust face detection using InsightFace.
         More accurate and handles various face angles well.
@@ -2311,7 +1472,7 @@ class FaceRecognitionSystem:
         
         return face_locations
     
-    def detect_faces_combined(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    def detect_faces_combined(self, frame):
         """
         Hybrid detection: fast Haar cascade first, then InsightFace fallback.
         Optimizes for speed while maintaining detection reliability.
@@ -2324,78 +1485,21 @@ class FaceRecognitionSystem:
         
         return faces
     
-    # ========== BACKGROUND RECOGNITION THREAD/PROCESS METHODS ==========
+    # ========== BACKGROUND RECOGNITION THREAD METHODS ==========
     
-    def start_recognition_thread(self) -> None:
-        """Launch the background recognition processing thread/process."""
+    def start_recognition_thread(self):
+        """Launch the background recognition processing thread."""
         if self._recognition_thread is not None and self._recognition_thread.is_alive():
             return
-        
-        # Start multiprocessing worker if enabled
-        if self._use_multiprocessing:
-            self._start_mp_worker()
         
         self._stop_recognition.clear()
         self._recognition_thread = threading.Thread(target=self._recognition_loop, daemon=True)
         self._recognition_thread.start()
-        logger.info(f"Background recognition started (multiprocessing={self._use_multiprocessing})")
+        logger.info("Background recognition thread started")
     
-    def _start_mp_worker(self) -> None:
-        """Start the multiprocessing worker for embedding matching."""
-        if self._mp_worker is not None and self._mp_worker.is_alive():
-            return
-        
-        self._mp_input_queue = MPQueue(maxsize=5)
-        self._mp_output_queue = MPQueue(maxsize=5)
-        self._mp_stop_event = MPEvent()
-        
-        self._mp_worker = Process(
-            target=_embedding_worker_process,
-            args=(
-                self._mp_input_queue,
-                self._mp_output_queue,
-                self._mp_stop_event,
-                self.encodings_path,
-                Config.RECOGNITION_THRESHOLD,
-                Config.FAISS_INDEX_THRESHOLD
-            ),
-            daemon=True
-        )
-        self._mp_worker.start()
-        logger.info("Multiprocessing embedding worker started")
-    
-    def _stop_mp_worker(self) -> None:
-        """Stop the multiprocessing worker."""
-        if self._mp_stop_event is not None:
-            self._mp_stop_event.set()
-        
-        if self._mp_worker is not None:
-            self._mp_worker.join(timeout=2.0)
-            if self._mp_worker.is_alive():
-                self._mp_worker.terminate()
-            self._mp_worker = None
-        
-        # Clean up queues
-        for q in [self._mp_input_queue, self._mp_output_queue]:
-            if q is not None:
-                try:
-                    while not q.empty():
-                        q.get_nowait()
-                except:
-                    pass
-        
-        self._mp_input_queue = None
-        self._mp_output_queue = None
-        self._mp_stop_event = None
-        logger.info("Multiprocessing embedding worker stopped")
-    
-    def stop_recognition_thread(self) -> None:
-        """Gracefully shut down the recognition thread/process."""
+    def stop_recognition_thread(self):
+        """Gracefully shut down the recognition thread."""
         self._stop_recognition.set()
-        
-        # Stop multiprocessing worker
-        if self._use_multiprocessing:
-            self._stop_mp_worker()
         
         # Drain queue to unblock the worker thread
         try:
@@ -2407,73 +1511,41 @@ class FaceRecognitionSystem:
         if self._recognition_thread is not None:
             self._recognition_thread.join(timeout=2.0)
             self._recognition_thread = None
-        logger.info("Background recognition stopped")
+        logger.info("Background recognition thread stopped")
     
-    def _recognition_loop(self) -> None:
+    def _recognition_loop(self):
         """
         Main loop for background recognition thread.
         Continuously pulls frames from queue and processes them.
-        Uses multiprocessing for embedding matching if enabled.
         """
         while not self._stop_recognition.is_set():
             try:
                 frame = self._frame_queue.get(timeout=0.1)
             except Empty:
-                # Check for multiprocessing results even when no new frames
-                if self._use_multiprocessing:
-                    self._collect_mp_results()
                 continue
             
             with self._recognition_lock:
                 self._recognition_running = True
                 try:
-                    if self._use_multiprocessing:
-                        results = self._process_recognition_mp(frame)
-                    else:
-                        results = self._process_recognition(frame)
+                    results = self._process_recognition(frame)
                     with self._last_results_lock:
                         self._last_results = results
-                except cv2.error as e:
-                    logger.error(f"OpenCV recognition error: {e}")
-                except (ValueError, TypeError) as e:
-                    logger.error(f"Recognition data error: {e}", exc_info=True)
-                except RuntimeError as e:
-                    logger.error(f"Recognition runtime error: {e}", exc_info=True)
+                except Exception as e:
+                    logger.error(f"Recognition error: {e}")
                 finally:
                     self._recognition_running = False
                     # Help GC by clearing reference
                     del frame
     
-    def _collect_mp_results(self) -> None:
-        """Collect any pending results from the multiprocessing worker."""
-        if self._mp_output_queue is None:
-            return
-        
-        try:
-            while not self._mp_output_queue.empty():
-                request_id, results = self._mp_output_queue.get_nowait()
-                # Store results keyed by request ID
-                self._mp_pending_requests[request_id] = results
-        except:
-            pass
-    
-    def _process_recognition_mp(self, frame: np.ndarray) -> List[Dict[str, Any]]:
-        """
-        Process recognition using multiprocessing worker for embedding matching.
-        
-        Face detection happens in this thread (using InsightFace),
-        but the heavy embedding comparison is offloaded to a separate process.
-        """
-        # First, collect any pending results from worker
-        self._collect_mp_results()
+    def _process_recognition(self, frame):
+        """Internal method to perform actual recognition (runs in background thread)"""
+        if not self.known_encodings or self.known_encodings_normalized is None:
+            return []
         
         results = []
         
-        # Run InsightFace detection and embedding extraction (in this thread)
+        # Run InsightFace detection and embedding extraction
         faces = self.face_app.get(frame)
-        
-        embeddings_to_match = []
-        face_metadata = []  # Store metadata for each face to correlate with results
         
         for face_idx, face in enumerate(faces):
             if face.embedding is None:
@@ -2484,12 +1556,13 @@ class FaceRecognitionSystem:
             left, top, right, bottom = bbox[0], bbox[1], bbox[2], bbox[3]
             location = (top, right, bottom, left)
             
-            # Check face stability
+            # Check face stability before attempting recognition
             is_stable = self.stability_tracker.update_and_check_stability(face_idx, location)
             
-            # Try cache lookup first
+            # Try cache lookup by embedding similarity first
             cached = self.face_cache.get_by_embedding(face_encoding)
             if cached:
+                # Update cache position since face may have moved
                 self.face_cache.update_location(cached['location'], location)
                 results.append({
                     'name': cached['name'],
@@ -2500,7 +1573,7 @@ class FaceRecognitionSystem:
                 })
                 continue
             
-            # Check position-based cache
+            # Fallback: check cache by position
             cached = self.face_cache.get(location, face_encoding)
             if cached:
                 results.append({
@@ -2523,146 +1596,18 @@ class FaceRecognitionSystem:
                 })
                 continue
             
-            # Queue for matching in worker process
-            embeddings_to_match.append({
-                'embedding': face_encoding.tolist(),
-                'location': location,
-                'is_stable': is_stable
-            })
-            face_metadata.append({
-                'encoding': face_encoding,
-                'location': location
-            })
-        
-        # Send to worker process for matching
-        if embeddings_to_match and self._mp_input_queue is not None:
-            self._mp_request_id += 1
-            try:
-                self._mp_input_queue.put_nowait((self._mp_request_id, embeddings_to_match))
-            except:
-                pass  # Queue full, will retry next frame
-            
-            # Wait briefly for result (with timeout to stay responsive)
-            start_wait = time.time()
-            while time.time() - start_wait < 0.05:  # 50ms timeout
-                self._collect_mp_results()
-                if self._mp_request_id in self._mp_pending_requests:
-                    mp_results = self._mp_pending_requests.pop(self._mp_request_id)
-                    
-                    # Add results and update cache
-                    for i, mp_result in enumerate(mp_results):
-                        if mp_result['name'] != "Unknown":
-                            self.face_cache.put(
-                                mp_result['location'],
-                                mp_result['name'],
-                                mp_result['confidence'],
-                                face_metadata[i]['encoding']
-                            )
-                        results.append({
-                            'name': mp_result['name'],
-                            'confidence': mp_result['confidence'],
-                            'location': mp_result['location'],
-                            'from_cache': False,
-                            'is_stable': mp_result['is_stable']
-                        })
-                    break
-                time.sleep(0.005)
-            else:
-                # Timeout - add pending faces as "Scanning..."
-                for meta in face_metadata:
-                    results.append({
-                        'name': 'Scanning...',
-                        'confidence': 0.0,
-                        'location': meta['location'],
-                        'from_cache': False,
-                        'is_stable': True
-                    })
-        
-        return results
-    
-    def _process_recognition(self, frame: np.ndarray) -> List[Dict[str, Any]]:
-        """Internal method to perform actual recognition (runs in background thread)"""
-        if not self.known_encodings or self.known_encodings_normalized is None:
-            return []
-        
-        results = []
-        
-        # Run InsightFace detection and embedding extraction
-        faces = self.face_app.get(frame)
-        
-        for face_idx, face in enumerate(faces):
-            if face.embedding is None:
-                continue
-            
-            face_encoding = face.embedding
-            bbox = face.bbox.astype(int)
-            left, top, right, bottom = bbox[0], bbox[1], bbox[2], bbox[3]
-            location = (top, right, bottom, left)
-            
-            # Extract Eye Aspect Ratio for liveness detection
-            left_ear, right_ear = self.liveness_detector.get_ear_from_face(face)
-            
-            # Check face stability before attempting recognition
-            is_stable = self.stability_tracker.update_and_check_stability(face_idx, location)
-            
-            # Try cache lookup by embedding similarity first
-            cached = self.face_cache.get_by_embedding(face_encoding)
-            if cached:
-                # Update cache position since face may have moved
-                self.face_cache.update_location(cached['location'], location)
-                results.append({
-                    'name': cached['name'],
-                    'confidence': cached['confidence'],
-                    'location': location,
-                    'from_cache': True,
-                    'is_stable': is_stable,
-                    'left_ear': left_ear,
-                    'right_ear': right_ear
-                })
-                continue
-            
-            # Fallback: check cache by position
-            cached = self.face_cache.get(location, face_encoding)
-            if cached:
-                results.append({
-                    'name': cached['name'],
-                    'confidence': cached['confidence'],
-                    'location': location,
-                    'from_cache': True,
-                    'is_stable': is_stable,
-                    'left_ear': left_ear,
-                    'right_ear': right_ear
-                })
-                continue
-            
-            # Defer recognition for moving faces
-            if not is_stable:
-                results.append({
-                    'name': 'Scanning...',
-                    'confidence': 0.0,
-                    'location': location,
-                    'from_cache': False,
-                    'is_stable': False,
-                    'left_ear': left_ear,
-                    'right_ear': right_ear
-                })
-                continue
-            
-            # Perform actual recognition using FAISS or linear search
+            # Perform actual recognition using vectorized cosine similarity
             name = "Unknown"
             confidence = 0.0
             
             # Normalize current embedding
-            face_norm = (face_encoding / np.linalg.norm(face_encoding)).astype(np.float32)
+            face_norm = face_encoding / np.linalg.norm(face_encoding)
             
-            # Use FAISS index if available, otherwise fall back to linear search
-            if self.faiss_index is not None:
-                best_match_index, best_similarity = self._search_faiss(face_norm)
-            else:
-                # Linear search with vectorized cosine similarity
-                similarities = np.dot(self.known_encodings_normalized, face_norm)
-                best_match_index = np.argmax(similarities)
-                best_similarity = similarities[best_match_index]
+            # Compute similarities against all known faces in one operation
+            similarities = np.dot(self.known_encodings_normalized, face_norm)
+            
+            best_match_index = np.argmax(similarities)
+            best_similarity = similarities[best_match_index]
             
             if best_similarity > Config.RECOGNITION_THRESHOLD:
                 name = self.known_names[best_match_index]
@@ -2677,14 +1622,12 @@ class FaceRecognitionSystem:
                 'confidence': confidence,
                 'location': location,
                 'from_cache': False,
-                'is_stable': True,
-                'left_ear': left_ear,
-                'right_ear': right_ear
+                'is_stable': True
             })
         
         return results
     
-    def recognize_faces(self, frame, force_recognition=False, idle_mode=False):
+    def recognize_faces(self, frame, force_recognition=False):
         """
         Non-blocking face recognition using background thread.
         
@@ -2694,7 +1637,6 @@ class FaceRecognitionSystem:
         Args:
             frame: OpenCV BGR image
             force_recognition: Skip frame interval check
-            idle_mode: Use less frequent recognition when no faces detected
             
         Returns:
             Tuple of (frame, list of recognition results)
@@ -2704,11 +1646,8 @@ class FaceRecognitionSystem:
         if not self.known_encodings or self.known_encodings_normalized is None:
             return frame, []
         
-        # Use adaptive recognition interval based on detection state
-        recognition_interval = Config.IDLE_RECOGNITION_INTERVAL if idle_mode else Config.RECOGNITION_INTERVAL_FRAMES
-        
         # Implement frame skipping for performance
-        if not force_recognition and self.frame_count % recognition_interval != 0:
+        if not force_recognition and self.frame_count % Config.RECOGNITION_INTERVAL_FRAMES != 0:
             with self._last_results_lock:
                 return frame, self._last_results.copy() if self._last_results else []
         
@@ -2728,7 +1667,7 @@ class FaceRecognitionSystem:
         with self._last_results_lock:
             return frame, self._last_results.copy() if self._last_results else []
     
-    def recognize_faces_sync(self, frame: np.ndarray, force_recognition: bool = False) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    def recognize_faces_sync(self, frame, force_recognition=False):
         """
         Synchronous face recognition (blocks until complete).
         Use for single-frame recognition scenarios.
@@ -2738,7 +1677,7 @@ class FaceRecognitionSystem:
         
         return frame, self._process_recognition(frame)
     
-    def get_last_results(self) -> List[Dict[str, Any]]:
+    def get_last_results(self):
         """Retrieve the most recent recognition results."""
         with self._last_results_lock:
             return self._last_results.copy() if self._last_results else []
@@ -2748,10 +1687,9 @@ class FaceRecognitionSystem:
         return self._recognition_running
     
     def clear_cache(self):
-        """Reset face cache, stability tracker, liveness state, and pending frame queue."""
+        """Reset face cache, stability tracker, and pending frame queue."""
         self.face_cache.clear()
         self.stability_tracker.clear()
-        self.liveness_detector.reset()
         with self._last_results_lock:
             self._last_results = []
         try:
@@ -2961,19 +1899,6 @@ class DoorEntryKiosk:
         self.door_controller = DoorController()
         self.access_log = AccessLog()
         
-        # Auto-migrate from JSON if old log exists
-        old_json_log = "access_log.json"
-        if os.path.exists(old_json_log):
-            migrated = self.access_log.migrate_from_json(old_json_log)
-            if migrated > 0:
-                # Rename old file to prevent re-migration
-                backup_path = "access_log.json.migrated"
-                try:
-                    os.rename(old_json_log, backup_path)
-                    logger.info(f"Old JSON log backed up to {backup_path}")
-                except OSError as e:
-                    logger.warning(f"Could not rename old JSON log: {e}")
-        
         # ========== Application State ==========
         self.is_running = True
         self.is_scanning = True
@@ -3017,13 +1942,7 @@ class DoorEntryKiosk:
         
         # ========== Memory Management ==========
         self.last_cache_cleanup = time.time()
-        self.last_gc_run = time.time()
         self.cache_cleanup_interval = 60  # Cleanup every 60 seconds
-        
-        # ========== Adaptive Frame Rate State ==========
-        self.target_fps = Config.IDLE_FPS  # Start in idle mode
-        self.no_face_frames = 0  # Counter for consecutive frames without faces
-        self.idle_threshold_frames = 15  # Switch to idle mode after this many empty frames
         
         # UI state tracking
         self._status_reset_id = None  # For cancelling pending status resets
@@ -3249,9 +2168,8 @@ class DoorEntryKiosk:
         Update the status display with appropriate styling.
         
         Args:
-            status: One of "scanning", "active_scanning", "processing", 
-                    "granted", "denied", "liveness", "liveness_timeout"
-            name: Person name for granted/liveness status
+            status: One of "scanning", "active_scanning", "processing", "granted", "denied"
+            name: Person name for granted status
             confidence: Recognition confidence for display
         """
         self.current_status = status
@@ -3306,26 +2224,6 @@ class DoorEntryKiosk:
             self.status_detail_label.config(text="Please wait")
             update_bg(Config.COLOR_CARD, Config.COLOR_WARNING, Config.COLOR_TEXT, Config.COLOR_TEXT_SECONDARY)
             self.status_card.config(highlightbackground=Config.COLOR_WARNING)
-        
-        elif status == "liveness":
-            # Liveness check in progress - ask user to blink
-            display_name = name if len(name) <= 20 else name[:18] + "..."
-            self.status_icon_label.config(text="👁")
-            self.status_text_label.config(text=f"Hello, {display_name}")
-            self.status_detail_label.config(text="Please BLINK to confirm it's you")
-            update_bg(Config.COLOR_CARD, Config.COLOR_SCANNING, Config.COLOR_TEXT, Config.COLOR_TEXT_SECONDARY)
-            self.status_card.config(highlightbackground=Config.COLOR_SCANNING)
-        
-        elif status == "liveness_timeout":
-            # Liveness check timed out
-            self.status_icon_label.config(text="⏱")
-            self.status_text_label.config(text="Liveness Check Failed")
-            self.status_detail_label.config(text="No blink detected - try again")
-            update_bg(Config.COLOR_WARNING, "#FFFFFF", "#FFFFFF", "#FFF3E0")
-            self._status_reset_id = self.root.after(
-                Config.STATUS_DISPLAY_DURATION, 
-                self._set_status_scanning
-            )
             
         else:  # Default scanning state
             self.status_icon_label.config(text="◉")
@@ -3373,9 +2271,8 @@ class DoorEntryKiosk:
                         cv2.putText(display_frame, "Training in progress...", (50, 50),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
                     else:
-                        # Run face recognition with adaptive interval based on idle state
-                        is_idle = self.no_face_frames >= self.idle_threshold_frames
-                        _, results = self.face_system.recognize_faces(frame, idle_mode=is_idle)
+                        # Run face recognition
+                        _, results = self.face_system.recognize_faces(frame)
                         self.faces_detected = len(results)
                         
                         # Check face stability status
@@ -3397,8 +2294,6 @@ class DoorEntryKiosk:
                             confidence = result['confidence']
                             from_cache = result.get('from_cache', False)
                             is_stable = result.get('is_stable', True)
-                            left_ear = result.get('left_ear', 1.0)
-                            right_ear = result.get('right_ear', 1.0)
                             
                             # Skip unstable faces
                             if not is_stable or name == 'Scanning...':
@@ -3409,33 +2304,8 @@ class DoorEntryKiosk:
                                 now = time.time()
                                 # Apply cooldown to prevent duplicate logs
                                 if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
-                                    # Check liveness verification
-                                    if Config.LIVENESS_ENABLED:
-                                        liveness = self.face_system.liveness_detector
-                                        
-                                        if liveness.is_verified(name):
-                                            # Already verified, grant access
-                                            self.last_access[name] = now
-                                            self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
-                                        else:
-                                            # Start or update liveness check
-                                            liveness.start_check(name)
-                                            status = liveness.update_check(name, left_ear, right_ear)
-                                            
-                                            if status == 'verified':
-                                                # Liveness confirmed, grant access
-                                                self.last_access[name] = now
-                                                self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
-                                            elif status == 'pending':
-                                                # Show blink prompt
-                                                self.root.after(0, lambda n=name: self.set_status("liveness", n))
-                                            elif status == 'timeout':
-                                                # Liveness check timed out
-                                                self.root.after(0, lambda: self.set_status("liveness_timeout"))
-                                    else:
-                                        # Liveness disabled, grant access directly
-                                        self.last_access[name] = now
-                                        self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
+                                    self.last_access[name] = now
+                                    self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
                             else:
                                 # Log unknown faces (with cooldown)
                                 if name == "Unknown" and self.current_status in ("scanning", "active_scanning") and not from_cache:
@@ -3528,23 +2398,8 @@ class DoorEntryKiosk:
                 
                 elif self.admin_mode:
                     # Admin mode but not in registration - show clean camera feed
-                    # Skip face recognition entirely in admin mode to save compute
+                    # Just display the frame without overlays
                     pass
-                
-                # Adaptive frame rate based on face detection
-                if self.is_scanning and not self.registration_mode and not self.admin_mode:
-                    if self.faces_detected > 0:
-                        # Faces detected - use high FPS for responsiveness
-                        self.target_fps = Config.ACTIVE_FPS
-                        self.no_face_frames = 0
-                    else:
-                        # No faces - count frames and switch to idle mode
-                        self.no_face_frames += 1
-                        if self.no_face_frames >= self.idle_threshold_frames:
-                            self.target_fps = Config.IDLE_FPS
-                else:
-                    # Registration or admin mode - use idle FPS
-                    self.target_fps = Config.IDLE_FPS
                 
                 # Periodic cache cleanup to prevent memory buildup
                 now = time.time()
@@ -3554,12 +2409,9 @@ class DoorEntryKiosk:
                         logger.debug(f"Cache cleanup: removed {expired_count} expired entries")
                     # Also clean up old last_access entries to prevent memory leak
                     self._cleanup_old_access_entries(now)
-                    self.last_cache_cleanup = now
-                
-                # Run garbage collection less frequently (separate from cache cleanup)
-                if now - self.last_gc_run > Config.GC_INTERVAL_SECONDS:
+                    # Run garbage collection periodically
                     gc.collect()
-                    self.last_gc_run = now
+                    self.last_cache_cleanup = now
                 
                 # Store current frame reference (avoid unnecessary copy when possible)
                 self.current_frame = frame
@@ -3567,40 +2419,33 @@ class DoorEntryKiosk:
                 # Update display
                 self.root.after(0, lambda f=display_frame: self.display_frame(f))
                 
-                # Adaptive frame rate based on detection state
+                # Adaptive frame rate - aim for ~30 FPS
                 loop_time = time.time() - loop_start
-                target_frame_time = 1.0 / self.target_fps
-                sleep_time = max(0.001, target_frame_time - loop_time)
+                sleep_time = max(0.001, 0.033 - loop_time)
                 time.sleep(sleep_time)
             
-        except cv2.error as e:
-            logger.error(f"OpenCV camera error: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Camera error: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            # Show error on UI
             self.root.after(0, lambda: self.show_toast("Camera error - restarting...", "error"))
-            self._attempt_camera_recovery()
-        except OSError as e:
-            logger.error(f"Camera OS error: {e}", exc_info=True)
-            self.root.after(0, lambda: self.show_toast("Camera hardware error", "error"))
-            self._attempt_camera_recovery()
-        except (tk.TclError, RuntimeError) as e:
-            logger.error(f"UI error in camera loop: {e}", exc_info=True)
+            # Attempt recovery
+            try:
+                time.sleep(2)  # Wait before retry
+                if self.is_running:
+                    logger.info("Attempting camera recovery...")
+                    self.camera.stop()
+                    time.sleep(1)
+                    self.camera.start()
+                    logger.info("Camera recovered successfully")
+            except Exception as recovery_error:
+                logger.error(f"Camera recovery failed: {recovery_error}")
         finally:
             try:
                 self.camera.stop()
             except Exception:
                 pass
-    
-    def _attempt_camera_recovery(self) -> None:
-        """Attempt to recover from camera errors by restarting the camera."""
-        try:
-            time.sleep(2)  # Wait before retry
-            if self.is_running:
-                logger.info("Attempting camera recovery...")
-                self.camera.stop()
-                time.sleep(1)
-                self.camera.start()
-                logger.info("Camera recovered successfully")
-        except (cv2.error, OSError) as recovery_error:
-            logger.error(f"Camera recovery failed: {recovery_error}", exc_info=True)
     
     def display_frame(self, frame):
         """
@@ -4156,20 +3001,14 @@ class DoorEntryKiosk:
         self.train_btn.pack(fill=tk.X, ipady=6)
     
     def create_manage_tab(self, parent):
-        """Build the user management tab with list, pagination, and delete functionality.
+        """Build the user management tab with list and delete functionality.
         
         Args:
             parent: Parent frame for the tab content.
         
-        Displays a paginated list of registered users with their photo counts
-        and provides buttons for revoking, restoring, and deleting users.
+        Displays a list of registered users with their photo counts
+        and provides a delete button for removing users.
         """
-        # Pagination state for users
-        self.users_current_page = 0
-        self.users_total_pages = 1
-        self.users_total_count = 0
-        self.users_all_items = []  # Cache of all user items for pagination
-        
         # Header with title and refresh button
         header = tk.Frame(parent, bg=Config.COLOR_BG)
         header.pack(fill=tk.X, padx=10, pady=(10, 5))
@@ -4210,48 +3049,7 @@ class DoorEntryKiosk:
             relief=tk.FLAT,
             activestyle='none'
         )
-        self.manage_listbox.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
-        
-        # Pagination controls
-        pagination_frame = tk.Frame(card, bg=Config.COLOR_CARD)
-        pagination_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
-        
-        self.users_prev_btn = tk.Button(
-            pagination_frame,
-            text="◀ Previous",
-            font=(Config.FONT_FAMILY, 9),
-            fg=Config.COLOR_SCANNING,
-            bg=Config.COLOR_CARD,
-            activeforeground=Config.COLOR_SCANNING,
-            activebackground=Config.COLOR_CARD_SECONDARY,
-            bd=0,
-            cursor="hand2",
-            command=self.users_prev_page
-        )
-        self.users_prev_btn.pack(side=tk.LEFT)
-        
-        self.users_page_label = tk.Label(
-            pagination_frame,
-            text="Page 1 of 1",
-            font=(Config.FONT_FAMILY, 9),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_CARD
-        )
-        self.users_page_label.pack(side=tk.LEFT, expand=True)
-        
-        self.users_next_btn = tk.Button(
-            pagination_frame,
-            text="Next ▶",
-            font=(Config.FONT_FAMILY, 9),
-            fg=Config.COLOR_SCANNING,
-            bg=Config.COLOR_CARD,
-            activeforeground=Config.COLOR_SCANNING,
-            activebackground=Config.COLOR_CARD_SECONDARY,
-            bd=0,
-            cursor="hand2",
-            command=self.users_next_page
-        )
-        self.users_next_btn.pack(side=tk.RIGHT)
+        self.manage_listbox.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         
         self.refresh_manage_list()
         
@@ -4300,15 +3098,7 @@ class DoorEntryKiosk:
         ).pack(side=tk.LEFT)
     
     def create_log_tab(self, parent):
-        """Build the access log tab with filtering and pagination."""
-        # Pagination state
-        self.log_current_page = 0
-        self.log_total_pages = 1
-        self.log_total_count = 0
-        self.log_date_from = None
-        self.log_date_to = None
-        self.log_name_var = tk.StringVar(value="All")
-        
+        """Build the access log tab with filtering capabilities."""
         # Header with title and clear button
         header = tk.Frame(parent, bg=Config.COLOR_BG)
         header.pack(fill=tk.X, padx=10, pady=(10, 5))
@@ -4401,113 +3191,33 @@ class DoorEntryKiosk:
             relief=tk.FLAT,
             activestyle='none'
         )
-        self.admin_log_listbox.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
+        self.admin_log_listbox.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         
-        # Pagination controls
-        pagination_frame = tk.Frame(card, bg=Config.COLOR_CARD)
-        pagination_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+        # Filter state
+        self.log_date_from = None
+        self.log_date_to = None
+        self.log_name_var = tk.StringVar(value="All")
         
-        self.log_prev_btn = tk.Button(
-            pagination_frame,
-            text="◀ Previous",
-            font=(Config.FONT_FAMILY, 9),
-            fg=Config.COLOR_SCANNING,
-            bg=Config.COLOR_CARD,
-            activeforeground=Config.COLOR_SCANNING,
-            activebackground=Config.COLOR_CARD_SECONDARY,
-            bd=0,
-            cursor="hand2",
-            command=self.log_prev_page
-        )
-        self.log_prev_btn.pack(side=tk.LEFT)
-        
-        self.log_page_label = tk.Label(
-            pagination_frame,
-            text="Page 1 of 1",
-            font=(Config.FONT_FAMILY, 9),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_CARD
-        )
-        self.log_page_label.pack(side=tk.LEFT, expand=True)
-        
-        self.log_next_btn = tk.Button(
-            pagination_frame,
-            text="Next ▶",
-            font=(Config.FONT_FAMILY, 9),
-            fg=Config.COLOR_SCANNING,
-            bg=Config.COLOR_CARD,
-            activeforeground=Config.COLOR_SCANNING,
-            activebackground=Config.COLOR_CARD_SECONDARY,
-            bd=0,
-            cursor="hand2",
-            command=self.log_next_page
-        )
-        self.log_next_btn.pack(side=tk.RIGHT)
-        
-        # Load initial entries with pagination
-        self.refresh_log_page()
+        # Load initial entries
+        self.populate_log_listbox(self.access_log.get_recent(100))
     
     def set_log_date_range(self, days_back):
         """Apply a quick date filter to the access log display."""
-        from datetime import timedelta
+        from datetime import timedelta, date
         today = datetime.now().date()
         
         if days_back == 0:
-            self.log_date_from = today
+            date_from = today
         else:
-            self.log_date_from = today - timedelta(days=days_back)
+            date_from = today - timedelta(days=days_back)
         
-        self.log_date_to = today
-        self.log_current_page = 0  # Reset to first page when filter changes
-        self.refresh_log_page()
+        entries = self.access_log.get_filtered(date_from, today, None, count=100)
+        self.populate_log_listbox(entries)
     
     def clear_log_filter(self):
         """Remove all filters and show all log entries."""
         self.log_name_var.set("All")
-        self.log_date_from = None
-        self.log_date_to = None
-        self.log_current_page = 0
-        self.refresh_log_page()
-    
-    def log_prev_page(self):
-        """Navigate to previous page of log entries."""
-        if self.log_current_page > 0:
-            self.log_current_page -= 1
-            self.refresh_log_page()
-    
-    def log_next_page(self):
-        """Navigate to next page of log entries."""
-        if self.log_current_page < self.log_total_pages - 1:
-            self.log_current_page += 1
-            self.refresh_log_page()
-    
-    def refresh_log_page(self):
-        """Refresh the log display with current page and filters."""
-        entries, total_count, total_pages = self.access_log.get_paginated(
-            page=self.log_current_page,
-            page_size=Config.LOG_PAGE_SIZE,
-            date_from=self.log_date_from,
-            date_to=self.log_date_to,
-            name_filter=None if self.log_name_var.get() == "All" else self.log_name_var.get()
-        )
-        
-        self.log_total_count = total_count
-        self.log_total_pages = total_pages
-        
-        # Update pagination controls
-        self.log_page_label.config(text=f"Page {self.log_current_page + 1} of {total_pages} ({total_count} entries)")
-        
-        # Enable/disable navigation buttons
-        self.log_prev_btn.config(
-            state=tk.NORMAL if self.log_current_page > 0 else tk.DISABLED,
-            fg=Config.COLOR_SCANNING if self.log_current_page > 0 else Config.COLOR_TEXT_TERTIARY
-        )
-        self.log_next_btn.config(
-            state=tk.NORMAL if self.log_current_page < total_pages - 1 else tk.DISABLED,
-            fg=Config.COLOR_SCANNING if self.log_current_page < total_pages - 1 else Config.COLOR_TEXT_TERTIARY
-        )
-        
-        self.populate_log_listbox(entries)
+        self.populate_log_listbox(self.access_log.get_recent(100))
     
     def populate_log_listbox(self, entries):
         """Fill the log listbox with formatted access entries."""
@@ -4635,12 +3345,13 @@ class DoorEntryKiosk:
         """Refresh the users list showing both active and revoked users.
         
         Active users are shown normally, revoked users are shown with
-        a [REVOKED] prefix. Builds full list then displays current page.
+        a [REVOKED] prefix. Maintains index-to-name mapping for operations.
         """
-        # Build complete list of all users
-        self.users_all_items = []
+        self.manage_listbox.delete(0, tk.END)
         self.person_map = {}
-        self.person_status = {}
+        self.person_status = {}  # Track if user is active or revoked
+        
+        idx = 0
         
         # Get active users from trained model
         trained_names = self.face_system.get_trained_persons()
@@ -4649,80 +3360,19 @@ class DoorEntryKiosk:
             name_counts[name] = name_counts.get(name, 0) + 1
         
         for name in sorted(trained_names):
+            self.person_map[idx] = name
+            self.person_status[idx] = 'active'
             count = name_counts.get(name, 0)
-            self.users_all_items.append({
-                'name': name,
-                'status': 'active',
-                'count': count,
-                'display': f"  ✓  {name}   •   {count} encodings"
-            })
+            self.manage_listbox.insert(tk.END, f"  ✓  {name}   •   {count} encodings")
+            idx += 1
         
         # Get revoked users
         revoked_users = self.face_system.get_disabled_persons()
         for name, count in sorted(revoked_users):
-            self.users_all_items.append({
-                'name': name,
-                'status': 'revoked',
-                'count': count,
-                'display': f"  ✗  {name}   •   {count} encodings [REVOKED]"
-            })
-        
-        # Calculate pagination
-        self.users_total_count = len(self.users_all_items)
-        self.users_total_pages = max(1, (self.users_total_count + Config.USERS_PAGE_SIZE - 1) // Config.USERS_PAGE_SIZE)
-        
-        # Ensure current page is valid
-        if self.users_current_page >= self.users_total_pages:
-            self.users_current_page = max(0, self.users_total_pages - 1)
-        
-        self.refresh_users_page()
-    
-    def users_prev_page(self):
-        """Navigate to previous page of users."""
-        if self.users_current_page > 0:
-            self.users_current_page -= 1
-            self.refresh_users_page()
-    
-    def users_next_page(self):
-        """Navigate to next page of users."""
-        if self.users_current_page < self.users_total_pages - 1:
-            self.users_current_page += 1
-            self.refresh_users_page()
-    
-    def refresh_users_page(self):
-        """Display the current page of users."""
-        self.manage_listbox.delete(0, tk.END)
-        self.person_map = {}
-        self.person_status = {}
-        
-        # Calculate slice for current page
-        start_idx = self.users_current_page * Config.USERS_PAGE_SIZE
-        end_idx = start_idx + Config.USERS_PAGE_SIZE
-        page_items = self.users_all_items[start_idx:end_idx]
-        
-        # Populate listbox with current page
-        for local_idx, item in enumerate(page_items):
-            self.person_map[local_idx] = item['name']
-            self.person_status[local_idx] = item['status']
-            self.manage_listbox.insert(tk.END, item['display'])
-        
-        if not page_items:
-            self.manage_listbox.insert(tk.END, "  No users registered")
-        
-        # Update pagination controls
-        self.users_page_label.config(
-            text=f"Page {self.users_current_page + 1} of {self.users_total_pages} ({self.users_total_count} users)"
-        )
-        
-        # Enable/disable navigation buttons
-        self.users_prev_btn.config(
-            state=tk.NORMAL if self.users_current_page > 0 else tk.DISABLED,
-            fg=Config.COLOR_SCANNING if self.users_current_page > 0 else Config.COLOR_TEXT_TERTIARY
-        )
-        self.users_next_btn.config(
-            state=tk.NORMAL if self.users_current_page < self.users_total_pages - 1 else tk.DISABLED,
-            fg=Config.COLOR_SCANNING if self.users_current_page < self.users_total_pages - 1 else Config.COLOR_TEXT_TERTIARY
-        )
+            self.person_map[idx] = name
+            self.person_status[idx] = 'revoked'
+            self.manage_listbox.insert(tk.END, f"  ✗  {name}   •   {count} encodings [REVOKED]")
+            idx += 1
     
     def refresh_train_tab(self):
         """Update the training tab's dataset statistics display."""
@@ -5311,7 +3961,7 @@ class DoorEntryKiosk:
     
     def clear_access_log(self):
         """Clear all access log entries with user confirmation."""
-        entry_count = self.access_log.get_total_count()
+        entry_count = len(self.access_log.entries)
         if entry_count == 0:
             self.show_toast("Log is already empty", "info")
             return
