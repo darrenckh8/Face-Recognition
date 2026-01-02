@@ -67,19 +67,8 @@ except ImportError:
     USE_FAISS = False
     logger.info("FAISS not available - using linear search (install with: pip install faiss-cpu)")
 
-# ONNX Runtime: Optional - required for MiniFASNet anti-spoofing
-USE_ANTISPOOF = False
-ONNX_SESSION = None
-try:
-    import onnxruntime as ort
-    USE_ANTISPOOF = True
-    logger.info("ONNX Runtime available - Anti-spoofing support enabled")
-except ImportError:
-    USE_ANTISPOOF = False
-    logger.info("ONNX Runtime not available - anti-spoofing disabled (install with: pip install onnxruntime)")
 
-
-# ==================== SECURITY UTILITIES ==
+# ==================== SECURITY UTILITIES ====================
 def hash_password(password: str) -> str:
     """
     Hash a password using SHA-256 with a salt for secure storage.
@@ -149,11 +138,12 @@ class Config:
     USE_MULTIPROCESSING = True             # Use separate process for recognition (bypasses GIL)
     FAISS_INDEX_THRESHOLD = 50             # Use FAISS index when user count exceeds this
     
-    # ----- Anti-Spoofing / Liveness Detection -----
-    ENABLE_ANTISPOOF = True                # Enable liveness detection (requires onnxruntime)
-    ANTISPOOF_MODEL_PATH = "anti_spoof_models"  # Directory containing MiniFASNet ONNX models
-    ANTISPOOF_THRESHOLD = 0.5              # Threshold for real vs spoof (higher = stricter)
-    ANTISPOOF_SCALE = 2.7                  # Face crop scale factor for anti-spoof model
+    # ----- Liveness Detection (Anti-Spoofing) -----
+    LIVENESS_ENABLED = True                # Require blink to confirm liveness
+    LIVENESS_EAR_THRESHOLD = 0.21          # Eye Aspect Ratio below this = eye closed
+    LIVENESS_BLINK_FRAMES = 2              # Consecutive frames with closed eyes = blink
+    LIVENESS_TIMEOUT_SECONDS = 10.0        # Time allowed to complete liveness check
+    LIVENESS_COOLDOWN_SECONDS = 30.0       # Cooldown before requiring liveness again for same person
     
     # ----- Memory Management Settings -----
     MAX_CACHE_ENTRIES = 20  # Maximum faces to keep in cache
@@ -429,6 +419,242 @@ class FaceStabilityTracker:
         with self.lock:
             self.last_positions.pop(face_id, None)
             self.stable_count.pop(face_id, None)
+
+
+# ==================== LIVENESS DETECTOR ====================
+class LivenessDetector:
+    """
+    Detects liveness via blink detection to prevent photo-based spoofing.
+    
+    Uses Eye Aspect Ratio (EAR) calculated from InsightFace's 106-point
+    facial landmarks. A blink is detected when EAR drops below threshold
+    for consecutive frames, then returns to normal.
+    
+    Attributes:
+        ear_threshold: EAR value below which eyes are considered closed
+        blink_frames: Consecutive closed-eye frames to register a blink
+    """
+    
+    # Eye landmark indices from InsightFace's 106-point model
+    # Left eye: indices 33-41 (upper) and 42-46 (lower) - 8 contour points total
+    # Right eye: indices 87-95 (upper) and 96-100 (lower) - 8 contour points total
+    LEFT_EYE_INDICES = [33, 34, 35, 36, 37, 42, 43, 44]  # Top and bottom points
+    RIGHT_EYE_INDICES = [87, 88, 89, 90, 91, 96, 97, 98]  # Top and bottom points
+    
+    def __init__(self, ear_threshold: float = None, blink_frames: int = None):
+        """
+        Initialize the liveness detector.
+        
+        Args:
+            ear_threshold: EAR value below which eyes are considered closed
+            blink_frames: Consecutive frames with closed eyes to count as blink
+        """
+        self.ear_threshold = ear_threshold or Config.LIVENESS_EAR_THRESHOLD
+        self.blink_frames = blink_frames or Config.LIVENESS_BLINK_FRAMES
+        self.timeout = Config.LIVENESS_TIMEOUT_SECONDS
+        self.cooldown = Config.LIVENESS_COOLDOWN_SECONDS
+        
+        # Track state per person (by name)
+        self._pending_checks: Dict[str, Dict[str, Any]] = {}  # {name: {start_time, closed_frames, blink_detected}}
+        self._verified: Dict[str, float] = {}  # {name: verification_timestamp}
+        self._lock = threading.Lock()
+    
+    def _calculate_ear(self, eye_landmarks: np.ndarray) -> float:
+        """
+        Calculate Eye Aspect Ratio from landmark points.
+        
+        EAR = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
+        
+        For 8-point eye contour, we approximate using vertical vs horizontal distances.
+        
+        Args:
+            eye_landmarks: Array of (x, y) coordinates for eye contour
+            
+        Returns:
+            Eye aspect ratio (lower = more closed)
+        """
+        if len(eye_landmarks) < 6:
+            return 1.0  # Default to "open" if insufficient points
+        
+        # Use points at roughly: left corner, upper lid center, upper lid, 
+        # right corner, lower lid center, lower lid
+        # For 8-point contour: [0]=left, [2]=upper-mid, [4]=right, [6]=lower-mid
+        
+        # Calculate vertical eye opening (average of two vertical distances)
+        # Upper to lower lid distance
+        vertical_1 = np.linalg.norm(eye_landmarks[1] - eye_landmarks[5])
+        vertical_2 = np.linalg.norm(eye_landmarks[2] - eye_landmarks[6])
+        
+        # Horizontal eye width (corner to corner)
+        horizontal = np.linalg.norm(eye_landmarks[0] - eye_landmarks[4])
+        
+        if horizontal < 1e-6:
+            return 1.0  # Avoid division by zero
+        
+        # EAR formula
+        ear = (vertical_1 + vertical_2) / (2.0 * horizontal)
+        return ear
+    
+    def get_ear_from_face(self, face) -> Tuple[float, float]:
+        """
+        Extract EAR for both eyes from an InsightFace detection result.
+        
+        Args:
+            face: InsightFace Face object with landmark_2d_106 attribute
+            
+        Returns:
+            Tuple of (left_ear, right_ear), or (1.0, 1.0) if landmarks unavailable
+        """
+        # Check for 106-point landmarks
+        landmarks = getattr(face, 'landmark_2d_106', None)
+        if landmarks is None:
+            # Try alternative attribute names
+            landmarks = getattr(face, 'landmark', None)
+        
+        if landmarks is None or len(landmarks) < 100:
+            # Fall back to kps (5-point) - can't calculate EAR properly
+            return 1.0, 1.0
+        
+        try:
+            left_eye = landmarks[self.LEFT_EYE_INDICES]
+            right_eye = landmarks[self.RIGHT_EYE_INDICES]
+            
+            left_ear = self._calculate_ear(left_eye)
+            right_ear = self._calculate_ear(right_eye)
+            
+            return left_ear, right_ear
+        except (IndexError, TypeError):
+            return 1.0, 1.0
+    
+    def is_verified(self, name: str) -> bool:
+        """
+        Check if a person has passed liveness verification recently.
+        
+        Args:
+            name: Person's name
+            
+        Returns:
+            True if verified within cooldown period
+        """
+        if not Config.LIVENESS_ENABLED:
+            return True  # Liveness disabled, always verified
+        
+        with self._lock:
+            if name in self._verified:
+                elapsed = time.time() - self._verified[name]
+                if elapsed < self.cooldown:
+                    return True
+                else:
+                    # Verification expired
+                    del self._verified[name]
+            return False
+    
+    def start_check(self, name: str) -> None:
+        """
+        Start a liveness check for a recognized person.
+        
+        Args:
+            name: Person's name
+        """
+        if not Config.LIVENESS_ENABLED:
+            return
+        
+        with self._lock:
+            if name not in self._pending_checks:
+                self._pending_checks[name] = {
+                    'start_time': time.time(),
+                    'closed_frames': 0,
+                    'was_closed': False,
+                    'blink_detected': False
+                }
+                logger.debug(f"Started liveness check for {name}")
+    
+    def update_check(self, name: str, left_ear: float, right_ear: float) -> str:
+        """
+        Update liveness check with new EAR values.
+        
+        Args:
+            name: Person's name
+            left_ear: Left eye aspect ratio
+            right_ear: Right eye aspect ratio
+            
+        Returns:
+            Status string: 'pending', 'verified', 'timeout', or 'not_started'
+        """
+        if not Config.LIVENESS_ENABLED:
+            return 'verified'
+        
+        with self._lock:
+            if name not in self._pending_checks:
+                return 'not_started'
+            
+            check = self._pending_checks[name]
+            
+            # Check timeout
+            elapsed = time.time() - check['start_time']
+            if elapsed > self.timeout:
+                del self._pending_checks[name]
+                logger.debug(f"Liveness check timed out for {name}")
+                return 'timeout'
+            
+            # Average EAR from both eyes
+            avg_ear = (left_ear + right_ear) / 2.0
+            
+            # Detect blink: eyes must close then reopen
+            if avg_ear < self.ear_threshold:
+                check['closed_frames'] += 1
+                if check['closed_frames'] >= self.blink_frames:
+                    check['was_closed'] = True
+            else:
+                # Eyes are open
+                if check['was_closed']:
+                    # Blink completed (was closed, now open)
+                    check['blink_detected'] = True
+                check['closed_frames'] = 0
+            
+            if check['blink_detected']:
+                # Verification successful
+                self._verified[name] = time.time()
+                del self._pending_checks[name]
+                logger.info(f"Liveness verified for {name} (blink detected)")
+                return 'verified'
+            
+            return 'pending'
+    
+    def cancel_check(self, name: str) -> None:
+        """Cancel an ongoing liveness check."""
+        with self._lock:
+            self._pending_checks.pop(name, None)
+    
+    def get_pending_names(self) -> List[str]:
+        """Get list of names with pending liveness checks."""
+        with self._lock:
+            return list(self._pending_checks.keys())
+    
+    def clear_expired(self) -> None:
+        """Remove expired verification records."""
+        now = time.time()
+        with self._lock:
+            expired = [
+                name for name, ts in self._verified.items()
+                if now - ts > self.cooldown
+            ]
+            for name in expired:
+                del self._verified[name]
+            
+            # Also clear timed-out pending checks
+            timed_out = [
+                name for name, check in self._pending_checks.items()
+                if now - check['start_time'] > self.timeout
+            ]
+            for name in timed_out:
+                del self._pending_checks[name]
+    
+    def reset(self) -> None:
+        """Clear all liveness tracking state."""
+        with self._lock:
+            self._pending_checks.clear()
+            self._verified.clear()
 
 
 # ==================== FACE CACHE ====================
@@ -1524,236 +1750,6 @@ def _embedding_worker_process(
             continue
 
 
-# ==================== ANTI-SPOOFING DETECTOR ====================
-class AntiSpoofPredictor:
-    """
-    Liveness detection using MiniFASNet ONNX models.
-    
-    Classifies faces as 'Real' or 'Spoof' to prevent photo/video attacks.
-    Uses multiple scales for robust detection.
-    """
-    
-    # Model input sizes for multi-scale detection
-    MODEL_SCALES = {
-        "2.7_80x80": (80, 80, 2.7),
-        "4.0_80x80": (80, 80, 4.0),
-    }
-    
-    def __init__(self, model_dir: str = None):
-        """
-        Initialize anti-spoof predictor.
-        
-        Args:
-            model_dir: Directory containing MiniFASNet ONNX model files
-        """
-        self.model_dir = model_dir or Config.ANTISPOOF_MODEL_PATH
-        self.sessions: Dict[str, Any] = {}
-        self.available = False
-        self._load_models()
-    
-    def _load_models(self) -> None:
-        """Load all available MiniFASNet ONNX models."""
-        if not USE_ANTISPOOF:
-            logger.warning("ONNX Runtime not available - anti-spoofing disabled")
-            return
-        
-        if not os.path.exists(self.model_dir):
-            logger.warning(f"Anti-spoof model directory not found: {self.model_dir}")
-            logger.info("To enable anti-spoofing, download MiniFASNet models to 'anti_spoof_models/' directory")
-            return
-        
-        try:
-            import onnxruntime as ort
-            
-            # Look for ONNX model files
-            model_files = [f for f in os.listdir(self.model_dir) if f.endswith('.onnx')]
-            
-            if not model_files:
-                logger.warning(f"No ONNX models found in {self.model_dir}")
-                return
-            
-            # Load each model
-            for model_file in model_files:
-                model_path = os.path.join(self.model_dir, model_file)
-                try:
-                    session = ort.InferenceSession(
-                        model_path,
-                        providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
-                    )
-                    self.sessions[model_file] = session
-                    logger.info(f"Loaded anti-spoof model: {model_file}")
-                except Exception as e:
-                    logger.error(f"Failed to load anti-spoof model {model_file}: {e}")
-            
-            if self.sessions:
-                self.available = True
-                logger.info(f"Anti-spoofing enabled with {len(self.sessions)} model(s)")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize anti-spoof predictor: {e}")
-    
-    def _crop_face(self, frame: np.ndarray, bbox: Tuple[int, int, int, int], 
-                   scale: float = 2.7) -> Optional[np.ndarray]:
-        """
-        Crop and prepare face region for anti-spoof model.
-        
-        Args:
-            frame: Full frame image (BGR)
-            bbox: Face bounding box (left, top, right, bottom)
-            scale: Crop scale factor (larger = more context around face)
-            
-        Returns:
-            Cropped and padded face image, or None if invalid
-        """
-        left, top, right, bottom = bbox
-        
-        # Calculate face dimensions
-        width = right - left
-        height = bottom - top
-        
-        if width <= 0 or height <= 0:
-            return None
-        
-        # Calculate center and scaled crop region
-        center_x = (left + right) // 2
-        center_y = (top + bottom) // 2
-        
-        # Use the larger dimension for square crop
-        size = max(width, height)
-        scaled_size = int(size * scale)
-        half_size = scaled_size // 2
-        
-        # Calculate crop boundaries
-        crop_left = max(0, center_x - half_size)
-        crop_top = max(0, center_y - half_size)
-        crop_right = min(frame.shape[1], center_x + half_size)
-        crop_bottom = min(frame.shape[0], center_y + half_size)
-        
-        # Crop the face region
-        face_crop = frame[crop_top:crop_bottom, crop_left:crop_right]
-        
-        if face_crop.size == 0:
-            return None
-        
-        return face_crop
-    
-    def _preprocess(self, face_crop: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
-        """
-        Preprocess face crop for model input.
-        
-        Args:
-            face_crop: Cropped face image (BGR)
-            target_size: Model input size (width, height)
-            
-        Returns:
-            Preprocessed tensor ready for model input
-        """
-        # Resize to model input size
-        resized = cv2.resize(face_crop, target_size)
-        
-        # Convert BGR to RGB
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        
-        # Normalize to [-1, 1]
-        normalized = (rgb.astype(np.float32) - 127.5) / 128.0
-        
-        # Transpose to NCHW format (batch, channels, height, width)
-        transposed = np.transpose(normalized, (2, 0, 1))
-        
-        # Add batch dimension
-        batched = np.expand_dims(transposed, axis=0)
-        
-        return batched
-    
-    def predict(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Tuple[bool, float]:
-        """
-        Predict if a face is real or spoofed.
-        
-        Args:
-            frame: Full frame image (BGR)
-            bbox: Face bounding box (left, top, right, bottom)
-            
-        Returns:
-            Tuple of (is_real: bool, confidence: float)
-            is_real is True if face appears to be a live person
-            confidence is the model's certainty (0.0 to 1.0)
-        """
-        if not self.available:
-            # If anti-spoof not available, assume real
-            return True, 1.0
-        
-        try:
-            scores = []
-            
-            # Run inference on each model
-            for model_name, session in self.sessions.items():
-                # Determine scale from model name or use default
-                scale = Config.ANTISPOOF_SCALE
-                for key, (w, h, s) in self.MODEL_SCALES.items():
-                    if key in model_name:
-                        scale = s
-                        target_size = (w, h)
-                        break
-                else:
-                    # Default size if not matched
-                    target_size = (80, 80)
-                
-                # Crop and preprocess face
-                face_crop = self._crop_face(frame, bbox, scale)
-                if face_crop is None:
-                    continue
-                
-                input_tensor = self._preprocess(face_crop, target_size)
-                
-                # Get model input name
-                input_name = session.get_inputs()[0].name
-                
-                # Run inference
-                outputs = session.run(None, {input_name: input_tensor})
-                
-                # Parse output (typically softmax over [spoof, real])
-                output = outputs[0]
-                
-                if output.shape[-1] >= 2:
-                    # Standard 2-class output: [spoof_prob, real_prob]
-                    real_score = float(output[0][1])
-                elif output.shape[-1] == 1:
-                    # Single output: higher = more real
-                    real_score = float(output[0][0])
-                else:
-                    real_score = 0.5
-                
-                scores.append(real_score)
-            
-            if not scores:
-                return True, 1.0
-            
-            # Average scores from all models
-            avg_score = sum(scores) / len(scores)
-            is_real = avg_score >= Config.ANTISPOOF_THRESHOLD
-            
-            return is_real, avg_score
-            
-        except Exception as e:
-            logger.error(f"Anti-spoof prediction failed: {e}")
-            # On error, assume real to avoid blocking legitimate access
-            return True, 1.0
-    
-    def predict_batch(self, frame: np.ndarray, 
-                      bboxes: List[Tuple[int, int, int, int]]) -> List[Tuple[bool, float]]:
-        """
-        Predict liveness for multiple faces.
-        
-        Args:
-            frame: Full frame image (BGR)
-            bboxes: List of face bounding boxes
-            
-        Returns:
-            List of (is_real, confidence) tuples for each face
-        """
-        return [self.predict(frame, bbox) for bbox in bboxes]
-
-
 # ==================== FACE RECOGNITION SYSTEM ====================
 class FaceRecognitionSystem:
     """
@@ -1788,6 +1784,9 @@ class FaceRecognitionSystem:
         # Face stability tracking - wait for face to settle before recognizing
         self.stability_tracker = FaceStabilityTracker()
         
+        # Liveness detection - anti-spoofing via blink detection
+        self.liveness_detector = LivenessDetector()
+        
         # Initialize InsightFace model
         try:
             self.face_app = FaceAnalysis(
@@ -1814,15 +1813,6 @@ class FaceRecognitionSystem:
         
         # Cache to avoid re-recognizing the same face
         self.face_cache = FaceCache()
-        
-        # Anti-spoofing / liveness detection
-        self.antispoof = None
-        if Config.ENABLE_ANTISPOOF:
-            self.antispoof = AntiSpoofPredictor()
-            if self.antispoof.available:
-                logger.info("Anti-spoofing liveness detection enabled")
-            else:
-                logger.warning("Anti-spoofing requested but models not available")
         
         # Frame skip counter for performance
         self.frame_count = 0
@@ -2609,6 +2599,9 @@ class FaceRecognitionSystem:
             left, top, right, bottom = bbox[0], bbox[1], bbox[2], bbox[3]
             location = (top, right, bottom, left)
             
+            # Extract Eye Aspect Ratio for liveness detection
+            left_ear, right_ear = self.liveness_detector.get_ear_from_face(face)
+            
             # Check face stability before attempting recognition
             is_stable = self.stability_tracker.update_and_check_stability(face_idx, location)
             
@@ -2622,7 +2615,9 @@ class FaceRecognitionSystem:
                     'confidence': cached['confidence'],
                     'location': location,
                     'from_cache': True,
-                    'is_stable': is_stable
+                    'is_stable': is_stable,
+                    'left_ear': left_ear,
+                    'right_ear': right_ear
                 })
                 continue
             
@@ -2634,7 +2629,9 @@ class FaceRecognitionSystem:
                     'confidence': cached['confidence'],
                     'location': location,
                     'from_cache': True,
-                    'is_stable': is_stable
+                    'is_stable': is_stable,
+                    'left_ear': left_ear,
+                    'right_ear': right_ear
                 })
                 continue
             
@@ -2645,7 +2642,9 @@ class FaceRecognitionSystem:
                     'confidence': 0.0,
                     'location': location,
                     'from_cache': False,
-                    'is_stable': False
+                    'is_stable': False,
+                    'left_ear': left_ear,
+                    'right_ear': right_ear
                 })
                 continue
             
@@ -2669,18 +2668,8 @@ class FaceRecognitionSystem:
                 name = self.known_names[best_match_index]
                 confidence = float(best_similarity)
             
-            # Perform liveness/anti-spoof check for recognized faces
-            is_real = True
-            liveness_score = 1.0
-            if name != "Unknown" and self.antispoof is not None and self.antispoof.available:
-                is_real, liveness_score = self.antispoof.predict(frame, (left, top, right, bottom))
-                if not is_real:
-                    logger.warning(f"Spoof detected for '{name}' (score: {liveness_score:.3f})")
-                    name = "Spoof"
-                    confidence = 0.0
-            
-            # Only cache recognized faces, not unknown or spoofed ones
-            if name != "Unknown" and name != "Spoof":
+            # Only cache recognized faces, not unknown ones
+            if name != "Unknown":
                 self.face_cache.put(location, name, confidence, face_encoding)
             
             results.append({
@@ -2689,8 +2678,8 @@ class FaceRecognitionSystem:
                 'location': location,
                 'from_cache': False,
                 'is_stable': True,
-                'is_real': is_real,
-                'liveness_score': liveness_score
+                'left_ear': left_ear,
+                'right_ear': right_ear
             })
         
         return results
@@ -2759,9 +2748,10 @@ class FaceRecognitionSystem:
         return self._recognition_running
     
     def clear_cache(self):
-        """Reset face cache, stability tracker, and pending frame queue."""
+        """Reset face cache, stability tracker, liveness state, and pending frame queue."""
         self.face_cache.clear()
         self.stability_tracker.clear()
+        self.liveness_detector.reset()
         with self._last_results_lock:
             self._last_results = []
         try:
@@ -3259,8 +3249,9 @@ class DoorEntryKiosk:
         Update the status display with appropriate styling.
         
         Args:
-            status: One of "scanning", "active_scanning", "processing", "granted", "denied"
-            name: Person name for granted status
+            status: One of "scanning", "active_scanning", "processing", 
+                    "granted", "denied", "liveness", "liveness_timeout"
+            name: Person name for granted/liveness status
             confidence: Recognition confidence for display
         """
         self.current_status = status
@@ -3315,6 +3306,26 @@ class DoorEntryKiosk:
             self.status_detail_label.config(text="Please wait")
             update_bg(Config.COLOR_CARD, Config.COLOR_WARNING, Config.COLOR_TEXT, Config.COLOR_TEXT_SECONDARY)
             self.status_card.config(highlightbackground=Config.COLOR_WARNING)
+        
+        elif status == "liveness":
+            # Liveness check in progress - ask user to blink
+            display_name = name if len(name) <= 20 else name[:18] + "..."
+            self.status_icon_label.config(text="👁")
+            self.status_text_label.config(text=f"Hello, {display_name}")
+            self.status_detail_label.config(text="Please BLINK to confirm it's you")
+            update_bg(Config.COLOR_CARD, Config.COLOR_SCANNING, Config.COLOR_TEXT, Config.COLOR_TEXT_SECONDARY)
+            self.status_card.config(highlightbackground=Config.COLOR_SCANNING)
+        
+        elif status == "liveness_timeout":
+            # Liveness check timed out
+            self.status_icon_label.config(text="⏱")
+            self.status_text_label.config(text="Liveness Check Failed")
+            self.status_detail_label.config(text="No blink detected - try again")
+            update_bg(Config.COLOR_WARNING, "#FFFFFF", "#FFFFFF", "#FFF3E0")
+            self._status_reset_id = self.root.after(
+                Config.STATUS_DISPLAY_DURATION, 
+                self._set_status_scanning
+            )
             
         else:  # Default scanning state
             self.status_icon_label.config(text="◉")
@@ -3386,18 +3397,11 @@ class DoorEntryKiosk:
                             confidence = result['confidence']
                             from_cache = result.get('from_cache', False)
                             is_stable = result.get('is_stable', True)
-                            is_real = result.get('is_real', True)
+                            left_ear = result.get('left_ear', 1.0)
+                            right_ear = result.get('right_ear', 1.0)
                             
                             # Skip unstable faces
                             if not is_stable or name == 'Scanning...':
-                                continue
-                            
-                            # Handle spoof detection
-                            if name == "Spoof" or not is_real:
-                                now = time.time()
-                                if "Spoof" not in self.last_access or (now - self.last_access["Spoof"]) > Config.COOLDOWN_SECONDS:
-                                    self.last_access["Spoof"] = now
-                                    self.root.after(0, self.deny_spoof)
                                 continue
                             
                             # Handle recognized faces
@@ -3405,8 +3409,33 @@ class DoorEntryKiosk:
                                 now = time.time()
                                 # Apply cooldown to prevent duplicate logs
                                 if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
-                                    self.last_access[name] = now
-                                    self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
+                                    # Check liveness verification
+                                    if Config.LIVENESS_ENABLED:
+                                        liveness = self.face_system.liveness_detector
+                                        
+                                        if liveness.is_verified(name):
+                                            # Already verified, grant access
+                                            self.last_access[name] = now
+                                            self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
+                                        else:
+                                            # Start or update liveness check
+                                            liveness.start_check(name)
+                                            status = liveness.update_check(name, left_ear, right_ear)
+                                            
+                                            if status == 'verified':
+                                                # Liveness confirmed, grant access
+                                                self.last_access[name] = now
+                                                self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
+                                            elif status == 'pending':
+                                                # Show blink prompt
+                                                self.root.after(0, lambda n=name: self.set_status("liveness", n))
+                                            elif status == 'timeout':
+                                                # Liveness check timed out
+                                                self.root.after(0, lambda: self.set_status("liveness_timeout"))
+                                    else:
+                                        # Liveness disabled, grant access directly
+                                        self.last_access[name] = now
+                                        self.root.after(0, lambda n=name, c=confidence: self.grant_access(n, c))
                             else:
                                 # Log unknown faces (with cooldown)
                                 if name == "Unknown" and self.current_status in ("scanning", "active_scanning") and not from_cache:
@@ -3678,17 +3707,6 @@ class DoorEntryKiosk:
         self.update_log_display()
         self._pulse_border(Config.COLOR_DENIED)
         logger.info("Access denied: Unknown person")
-    
-    def deny_spoof(self):
-        """
-        Handle spoof/photo attack detection - deny access.
-        Logs attempt with 'Spoof' identifier and shows warning feedback.
-        """
-        self.set_status("denied")
-        self.access_log.add_entry("Spoof", False, 0.0)
-        self.update_log_display()
-        self._pulse_border(Config.COLOR_WARNING)  # Orange for spoof warning
-        logger.warning("Access denied: Spoof/photo attack detected")
     
     def _pulse_border(self, color, duration=300):
         """Create a brief color pulse on the video container border."""
