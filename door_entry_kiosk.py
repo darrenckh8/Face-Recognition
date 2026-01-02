@@ -3972,13 +3972,77 @@ class DoorEntryKiosk:
         
         # Handle Escape key
         overlay.bind('<Escape>', lambda e: close_dialog(False if show_cancel else True))
-        overlay.focus_set()
         
         # If no callback provided, block until dialog is closed
         if callback is None:
-            overlay.grab_set()
-            self.root.wait_window(overlay)
+            # Use wait_variable instead of grab_set for Wayland/Cage compatibility
+            # grab_set() fails with "window not viewable" under Wayland
+            wait_var = tk.BooleanVar(value=False)
+            
+            def on_close(value):
+                result['value'] = value
+                result['done'] = True
+                overlay.destroy()
+                wait_var.set(True)
+            
+            # Rebind close_dialog to use wait_var
+            for widget in btn_frame.winfo_children():
+                widget.destroy()
+            
+            if show_cancel:
+                cancel_btn = tk.Button(
+                    btn_frame,
+                    text="Cancel" if dialog_type != "question" else "No",
+                    font=(Config.FONT_FAMILY, 11),
+                    fg=Config.COLOR_TEXT_SECONDARY,
+                    bg=Config.COLOR_BG,
+                    activeforeground=Config.COLOR_TEXT,
+                    activebackground=Config.COLOR_CARD_SECONDARY,
+                    relief=tk.FLAT,
+                    cursor="hand2",
+                    width=10,
+                    command=lambda: on_close(False)
+                )
+                cancel_btn.pack(side=tk.LEFT, padx=(0, 10))
+                
+                ok_btn = tk.Button(
+                    btn_frame,
+                    text="OK" if dialog_type != "question" else "Yes",
+                    font=(Config.FONT_FAMILY, 11),
+                    fg="white",
+                    bg=accent_color,
+                    activeforeground="white",
+                    activebackground=accent_color,
+                    relief=tk.FLAT,
+                    cursor="hand2",
+                    width=10,
+                    command=lambda: on_close(True)
+                )
+                ok_btn.pack(side=tk.RIGHT)
+            else:
+                ok_btn = tk.Button(
+                    btn_frame,
+                    text="OK",
+                    font=(Config.FONT_FAMILY, 11),
+                    fg="white",
+                    bg=accent_color,
+                    activeforeground="white",
+                    activebackground=accent_color,
+                    relief=tk.FLAT,
+                    cursor="hand2",
+                    width=12,
+                    command=lambda: on_close(True)
+                )
+                ok_btn.pack()
+            
+            overlay.bind('<Escape>', lambda e: on_close(False if show_cancel else True))
+            overlay.focus_force()
+            
+            # Wait for dialog to be closed
+            self.root.wait_variable(wait_var)
             return result['value']
+        else:
+            overlay.focus_force()
         
         return None
     
