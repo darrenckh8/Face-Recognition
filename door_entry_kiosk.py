@@ -190,8 +190,8 @@ class Config:
     
     # ----- Liveness Detection (Blink) -----
     ENABLE_BLINK_DETECTION = True          # Enable blink-based liveness detection
-    EAR_THRESHOLD = 0.21                   # Eye Aspect Ratio threshold for blink detection
-    BLINK_CONSEC_FRAMES = 2                # Consecutive frames below threshold to count as blink
+    EAR_THRESHOLD = 0.30                   # Eye Aspect Ratio threshold for blink detection (higher = more sensitive)
+    BLINK_CONSEC_FRAMES = 1                # Consecutive frames below threshold to count as blink (1 = most responsive)
     BLINK_REQUIRED_COUNT = 1               # Number of blinks required to pass liveness
     BLINK_TIMEOUT_SECONDS = 5.0            # Time window to detect required blinks
     
