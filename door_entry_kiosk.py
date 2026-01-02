@@ -1613,8 +1613,9 @@ class FaceRecognitionSystem:
                 name = self.known_names[best_match_index]
                 confidence = float(best_similarity)
             
-            # Cache result for future frames
-            self.face_cache.put(location, name, confidence, face_encoding)
+            # Only cache recognized faces, not unknown ones
+            if name != "Unknown":
+                self.face_cache.put(location, name, confidence, face_encoding)
             
             results.append({
                 'name': name,
