@@ -115,6 +115,13 @@ class Config:
     USE_FAST_DETECTION = False            # Use Haar cascade (faster but less accurate)
     EMBEDDING_CACHE_THRESHOLD = 0.6       # Similarity threshold for cache matching
     
+    # ----- Power/Compute Optimization -----
+    IDLE_FPS = 10                          # Lower frame rate when no faces detected
+    ACTIVE_FPS = 30                        # Higher frame rate when faces detected
+    IDLE_RECOGNITION_INTERVAL = 4          # Process every Nth frame when idle (less frequent)
+    CAPTURE_THREAD_SLEEP_MS = 5            # Milliseconds to sleep between captures (reduce CPU spin)
+    GC_INTERVAL_SECONDS = 120              # Garbage collection interval (seconds)
+    
     # ----- Memory Management Settings -----
     MAX_CACHE_ENTRIES = 20  # Maximum faces to keep in cache
     ACCESS_LOG_MAX_MEMORY_ENTRIES = 1000  # Max entries to keep in memory (older are on disk only)
@@ -928,6 +935,7 @@ class CameraManager:
         """
         Continuous frame capture running in background thread.
         Ensures latest frame is always available for the main loop.
+        Includes small sleep to reduce CPU spinning.
         """
         while self.is_running:
             try:
@@ -937,11 +945,15 @@ class CameraManager:
                 else:
                     ret, frame = self.camera.read()
                     if not ret:
+                        time.sleep(0.01)  # Brief sleep on failed read
                         continue
                 
                 # Thread-safe frame update
                 with self.frame_lock:
                     self.current_frame = frame
+                
+                # Small sleep to reduce CPU usage (configurable)
+                time.sleep(Config.CAPTURE_THREAD_SLEEP_MS / 1000.0)
                     
             except Exception as e:
                 logger.warning(f"Camera capture error: {e}")
@@ -1627,7 +1639,7 @@ class FaceRecognitionSystem:
         
         return results
     
-    def recognize_faces(self, frame, force_recognition=False):
+    def recognize_faces(self, frame, force_recognition=False, idle_mode=False):
         """
         Non-blocking face recognition using background thread.
         
@@ -1637,6 +1649,7 @@ class FaceRecognitionSystem:
         Args:
             frame: OpenCV BGR image
             force_recognition: Skip frame interval check
+            idle_mode: Use less frequent recognition when no faces detected
             
         Returns:
             Tuple of (frame, list of recognition results)
@@ -1646,8 +1659,11 @@ class FaceRecognitionSystem:
         if not self.known_encodings or self.known_encodings_normalized is None:
             return frame, []
         
+        # Use adaptive recognition interval based on detection state
+        recognition_interval = Config.IDLE_RECOGNITION_INTERVAL if idle_mode else Config.RECOGNITION_INTERVAL_FRAMES
+        
         # Implement frame skipping for performance
-        if not force_recognition and self.frame_count % Config.RECOGNITION_INTERVAL_FRAMES != 0:
+        if not force_recognition and self.frame_count % recognition_interval != 0:
             with self._last_results_lock:
                 return frame, self._last_results.copy() if self._last_results else []
         
@@ -1942,7 +1958,13 @@ class DoorEntryKiosk:
         
         # ========== Memory Management ==========
         self.last_cache_cleanup = time.time()
+        self.last_gc_run = time.time()
         self.cache_cleanup_interval = 60  # Cleanup every 60 seconds
+        
+        # ========== Adaptive Frame Rate State ==========
+        self.target_fps = Config.IDLE_FPS  # Start in idle mode
+        self.no_face_frames = 0  # Counter for consecutive frames without faces
+        self.idle_threshold_frames = 15  # Switch to idle mode after this many empty frames
         
         # UI state tracking
         self._status_reset_id = None  # For cancelling pending status resets
@@ -2271,8 +2293,9 @@ class DoorEntryKiosk:
                         cv2.putText(display_frame, "Training in progress...", (50, 50),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
                     else:
-                        # Run face recognition
-                        _, results = self.face_system.recognize_faces(frame)
+                        # Run face recognition with adaptive interval based on idle state
+                        is_idle = self.no_face_frames >= self.idle_threshold_frames
+                        _, results = self.face_system.recognize_faces(frame, idle_mode=is_idle)
                         self.faces_detected = len(results)
                         
                         # Check face stability status
@@ -2398,8 +2421,23 @@ class DoorEntryKiosk:
                 
                 elif self.admin_mode:
                     # Admin mode but not in registration - show clean camera feed
-                    # Just display the frame without overlays
+                    # Skip face recognition entirely in admin mode to save compute
                     pass
+                
+                # Adaptive frame rate based on face detection
+                if self.is_scanning and not self.registration_mode and not self.admin_mode:
+                    if self.faces_detected > 0:
+                        # Faces detected - use high FPS for responsiveness
+                        self.target_fps = Config.ACTIVE_FPS
+                        self.no_face_frames = 0
+                    else:
+                        # No faces - count frames and switch to idle mode
+                        self.no_face_frames += 1
+                        if self.no_face_frames >= self.idle_threshold_frames:
+                            self.target_fps = Config.IDLE_FPS
+                else:
+                    # Registration or admin mode - use idle FPS
+                    self.target_fps = Config.IDLE_FPS
                 
                 # Periodic cache cleanup to prevent memory buildup
                 now = time.time()
@@ -2409,9 +2447,12 @@ class DoorEntryKiosk:
                         logger.debug(f"Cache cleanup: removed {expired_count} expired entries")
                     # Also clean up old last_access entries to prevent memory leak
                     self._cleanup_old_access_entries(now)
-                    # Run garbage collection periodically
-                    gc.collect()
                     self.last_cache_cleanup = now
+                
+                # Run garbage collection less frequently (separate from cache cleanup)
+                if now - self.last_gc_run > Config.GC_INTERVAL_SECONDS:
+                    gc.collect()
+                    self.last_gc_run = now
                 
                 # Store current frame reference (avoid unnecessary copy when possible)
                 self.current_frame = frame
@@ -2419,9 +2460,10 @@ class DoorEntryKiosk:
                 # Update display
                 self.root.after(0, lambda f=display_frame: self.display_frame(f))
                 
-                # Adaptive frame rate - aim for ~30 FPS
+                # Adaptive frame rate based on detection state
                 loop_time = time.time() - loop_start
-                sleep_time = max(0.001, 0.033 - loop_time)
+                target_frame_time = 1.0 / self.target_fps
+                sleep_time = max(0.001, target_frame_time - loop_time)
                 time.sleep(sleep_time)
             
         except Exception as e:
