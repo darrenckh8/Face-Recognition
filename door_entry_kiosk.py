@@ -82,17 +82,6 @@ except ImportError:
     USE_FAISS = False
     logger.info("FAISS not available - using linear search (install with: pip install faiss-cpu)")
 
-# ONNX Runtime: Optional - required for MiniFASNet anti-spoofing
-USE_ANTISPOOF = False
-ONNX_SESSION = None
-try:
-    import onnxruntime as ort
-    USE_ANTISPOOF = True
-    logger.info("ONNX Runtime available - Anti-spoofing support enabled")
-except ImportError:
-    USE_ANTISPOOF = False
-    logger.info("ONNX Runtime not available - anti-spoofing disabled (install with: pip install onnxruntime)")
-
 
 # ==================== SECURITY UTILITIES ====================
 def hash_password(password: str) -> str:
@@ -189,12 +178,6 @@ class Config:
     GC_INTERVAL_SECONDS = 120              # Garbage collection interval (seconds)
     USE_MULTIPROCESSING = True             # Use separate process for recognition (bypasses GIL)
     FAISS_INDEX_THRESHOLD = 50             # Use FAISS index when user count exceeds this
-    
-    # ----- Anti-Spoofing / Liveness Detection -----
-    ENABLE_ANTISPOOF = True                # Enable liveness detection (requires onnxruntime)
-    ANTISPOOF_MODEL_PATH = "anti_spoof_models"  # Directory containing MiniFASNet ONNX models
-    ANTISPOOF_THRESHOLD = 0.5              # Threshold for real vs spoof (higher = stricter)
-    ANTISPOOF_SCALE = 2.7                  # Face crop scale factor for anti-spoof model
     
     # ----- Memory Management Settings -----
     MAX_CACHE_ENTRIES = 20  # Maximum faces to keep in cache
@@ -1565,236 +1548,6 @@ def _embedding_worker_process(
             continue
 
 
-# ==================== ANTI-SPOOFING DETECTOR ====================
-class AntiSpoofPredictor:
-    """
-    Liveness detection using MiniFASNet ONNX models.
-    
-    Classifies faces as 'Real' or 'Spoof' to prevent photo/video attacks.
-    Uses multiple scales for robust detection.
-    """
-    
-    # Model input sizes for multi-scale detection
-    MODEL_SCALES = {
-        "2.7_80x80": (80, 80, 2.7),
-        "4.0_80x80": (80, 80, 4.0),
-    }
-    
-    def __init__(self, model_dir: str = None):
-        """
-        Initialize anti-spoof predictor.
-        
-        Args:
-            model_dir: Directory containing MiniFASNet ONNX model files
-        """
-        self.model_dir = model_dir or Config.ANTISPOOF_MODEL_PATH
-        self.sessions: Dict[str, Any] = {}
-        self.available = False
-        self._load_models()
-    
-    def _load_models(self) -> None:
-        """Load all available MiniFASNet ONNX models."""
-        if not USE_ANTISPOOF:
-            logger.warning("ONNX Runtime not available - anti-spoofing disabled")
-            return
-        
-        if not os.path.exists(self.model_dir):
-            logger.warning(f"Anti-spoof model directory not found: {self.model_dir}")
-            logger.info("To enable anti-spoofing, download MiniFASNet models to 'anti_spoof_models/' directory")
-            return
-        
-        try:
-            import onnxruntime as ort
-            
-            # Look for ONNX model files
-            model_files = [f for f in os.listdir(self.model_dir) if f.endswith('.onnx')]
-            
-            if not model_files:
-                logger.warning(f"No ONNX models found in {self.model_dir}")
-                return
-            
-            # Load each model
-            for model_file in model_files:
-                model_path = os.path.join(self.model_dir, model_file)
-                try:
-                    session = ort.InferenceSession(
-                        model_path,
-                        providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
-                    )
-                    self.sessions[model_file] = session
-                    logger.info(f"Loaded anti-spoof model: {model_file}")
-                except Exception as e:
-                    logger.error(f"Failed to load anti-spoof model {model_file}: {e}")
-            
-            if self.sessions:
-                self.available = True
-                logger.info(f"Anti-spoofing enabled with {len(self.sessions)} model(s)")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize anti-spoof predictor: {e}")
-    
-    def _crop_face(self, frame: np.ndarray, bbox: Tuple[int, int, int, int], 
-                   scale: float = 2.7) -> Optional[np.ndarray]:
-        """
-        Crop and prepare face region for anti-spoof model.
-        
-        Args:
-            frame: Full frame image (BGR)
-            bbox: Face bounding box (left, top, right, bottom)
-            scale: Crop scale factor (larger = more context around face)
-            
-        Returns:
-            Cropped and padded face image, or None if invalid
-        """
-        left, top, right, bottom = bbox
-        
-        # Calculate face dimensions
-        width = right - left
-        height = bottom - top
-        
-        if width <= 0 or height <= 0:
-            return None
-        
-        # Calculate center and scaled crop region
-        center_x = (left + right) // 2
-        center_y = (top + bottom) // 2
-        
-        # Use the larger dimension for square crop
-        size = max(width, height)
-        scaled_size = int(size * scale)
-        half_size = scaled_size // 2
-        
-        # Calculate crop boundaries
-        crop_left = max(0, center_x - half_size)
-        crop_top = max(0, center_y - half_size)
-        crop_right = min(frame.shape[1], center_x + half_size)
-        crop_bottom = min(frame.shape[0], center_y + half_size)
-        
-        # Crop the face region
-        face_crop = frame[crop_top:crop_bottom, crop_left:crop_right]
-        
-        if face_crop.size == 0:
-            return None
-        
-        return face_crop
-    
-    def _preprocess(self, face_crop: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
-        """
-        Preprocess face crop for model input.
-        
-        Args:
-            face_crop: Cropped face image (BGR)
-            target_size: Model input size (width, height)
-            
-        Returns:
-            Preprocessed tensor ready for model input
-        """
-        # Resize to model input size
-        resized = cv2.resize(face_crop, target_size)
-        
-        # Convert BGR to RGB
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        
-        # Normalize to [-1, 1]
-        normalized = (rgb.astype(np.float32) - 127.5) / 128.0
-        
-        # Transpose to NCHW format (batch, channels, height, width)
-        transposed = np.transpose(normalized, (2, 0, 1))
-        
-        # Add batch dimension
-        batched = np.expand_dims(transposed, axis=0)
-        
-        return batched
-    
-    def predict(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Tuple[bool, float]:
-        """
-        Predict if a face is real or spoofed.
-        
-        Args:
-            frame: Full frame image (BGR)
-            bbox: Face bounding box (left, top, right, bottom)
-            
-        Returns:
-            Tuple of (is_real: bool, confidence: float)
-            is_real is True if face appears to be a live person
-            confidence is the model's certainty (0.0 to 1.0)
-        """
-        if not self.available:
-            # If anti-spoof not available, assume real
-            return True, 1.0
-        
-        try:
-            scores = []
-            
-            # Run inference on each model
-            for model_name, session in self.sessions.items():
-                # Determine scale from model name or use default
-                scale = Config.ANTISPOOF_SCALE
-                for key, (w, h, s) in self.MODEL_SCALES.items():
-                    if key in model_name:
-                        scale = s
-                        target_size = (w, h)
-                        break
-                else:
-                    # Default size if not matched
-                    target_size = (80, 80)
-                
-                # Crop and preprocess face
-                face_crop = self._crop_face(frame, bbox, scale)
-                if face_crop is None:
-                    continue
-                
-                input_tensor = self._preprocess(face_crop, target_size)
-                
-                # Get model input name
-                input_name = session.get_inputs()[0].name
-                
-                # Run inference
-                outputs = session.run(None, {input_name: input_tensor})
-                
-                # Parse output (typically softmax over [spoof, real])
-                output = outputs[0]
-                
-                if output.shape[-1] >= 2:
-                    # Standard 2-class output: [spoof_prob, real_prob]
-                    real_score = float(output[0][1])
-                elif output.shape[-1] == 1:
-                    # Single output: higher = more real
-                    real_score = float(output[0][0])
-                else:
-                    real_score = 0.5
-                
-                scores.append(real_score)
-            
-            if not scores:
-                return True, 1.0
-            
-            # Average scores from all models
-            avg_score = sum(scores) / len(scores)
-            is_real = avg_score >= Config.ANTISPOOF_THRESHOLD
-            
-            return is_real, avg_score
-            
-        except Exception as e:
-            logger.error(f"Anti-spoof prediction failed: {e}")
-            # On error, assume real to avoid blocking legitimate access
-            return True, 1.0
-    
-    def predict_batch(self, frame: np.ndarray, 
-                      bboxes: List[Tuple[int, int, int, int]]) -> List[Tuple[bool, float]]:
-        """
-        Predict liveness for multiple faces.
-        
-        Args:
-            frame: Full frame image (BGR)
-            bboxes: List of face bounding boxes
-            
-        Returns:
-            List of (is_real, confidence) tuples for each face
-        """
-        return [self.predict(frame, bbox) for bbox in bboxes]
-
-
 # ==================== FACE RECOGNITION SYSTEM ====================
 class FaceRecognitionSystem:
     """
@@ -1855,15 +1608,6 @@ class FaceRecognitionSystem:
         
         # Cache to avoid re-recognizing the same face
         self.face_cache = FaceCache()
-        
-        # Anti-spoofing / liveness detection
-        self.antispoof = None
-        if Config.ENABLE_ANTISPOOF:
-            self.antispoof = AntiSpoofPredictor()
-            if self.antispoof.available:
-                logger.info("Anti-spoofing liveness detection enabled")
-            else:
-                logger.warning("Anti-spoofing requested but models not available")
         
         # Frame skip counter for performance
         self.frame_count = 0
@@ -2710,18 +2454,8 @@ class FaceRecognitionSystem:
                 name = self.known_names[best_match_index]
                 confidence = float(best_similarity)
             
-            # Perform liveness/anti-spoof check for recognized faces
-            is_real = True
-            liveness_score = 1.0
-            if name != "Unknown" and self.antispoof is not None and self.antispoof.available:
-                is_real, liveness_score = self.antispoof.predict(frame, (left, top, right, bottom))
-                if not is_real:
-                    logger.warning(f"Spoof detected for '{name}' (score: {liveness_score:.3f})")
-                    name = "Spoof"
-                    confidence = 0.0
-            
-            # Only cache recognized faces, not unknown or spoofed ones
-            if name != "Unknown" and name != "Spoof":
+            # Only cache recognized faces, not unknown ones
+            if name != "Unknown":
                 self.face_cache.put(location, name, confidence, face_encoding)
             
             results.append({
@@ -2729,9 +2463,7 @@ class FaceRecognitionSystem:
                 'confidence': confidence,
                 'location': location,
                 'from_cache': False,
-                'is_stable': True,
-                'is_real': is_real,
-                'liveness_score': liveness_score
+                'is_stable': True
             })
         
         return results
@@ -3427,18 +3159,9 @@ class DoorEntryKiosk:
                             confidence = result['confidence']
                             from_cache = result.get('from_cache', False)
                             is_stable = result.get('is_stable', True)
-                            is_real = result.get('is_real', True)
                             
                             # Skip unstable faces
                             if not is_stable or name == 'Scanning...':
-                                continue
-                            
-                            # Handle spoof detection
-                            if name == "Spoof" or not is_real:
-                                now = time.time()
-                                if "Spoof" not in self.last_access or (now - self.last_access["Spoof"]) > Config.COOLDOWN_SECONDS:
-                                    self.last_access["Spoof"] = now
-                                    self.root.after(0, self.deny_spoof)
                                 continue
                             
                             # Handle recognized faces
@@ -3719,17 +3442,6 @@ class DoorEntryKiosk:
         self.update_log_display()
         self._pulse_border(Config.COLOR_DENIED)
         logger.info("Access denied: Unknown person")
-    
-    def deny_spoof(self):
-        """
-        Handle spoof/photo attack detection - deny access.
-        Logs attempt with 'Spoof' identifier and shows warning feedback.
-        """
-        self.set_status("denied")
-        self.access_log.add_entry("Spoof", False, 0.0)
-        self.update_log_display()
-        self._pulse_border(Config.COLOR_WARNING)  # Orange for spoof warning
-        logger.warning("Access denied: Spoof/photo attack detected")
     
     def _pulse_border(self, color, duration=300):
         """Create a brief color pulse on the video container border."""
