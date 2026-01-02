@@ -204,12 +204,12 @@ class Config:
     # ----- Liveness Detection (Blink) -----
     ENABLE_BLINK_DETECTION = True          # Enable blink-based liveness detection
     EAR_THRESHOLD = 0.30                   # Default Eye Aspect Ratio threshold (fallback during calibration)
-    EAR_BLINK_RATIO = 0.60                 # Blink threshold as ratio of person's baseline EAR (0.60 = 60% of open-eye EAR)
-    EAR_CALIBRATION_FRAMES = 35            # Number of frames to collect for baseline calibration
+    EAR_BLINK_RATIO = 0.40                 # Blink threshold as ratio of person's baseline EAR (0.60 = 60% of open-eye EAR)
+    EAR_CALIBRATION_FRAMES = 30            # Number of frames to collect for baseline calibration
     EAR_MIN_OPEN = 0.20                    # Minimum EAR to consider eyes "open" for calibration
     EAR_BILATERAL_THRESHOLD = 0.05         # Max difference between left/right EAR for valid blink (stricter = less gaze false positives)
-    EAR_MIN_DROP = 0.06                    # Minimum sudden drop from recent EAR average to consider a blink (prevents gradual gaze changes)
-    BLINK_CONSEC_FRAMES = 2                # Consecutive frames below threshold to count as blink
+    EAR_MIN_DROP = 0.10                    # Minimum sudden drop from recent EAR average to consider a blink (prevents gradual gaze changes)
+    BLINK_CONSEC_FRAMES = 1                # Consecutive frames below threshold to count as blink
     BLINK_REQUIRED_COUNT = 1               # Number of blinks required to pass liveness
     BLINK_TIMEOUT_SECONDS = 5.0            # Time window to detect required blinks
     
