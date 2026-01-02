@@ -203,8 +203,11 @@ class Config:
     
     # ----- Liveness Detection (Blink) -----
     ENABLE_BLINK_DETECTION = True          # Enable blink-based liveness detection
-    EAR_THRESHOLD = 0.30                   # Eye Aspect Ratio threshold for blink detection (higher = more sensitive)
-    BLINK_CONSEC_FRAMES = 1                # Consecutive frames below threshold to count as blink (1 = most responsive)
+    EAR_THRESHOLD = 0.30                   # Default Eye Aspect Ratio threshold (fallback during calibration)
+    EAR_BLINK_RATIO = 0.60                 # Blink threshold as ratio of person's baseline EAR (0.75 = 75% of open-eye EAR)
+    EAR_CALIBRATION_FRAMES = 35            # Number of frames to collect for baseline calibration
+    EAR_MIN_OPEN = 0.20                    # Minimum EAR to consider eyes "open" for calibration
+    BLINK_CONSEC_FRAMES = 2                # Consecutive frames below threshold to count as blink (1 = most responsive)
     BLINK_REQUIRED_COUNT = 1               # Number of blinks required to pass liveness
     BLINK_TIMEOUT_SECONDS = 5.0            # Time window to detect required blinks
     
@@ -1695,7 +1698,11 @@ class BlinkDetector:
                 'last_seen': now,
                 'passed': False,
                 'last_ear': 1.0,
-                'awaiting_blink': True  # Start in awaiting state
+                'awaiting_blink': True,  # Start in awaiting state
+                # Per-person calibration
+                'ear_samples': [],        # Collected EAR samples for baseline
+                'baseline_ear': None,     # Calibrated baseline EAR (eyes open)
+                'threshold': None         # Personalized blink threshold
             }
         
         state = self._tracking[face_id]
@@ -1762,8 +1769,31 @@ class BlinkDetector:
             avg_ear = (left_ear + right_ear) / 2.0
             state['last_ear'] = avg_ear
             
-            # Check for blink (EAR below threshold)
-            if avg_ear < Config.EAR_THRESHOLD:
+            # Per-person calibration: collect baseline EAR samples when eyes are open
+            if state['baseline_ear'] is None:
+                # Still calibrating - collect samples of open-eye EAR
+                if avg_ear >= Config.EAR_MIN_OPEN:
+                    state['ear_samples'].append(avg_ear)
+                    
+                    if len(state['ear_samples']) >= Config.EAR_CALIBRATION_FRAMES:
+                        # Calculate baseline as median of collected samples (robust to outliers)
+                        state['baseline_ear'] = sorted(state['ear_samples'])[len(state['ear_samples']) // 2]
+                        # Personalized threshold = baseline * ratio
+                        state['threshold'] = state['baseline_ear'] * Config.EAR_BLINK_RATIO
+                        logger.info(f"Calibrated {face_id}: baseline EAR={state['baseline_ear']:.3f}, threshold={state['threshold']:.3f}")
+                else:
+                    # Eyes appear closed during calibration - use default threshold temporarily
+                    pass
+            
+            # Determine which threshold to use
+            if state['threshold'] is not None:
+                blink_threshold = state['threshold']
+            else:
+                # Still calibrating or calibration failed - use default
+                blink_threshold = Config.EAR_THRESHOLD
+            
+            # Check for blink (EAR below personalized threshold)
+            if avg_ear < blink_threshold:
                 state['consec_frames'] += 1
             else:
                 # If we had enough consecutive low-EAR frames, count it as a blink
