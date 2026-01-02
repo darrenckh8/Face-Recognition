@@ -81,6 +81,16 @@ except ImportError:
     USE_FAISS = False
     logger.info("FAISS not available - using linear search (install with: pip install faiss-cpu)")
 
+# MediaPipe: Optional - enables blink-based liveness detection
+USE_MEDIAPIPE = False
+try:
+    import mediapipe as mp
+    USE_MEDIAPIPE = True
+    logger.info("MediaPipe available - Blink liveness detection enabled")
+except ImportError:
+    USE_MEDIAPIPE = False
+    logger.info("MediaPipe not available - liveness detection disabled (install with: pip install mediapipe)")
+
 
 # ==================== SECURITY UTILITIES ====================
 def hash_password(password: str) -> str:
@@ -177,6 +187,13 @@ class Config:
     GC_INTERVAL_SECONDS = 120              # Garbage collection interval (seconds)
     USE_MULTIPROCESSING = True             # Use separate process for recognition (bypasses GIL)
     FAISS_INDEX_THRESHOLD = 50             # Use FAISS index when user count exceeds this
+    
+    # ----- Liveness Detection (Blink) -----
+    ENABLE_BLINK_DETECTION = True          # Enable blink-based liveness detection
+    EAR_THRESHOLD = 0.21                   # Eye Aspect Ratio threshold for blink detection
+    BLINK_CONSEC_FRAMES = 2                # Consecutive frames below threshold to count as blink
+    BLINK_REQUIRED_COUNT = 1               # Number of blinks required to pass liveness
+    BLINK_TIMEOUT_SECONDS = 5.0            # Time window to detect required blinks
     
     # ----- Memory Management Settings -----
     MAX_CACHE_ENTRIES = 20  # Maximum faces to keep in cache
@@ -1547,6 +1564,245 @@ def _embedding_worker_process(
             continue
 
 
+# ==================== BLINK LIVENESS DETECTOR ====================
+class BlinkDetector:
+    """
+    Liveness detection using Eye Aspect Ratio (EAR) blink detection.
+    
+    Uses MediaPipe Face Mesh to detect eye landmarks and calculate EAR.
+    A blink is detected when EAR drops below threshold for consecutive frames.
+    This prevents photo/video spoofing attacks since printed faces can't blink.
+    """
+    
+    # MediaPipe Face Mesh eye landmark indices
+    # Left eye landmarks (from user's perspective, so right side of image)
+    LEFT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
+    # Right eye landmarks
+    RIGHT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
+    
+    def __init__(self):
+        """Initialize the blink detector with MediaPipe Face Mesh."""
+        self.available = False
+        self.face_mesh = None
+        
+        # Per-face tracking state: {face_id: {'blink_count': int, 'consec_frames': int, 'start_time': float, 'passed': bool}}
+        self._tracking: Dict[str, Dict[str, Any]] = {}
+        
+        if not USE_MEDIAPIPE:
+            logger.warning("MediaPipe not available - blink detection disabled")
+            return
+        
+        try:
+            mp_face_mesh = mp.solutions.face_mesh
+            self.face_mesh = mp_face_mesh.FaceMesh(
+                max_num_faces=5,
+                refine_landmarks=True,  # Includes iris landmarks for better eye detection
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5
+            )
+            self.available = True
+            logger.info("Blink detector initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize blink detector: {e}")
+    
+    def _calculate_ear(self, eye_landmarks: List[Tuple[float, float]]) -> float:
+        """
+        Calculate Eye Aspect Ratio (EAR) for a single eye.
+        
+        EAR = (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)
+        
+        Where p1-p6 are the 6 eye landmarks in order:
+        p1: outer corner, p2: upper outer, p3: upper inner,
+        p4: inner corner, p5: lower inner, p6: lower outer
+        
+        Args:
+            eye_landmarks: List of 6 (x, y) tuples for eye landmarks
+            
+        Returns:
+            Eye Aspect Ratio (higher = more open, lower = more closed)
+        """
+        # Vertical distances
+        v1 = np.linalg.norm(np.array(eye_landmarks[1]) - np.array(eye_landmarks[5]))
+        v2 = np.linalg.norm(np.array(eye_landmarks[2]) - np.array(eye_landmarks[4]))
+        
+        # Horizontal distance
+        h = np.linalg.norm(np.array(eye_landmarks[0]) - np.array(eye_landmarks[3]))
+        
+        if h == 0:
+            return 0.0
+        
+        ear = (v1 + v2) / (2.0 * h)
+        return ear
+    
+    def _get_face_id(self, bbox: Tuple[int, int, int, int], name: Optional[str] = None) -> str:
+        """
+        Generate a stable ID for a face.
+        
+        Uses the recognized name if available (most stable), otherwise falls back
+        to position-based ID with larger bins to reduce flickering.
+        """
+        if name and name not in ("Unknown", "Scanning..."):
+            return f"name_{name}"
+        
+        left, top, right, bottom = bbox
+        # Use center position binned with larger bins (100px) for more stability
+        cx = (left + right) // 2 // 100 * 100
+        cy = (top + bottom) // 2 // 100 * 100
+        return f"pos_{cx}_{cy}"
+    
+    def check_blink(self, frame: np.ndarray, bbox: Tuple[int, int, int, int], 
+                    name: Optional[str] = None) -> Tuple[bool, int, float, bool]:
+        """
+        Check for blink in the given face region.
+        
+        Args:
+            frame: Full BGR frame
+            bbox: Face bounding box (left, top, right, bottom)
+            name: Recognized person name (used for stable tracking)
+            
+        Returns:
+            Tuple of (liveness_passed, blink_count, current_ear, awaiting_blink)
+            - liveness_passed: True if required blinks detected within timeout
+            - blink_count: Number of blinks detected so far
+            - current_ear: Current Eye Aspect Ratio (for debugging/display)
+            - awaiting_blink: True if actively waiting for user to blink
+        """
+        if not self.available or not Config.ENABLE_BLINK_DETECTION:
+            return True, 0, 1.0, False, False  # Pass if detection disabled
+        
+        face_id = self._get_face_id(bbox, name)
+        now = time.time()
+        
+        # Initialize tracking for new face
+        if face_id not in self._tracking:
+            self._tracking[face_id] = {
+                'blink_count': 0,
+                'consec_frames': 0,
+                'start_time': now,
+                'last_seen': now,
+                'passed': False,
+                'last_ear': 1.0,
+                'awaiting_blink': True  # Start in awaiting state
+            }
+        
+        state = self._tracking[face_id]
+        state['last_seen'] = now  # Update last seen time
+        
+        # Already passed liveness - stay passed until timeout
+        if state['passed']:
+            # Reset passed state after cooldown (allow re-verification for next access)
+            if now - state['start_time'] > Config.COOLDOWN_SECONDS + 2.0:
+                state['passed'] = False
+                state['blink_count'] = 0
+                state['start_time'] = now
+                state['awaiting_blink'] = True
+            else:
+                return True, state['blink_count'], state['last_ear'], False
+        
+        # Check timeout for blink detection window
+        if now - state['start_time'] > Config.BLINK_TIMEOUT_SECONDS:
+            # Reset and try again
+            state['blink_count'] = 0
+            state['consec_frames'] = 0
+            state['start_time'] = now
+            state['awaiting_blink'] = True
+        
+        # Convert to RGB for MediaPipe
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        try:
+            results = self.face_mesh.process(rgb_frame)
+            
+            if not results.multi_face_landmarks:
+                return False, state['blink_count'], state['last_ear'], state['awaiting_blink']
+            
+            # Find the face mesh that best matches our bbox
+            h, w = frame.shape[:2]
+            best_landmarks = None
+            best_overlap = 0
+            
+            for face_landmarks in results.multi_face_landmarks:
+                # Get bounding box of this face mesh
+                xs = [lm.x * w for lm in face_landmarks.landmark]
+                ys = [lm.y * h for lm in face_landmarks.landmark]
+                mesh_left, mesh_right = int(min(xs)), int(max(xs))
+                mesh_top, mesh_bottom = int(min(ys)), int(max(ys))
+                
+                # Calculate overlap with our bbox
+                left, top, right, bottom = bbox
+                overlap_left = max(left, mesh_left)
+                overlap_right = min(right, mesh_right)
+                overlap_top = max(top, mesh_top)
+                overlap_bottom = min(bottom, mesh_bottom)
+                
+                if overlap_right > overlap_left and overlap_bottom > overlap_top:
+                    overlap_area = (overlap_right - overlap_left) * (overlap_bottom - overlap_top)
+                    if overlap_area > best_overlap:
+                        best_overlap = overlap_area
+                        best_landmarks = face_landmarks
+            
+            if best_landmarks is None:
+                return False, state['blink_count'], state['last_ear'], state['awaiting_blink']
+            
+            # Extract eye landmarks
+            left_eye = [(best_landmarks.landmark[i].x * w, best_landmarks.landmark[i].y * h) 
+                        for i in self.LEFT_EYE_INDICES]
+            right_eye = [(best_landmarks.landmark[i].x * w, best_landmarks.landmark[i].y * h) 
+                         for i in self.RIGHT_EYE_INDICES]
+            
+            # Calculate EAR for both eyes
+            left_ear = self._calculate_ear(left_eye)
+            right_ear = self._calculate_ear(right_eye)
+            avg_ear = (left_ear + right_ear) / 2.0
+            state['last_ear'] = avg_ear
+            
+            # Check for blink (EAR below threshold)
+            if avg_ear < Config.EAR_THRESHOLD:
+                state['consec_frames'] += 1
+            else:
+                # If we had enough consecutive low-EAR frames, count it as a blink
+                if state['consec_frames'] >= Config.BLINK_CONSEC_FRAMES:
+                    state['blink_count'] += 1
+                    logger.info(f"Blink detected for {face_id}, count: {state['blink_count']}")
+                state['consec_frames'] = 0
+            
+            # Check if liveness passed
+            if state['blink_count'] >= Config.BLINK_REQUIRED_COUNT:
+                state['passed'] = True
+                state['awaiting_blink'] = False
+                logger.info(f"Liveness verified for {face_id} ({state['blink_count']} blinks)")
+                return True, state['blink_count'], avg_ear, False
+            
+            return False, state['blink_count'], avg_ear, state['awaiting_blink']
+            
+        except Exception as e:
+            logger.error(f"Blink detection error: {e}")
+            return False, state['blink_count'], state['last_ear'], state['awaiting_blink']
+    
+    def reset_face(self, bbox: Tuple[int, int, int, int]) -> None:
+        """Reset tracking state for a specific face."""
+        face_id = self._get_face_id(bbox)
+        if face_id in self._tracking:
+            del self._tracking[face_id]
+    
+    def cleanup_stale(self, max_age_seconds: float = 10.0) -> None:
+        """Remove tracking state for faces not seen recently."""
+        now = time.time()
+        stale_ids = [
+            fid for fid, state in self._tracking.items()
+            if now - state.get('last_seen', state['start_time']) > max_age_seconds
+        ]
+        for fid in stale_ids:
+            del self._tracking[fid]
+    
+    def close(self) -> None:
+        """Release MediaPipe resources."""
+        if self.face_mesh:
+            self.face_mesh.close()
+            self.face_mesh = None
+            self.available = False
+
+
 # ==================== FACE RECOGNITION SYSTEM ====================
 class FaceRecognitionSystem:
     """
@@ -1607,6 +1863,15 @@ class FaceRecognitionSystem:
         
         # Cache to avoid re-recognizing the same face
         self.face_cache = FaceCache()
+        
+        # Blink-based liveness detection
+        self.blink_detector = None
+        if Config.ENABLE_BLINK_DETECTION:
+            self.blink_detector = BlinkDetector()
+            if self.blink_detector.available:
+                logger.info("Blink-based liveness detection enabled")
+            else:
+                logger.warning("Blink detection requested but MediaPipe not available")
         
         # Frame skip counter for performance
         self.frame_count = 0
@@ -3088,6 +3353,14 @@ class DoorEntryKiosk:
             update_bg(Config.COLOR_CARD, Config.COLOR_WARNING, Config.COLOR_TEXT, Config.COLOR_TEXT_SECONDARY)
             self.status_card.config(highlightbackground=Config.COLOR_WARNING)
             
+        elif status == "awaiting_blink":
+            # Liveness check - waiting for blink
+            self.status_icon_label.config(text="👁")
+            self.status_text_label.config(text="Please Blink")
+            self.status_detail_label.config(text="Liveness verification required")
+            update_bg(Config.COLOR_CARD, Config.COLOR_SCANNING, Config.COLOR_TEXT, Config.COLOR_TEXT_SECONDARY)
+            self.status_card.config(highlightbackground=Config.COLOR_SCANNING)
+            
         else:  # Default scanning state
             self.status_icon_label.config(text="◉")
             self.status_text_label.config(text="Ready to Scan")
@@ -3139,17 +3412,41 @@ class DoorEntryKiosk:
                         _, results = self.face_system.recognize_faces(frame, idle_mode=is_idle)
                         self.faces_detected = len(results)
                         
+                        # Track if any face is awaiting blink verification
+                        any_awaiting_blink = False
+                        
+                        # First pass: check blink status for all recognized faces
+                        for result in results:
+                            name = result['name']
+                            confidence = result['confidence']
+                            is_stable = result.get('is_stable', True)
+                            location = result.get('location', (0, 0, 0, 0))
+                            
+                            if not is_stable or name == 'Scanning...' or name == "Unknown":
+                                continue
+                            
+                            if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
+                                if self.face_system.blink_detector and self.face_system.blink_detector.available:
+                                    top, right, bottom, left = location
+                                    bbox = (left, top, right, bottom)
+                                    liveness_passed, _, _, awaiting = self.face_system.blink_detector.check_blink(frame, bbox, name)
+                                    if not liveness_passed and awaiting:
+                                        any_awaiting_blink = True
+                        
                         # Check face stability status
                         any_unstable = any(not r.get('is_stable', True) for r in results)
                         any_stable = any(r.get('is_stable', True) for r in results)
                         
-                        # Update UI status based on face detection
+                        # Update UI status based on face detection (but don't override awaiting_blink)
                         if len(results) > 0 and self.current_status not in ("granted", "denied"):
-                            if any_unstable and not any_stable:
+                            if any_awaiting_blink:
+                                if self.current_status != "awaiting_blink":
+                                    self.root.after(0, lambda: self.set_status("awaiting_blink"))
+                            elif any_unstable and not any_stable:
                                 self.root.after(0, lambda: self.set_status("processing"))
-                            else:
+                            elif self.current_status != "awaiting_blink":
                                 self.root.after(0, self._set_status_active_scanning)
-                        elif len(results) == 0 and self.current_status in ("active_scanning", "processing"):
+                        elif len(results) == 0 and self.current_status in ("active_scanning", "processing", "awaiting_blink"):
                             self.root.after(0, self._set_status_scanning)
                         
                         # Process each recognized face
@@ -3158,6 +3455,7 @@ class DoorEntryKiosk:
                             confidence = result['confidence']
                             from_cache = result.get('from_cache', False)
                             is_stable = result.get('is_stable', True)
+                            location = result.get('location', (0, 0, 0, 0))
                             
                             # Skip unstable faces
                             if not is_stable or name == 'Scanning...':
@@ -3165,6 +3463,18 @@ class DoorEntryKiosk:
                             
                             # Handle recognized faces
                             if name != "Unknown" and confidence >= Config.RECOGNITION_THRESHOLD:
+                                # Check blink-based liveness if enabled
+                                liveness_passed = True
+                                if self.face_system.blink_detector and self.face_system.blink_detector.available:
+                                    # Convert location (top, right, bottom, left) to bbox (left, top, right, bottom)
+                                    top, right, bottom, left = location
+                                    bbox = (left, top, right, bottom)
+                                    liveness_passed, blink_count, _, awaiting = self.face_system.blink_detector.check_blink(frame, bbox, name)
+                                    
+                                    if not liveness_passed:
+                                        # Skip granting access - UI status already set above
+                                        continue
+                                
                                 now = time.time()
                                 # Apply cooldown to prevent duplicate logs
                                 if name not in self.last_access or (now - self.last_access[name]) > Config.COOLDOWN_SECONDS:
@@ -5146,6 +5456,10 @@ class DoorEntryKiosk:
         
         # Stop the background recognition thread
         self.face_system.stop_recognition_thread()
+        
+        # Clean up blink detector
+        if self.face_system.blink_detector:
+            self.face_system.blink_detector.close()
         
         # Wait for camera thread to finish
         if self.camera_thread:
