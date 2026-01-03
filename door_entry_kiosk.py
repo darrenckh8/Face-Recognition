@@ -1,6 +1,6 @@
 # ==================== STANDARD LIBRARY IMPORTS ====================
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk
 import cv2
 import os
 import threading
