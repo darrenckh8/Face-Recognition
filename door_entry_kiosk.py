@@ -4,19 +4,19 @@ from tkinter import ttk
 import cv2
 import os
 import threading
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 from multiprocessing import Process, Queue as MPQueue, Event as MPEvent
+import io
 import time
 from datetime import datetime
 import pickle
 import numpy as np
 from PIL import Image, ImageTk
-import json
 import sqlite3
 import gc
 import logging
 import shutil
-from typing import Optional, List, Tuple, Dict, Any, Callable
+from typing import Optional, List, Tuple, Dict, Any, Callable, Hashable
 from abc import ABC, abstractmethod
 
 # ==================== SECURITY IMPORTS ====================
@@ -159,6 +159,124 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 
+def set_secure_permissions(path: str, file_mode: int = 0o600, dir_mode: int = 0o700) -> None:
+    """
+    Apply restrictive POSIX permissions to sensitive files/directories.
+    """
+    if os.name != 'posix' or not path or not os.path.exists(path):
+        return
+    if os.path.islink(path):
+        logger.warning(f"Skipping permission change on symbolic link: {path}")
+        return
+
+    mode = dir_mode if os.path.isdir(path) else file_mode
+    try:
+        os.chmod(path, mode)
+    except OSError as e:
+        logger.warning(f"Could not set secure permissions on {path}: {e}")
+
+
+class RestrictedUnpickler(pickle.Unpickler):
+    """
+    Pickle loader that blocks GLOBAL/object reconstruction opcodes.
+    Only simple built-in container/scalar types are allowed.
+    """
+
+    def find_class(self, module, name):
+        raise pickle.UnpicklingError(
+            f"Blocked unsafe pickle class reference: {module}.{name}")
+
+
+def safe_pickle_load(path: str) -> Any:
+    """Load pickle data using a restricted unpickler to prevent code execution."""
+    with open(path, "rb") as f:
+        return RestrictedUnpickler(io.BytesIO(f.read())).load()
+
+
+def parse_encodings_payload(data: Any) -> Tuple[List[np.ndarray], List[str]]:
+    """
+    Validate and normalize serialized encodings payload.
+    Returns float32 embedding vectors and aligned person names.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("Encodings payload must be a dictionary.")
+
+    encodings = data.get("encodings")
+    names = data.get("names")
+    if not isinstance(encodings, list) or not isinstance(names, list):
+        raise ValueError("Encodings payload missing required list fields.")
+    if len(encodings) != len(names):
+        raise ValueError("Encodings and names list lengths do not match.")
+    if len(encodings) > 100000:
+        raise ValueError("Encodings payload is too large.")
+
+    parsed_encodings: List[np.ndarray] = []
+    parsed_names: List[str] = []
+    expected_dim: Optional[int] = None
+
+    for idx, (enc, name) in enumerate(zip(encodings, names)):
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"Invalid name at index {idx}.")
+
+        vector = np.asarray(enc, dtype=np.float32)
+        if vector.ndim != 1:
+            raise ValueError(f"Invalid embedding shape at index {idx}.")
+        if vector.size == 0 or vector.size > 4096:
+            raise ValueError(f"Invalid embedding size at index {idx}.")
+
+        if expected_dim is None:
+            expected_dim = int(vector.size)
+        elif int(vector.size) != expected_dim:
+            raise ValueError("Embedding dimensions are inconsistent.")
+
+        parsed_encodings.append(vector)
+        parsed_names.append(name.strip())
+
+    return parsed_encodings, parsed_names
+
+
+def parse_disabled_encodings_payload(data: Any) -> Dict[str, List[List[float]]]:
+    """
+    Validate disabled-encodings payload and normalize to JSON/pickle-safe lists.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("Disabled encodings payload must be a dictionary.")
+    if len(data) > 10000:
+        raise ValueError("Disabled encodings payload is too large.")
+
+    normalized: Dict[str, List[List[float]]] = {}
+    for name, encodings in data.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Disabled encodings contain an invalid name key.")
+        if not isinstance(encodings, list):
+            raise ValueError(f"Disabled encodings for '{name}' must be a list.")
+        if len(encodings) > 10000:
+            raise ValueError(f"Disabled encodings for '{name}' are too large.")
+
+        cleaned_vectors: List[List[float]] = []
+        expected_dim: Optional[int] = None
+        for idx, enc in enumerate(encodings):
+            vector = np.asarray(enc, dtype=np.float32)
+            if vector.ndim != 1:
+                raise ValueError(
+                    f"Invalid disabled embedding shape for '{name}' at index {idx}.")
+            if vector.size == 0 or vector.size > 4096:
+                raise ValueError(
+                    f"Invalid disabled embedding size for '{name}' at index {idx}.")
+
+            if expected_dim is None:
+                expected_dim = int(vector.size)
+            elif int(vector.size) != expected_dim:
+                raise ValueError(
+                    f"Disabled embedding dimensions for '{name}' are inconsistent.")
+
+            cleaned_vectors.append(vector.tolist())
+
+        normalized[name.strip()] = cleaned_vectors
+
+    return normalized
+
+
 # ==================== APPLICATION CONFIGURATION ====================
 class Config:
     """Central configuration class for all application settings.
@@ -182,6 +300,8 @@ class Config:
             "Create a .env file with ADMIN_PASSWORD_HASH=<bcrypt_hash> or set the environment variable. "
             "Generate hash with: python -c \"import bcrypt; print(bcrypt.hashpw(b'your_password', bcrypt.gensalt(12)).decode())\""
         )
+    ADMIN_MAX_FAILED_ATTEMPTS = 5           # Lock admin login after N failed tries
+    ADMIN_LOCKOUT_SECONDS = 60              # Lockout duration after too many failures
 
     # ----- Camera Settings -----
     # Camera capture resolution (width, height)
@@ -216,6 +336,8 @@ class Config:
 
     # ----- Liveness Detection (Blink) -----
     ENABLE_BLINK_DETECTION = True          # Enable blink-based liveness detection
+    # If True, access is blocked when blink liveness is unavailable/disabled
+    REQUIRE_LIVENESS_FOR_ACCESS = True
     # Default Eye Aspect Ratio threshold (fallback during calibration)
     EAR_THRESHOLD = 0.30
     # Blink threshold as ratio of person's baseline EAR (0.40 = 40% of open-eye EAR)
@@ -232,6 +354,12 @@ class Config:
     BLINK_CONSEC_FRAMES = 1
     BLINK_REQUIRED_COUNT = 1               # Number of blinks required to pass liveness
     BLINK_TIMEOUT_SECONDS = 5.0            # Time window to detect required blinks
+    # Run pre-calibration less frequently to reduce MediaPipe CPU load
+    BLINK_PRESCAN_INTERVAL_FRAMES = 3
+    # Limit how many faces are pre-calibrated per interval
+    BLINK_PRESCAN_MAX_FACES = 1
+    # Remove stale blink tracking entries to bound memory use
+    BLINK_TRACKING_TTL_SECONDS = 15.0
 
     # ----- Memory Management Settings -----
     MAX_CACHE_ENTRIES = 20  # Maximum faces to keep in cache
@@ -250,6 +378,8 @@ class Config:
     ENCODINGS_PATH = "encodings.pickle"
     DISABLED_ENCODINGS_PATH = "disabled_encodings.pickle"  # Revoked users stored here
     ACCESS_LOG_PATH = "access_log.db"  # SQLite database for atomic writes
+    SECURE_FILE_MODE = 0o600  # rw-------
+    SECURE_DIR_MODE = 0o700   # rwx------
 
     # Apple-like Clean Design Colors
     COLOR_GRANTED = "#34C759"    # Apple Green
@@ -310,6 +440,12 @@ class Config:
         if cls.MAX_BACKUPS < 1:
             errors.append(
                 f"MAX_BACKUPS must be at least 1, got {cls.MAX_BACKUPS}")
+        if cls.ADMIN_MAX_FAILED_ATTEMPTS < 1:
+            errors.append(
+                f"ADMIN_MAX_FAILED_ATTEMPTS must be at least 1, got {cls.ADMIN_MAX_FAILED_ATTEMPTS}")
+        if cls.ADMIN_LOCKOUT_SECONDS < 1:
+            errors.append(
+                f"ADMIN_LOCKOUT_SECONDS must be at least 1, got {cls.ADMIN_LOCKOUT_SECONDS}")
 
         # Validate FPS settings (resource protection)
         if cls.IDLE_FPS < 1 or cls.IDLE_FPS > 30:
@@ -330,6 +466,9 @@ class Config:
         if cls.BLINK_TIMEOUT_SECONDS < 1.0:
             errors.append(
                 f"BLINK_TIMEOUT_SECONDS must be at least 1.0, got {cls.BLINK_TIMEOUT_SECONDS}")
+        if cls.REQUIRE_LIVENESS_FOR_ACCESS and not cls.ENABLE_BLINK_DETECTION:
+            errors.append(
+                "REQUIRE_LIVENESS_FOR_ACCESS is enabled but ENABLE_BLINK_DETECTION is False.")
 
         # Validate camera resolution
         if cls.CAMERA_RESOLUTION[0] < 320 or cls.CAMERA_RESOLUTION[1] < 240:
@@ -337,7 +476,7 @@ class Config:
                 f"CAMERA_RESOLUTION too small: {cls.CAMERA_RESOLUTION}")
 
         # Validate file paths are writable
-        for path_name in ['DATASET_PATH', 'ENCODINGS_PATH', 'ACCESS_LOG_PATH']:
+        for path_name in ['DATASET_PATH', 'ENCODINGS_PATH', 'DISABLED_ENCODINGS_PATH', 'ACCESS_LOG_PATH']:
             path = getattr(cls, path_name)
             parent_dir = os.path.dirname(path) or '.'
             if not os.access(parent_dir, os.W_OK):
@@ -350,7 +489,7 @@ class Config:
 # ==================== BACKUP SYSTEM ====================
 class BackupManager:
     """
-    Handles automatic backup of critical data files (encodings.pickle).
+    Handles automatic backup of critical data files.
 
     Creates timestamped backups before any modification and maintains
     a rolling window of recent backups for recovery purposes.
@@ -379,6 +518,8 @@ class BackupManager:
 
             # Preserve file metadata during copy
             shutil.copy2(file_path, backup_path)
+            set_secure_permissions(
+                backup_path, Config.SECURE_FILE_MODE, Config.SECURE_DIR_MODE)
             logger.info(f"Created backup: {backup_path}")
 
             # Enforce backup retention limit
@@ -435,9 +576,9 @@ class FaceStabilityTracker:
         self.stability_threshold = stability_threshold
         self.stable_frames_required = stable_frames_required
         # Track position history per face
-        self.last_positions: Dict[int, List[Tuple[int, int]]] = {}
+        self.last_positions: Dict[Hashable, List[Tuple[int, int]]] = {}
         # Consecutive stable frames per face
-        self.stable_count: Dict[int, int] = {}
+        self.stable_count: Dict[Hashable, int] = {}
         self.lock = threading.Lock()  # Thread-safe access
 
     def _get_face_center(self, location: Tuple[int, int, int, int]) -> Tuple[int, int]:
@@ -449,7 +590,7 @@ class FaceStabilityTracker:
         """Calculate Euclidean distance between two points."""
         return ((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2) ** 0.5
 
-    def update_and_check_stability(self, face_id: int, location: Tuple[int, int, int, int]) -> bool:
+    def update_and_check_stability(self, face_id: Hashable, location: Tuple[int, int, int, int]) -> bool:
         """
         Update tracking for a face and check if it's stable.
 
@@ -930,6 +1071,8 @@ class AccessLog:
         self._cache: List[Dict[str, Any]] = []  # Recent entries cache
         self._cache_dirty = False
         self._init_database()
+        set_secure_permissions(
+            self.log_path, Config.SECURE_FILE_MODE, Config.SECURE_DIR_MODE)
         self._load_cache()
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -973,6 +1116,8 @@ class AccessLog:
             """)
             conn.commit()
             conn.close()
+            set_secure_permissions(
+                self.log_path, Config.SECURE_FILE_MODE, Config.SECURE_DIR_MODE)
             logger.info(f"AccessLog database initialized: {self.log_path}")
         except sqlite3.Error as e:
             logger.error(f"Failed to initialize access log database: {e}")
@@ -1209,61 +1354,6 @@ class AccessLog:
             # Don't error out for maintenance
             logger.warning(f"Database optimization failed: {e}")
 
-    def migrate_from_json(self, json_path: str) -> int:
-        """
-        Import entries from an existing JSON log file.
-
-        Args:
-            json_path: Path to the JSON log file to migrate
-
-        Returns:
-            Number of entries imported
-        """
-        if not os.path.exists(json_path):
-            logger.warning(f"JSON log file not found: {json_path}")
-            return 0
-
-        try:
-            with open(json_path, 'r') as f:
-                json_entries = json.load(f)
-
-            if not json_entries:
-                return 0
-
-            conn = self._get_connection()
-            cursor = conn.cursor()
-
-            # Get existing timestamps to avoid duplicates
-            cursor.execute("SELECT timestamp FROM access_log")
-            existing = {row[0] for row in cursor.fetchall()}
-
-            imported = 0
-            for entry in json_entries:
-                if entry['timestamp'] not in existing:
-                    cursor.execute("""
-                        INSERT INTO access_log (timestamp, name, access_granted, confidence)
-                        VALUES (?, ?, ?, ?)
-                    """, (
-                        entry['timestamp'],
-                        entry['name'],
-                        int(entry['access_granted']),
-                        entry.get('confidence', 0.0)
-                    ))
-                    imported += 1
-
-            conn.commit()
-            conn.close()
-
-            # Reload cache
-            self._load_cache()
-
-            logger.info(f"Migrated {imported} entries from JSON to SQLite")
-            return imported
-
-        except (json.JSONDecodeError, IOError, sqlite3.Error) as e:
-            logger.error(f"Failed to migrate from JSON: {e}")
-            return 0
-
 
 # ==================== CAMERA MANAGER ====================
 class CameraManager:
@@ -1373,17 +1463,22 @@ class CameraManager:
                 logger.error(f"Camera OS error: {e}", exc_info=True)
                 time.sleep(0.5)
 
-    def capture_frame(self):
+    def capture_frame(self, copy_frame: bool = False):
         """
         Get the most recent captured frame.
         Returns immediately with latest frame (non-blocking).
+
+        Args:
+            copy_frame: If True, return a defensive copy of the frame.
         """
         if not self.is_running:
             return None
 
         with self.frame_lock:
             if self.current_frame is not None:
-                return self.current_frame.copy()
+                if copy_frame:
+                    return self.current_frame.copy()
+                return self.current_frame
         return None
 
     def stop(self):
@@ -1421,12 +1516,11 @@ def _embedding_worker_process(
         input_queue: Queue receiving (request_id, embeddings_list) tuples
         output_queue: Queue sending (request_id, results_list) tuples
         stop_event: Event to signal worker shutdown
-        encodings_path: Path to encodings pickle file
+        encodings_path: Path to serialized encodings file
         threshold: Recognition similarity threshold
         faiss_threshold: User count threshold for FAISS index
     """
     import numpy as np
-    import pickle
     import os
 
     # Try to import FAISS in the worker process
@@ -1442,37 +1536,45 @@ def _embedding_worker_process(
     known_encodings_normalized = None
     known_names = []
 
-    def load_encodings():
+    def load_encodings() -> bool:
         nonlocal known_encodings_normalized, known_names, faiss_index
-        if os.path.exists(encodings_path):
-            try:
-                with open(encodings_path, "rb") as f:
-                    data = pickle.loads(f.read())
-                known_encodings = [np.array(enc, dtype=np.float32)
-                                   for enc in data["encodings"]]
-                known_names = data["names"]
+        if not os.path.exists(encodings_path):
+            known_encodings_normalized = None
+            known_names = []
+            faiss_index = None
+            return True
 
-                if len(known_encodings) > 0:
-                    encodings_matrix = np.array(
-                        known_encodings, dtype=np.float32)
-                    norms = np.linalg.norm(
-                        encodings_matrix, axis=1, keepdims=True)
-                    known_encodings_normalized = (
-                        encodings_matrix / norms).astype(np.float32)
+        try:
+            data = safe_pickle_load(encodings_path)
+            known_encodings, new_names = parse_encodings_payload(data)
 
-                    # Build FAISS index if appropriate
-                    if faiss_available and len(set(known_names)) >= faiss_threshold:
-                        d = known_encodings_normalized.shape[1]
-                        faiss_index = faiss.IndexFlatIP(d)
-                        faiss_index.add(known_encodings_normalized)
-                    else:
-                        faiss_index = None
-                else:
-                    known_encodings_normalized = None
-                    faiss_index = None
-            except Exception:
+            if len(known_encodings) > 0:
+                encodings_matrix = np.array(known_encodings, dtype=np.float32)
+                norms = np.linalg.norm(encodings_matrix, axis=1, keepdims=True)
+                norms[norms == 0] = 1.0
+                normalized = (encodings_matrix / norms).astype(np.float32)
+
+                # Build FAISS index if appropriate
+                new_faiss_index = None
+                if faiss_available and len(set(new_names)) >= faiss_threshold:
+                    d = normalized.shape[1]
+                    new_faiss_index = faiss.IndexFlatIP(d)
+                    new_faiss_index.add(normalized)
+
+                # Commit only after successful full load/build.
+                known_encodings_normalized = normalized
+                known_names = new_names
+                faiss_index = new_faiss_index
+            else:
                 known_encodings_normalized = None
+                known_names = []
                 faiss_index = None
+            return True
+        except (OSError, IOError, ValueError, TypeError, pickle.UnpicklingError) as e:
+            logger.warning(f"Worker could not reload encodings safely: {e}")
+            # Keep previous in-memory encodings so a transient file write/read
+            # issue does not disable recognition until the next mtime change.
+            return False
 
     load_encodings()
     last_encodings_mtime = os.path.getmtime(
@@ -1484,13 +1586,13 @@ def _embedding_worker_process(
             if os.path.exists(encodings_path):
                 current_mtime = os.path.getmtime(encodings_path)
                 if current_mtime > last_encodings_mtime:
-                    load_encodings()
-                    last_encodings_mtime = current_mtime
+                    if load_encodings():
+                        last_encodings_mtime = current_mtime
 
             # Get work from queue with timeout
             try:
                 request_id, embeddings = input_queue.get(timeout=0.1)
-            except:
+            except Empty:
                 continue
 
             results = []
@@ -1560,6 +1662,10 @@ class BlinkDetector:
 
         # Per-face tracking state: {face_id: {'blink_count': int, 'consec_frames': int, 'start_time': float, 'passed': bool}}
         self._tracking: Dict[str, Dict[str, Any]] = {}
+        # Per-frame cache so multiple check_blink() calls on the same frame
+        # don't rerun MediaPipe repeatedly.
+        self._mesh_cache_frame_id: Optional[int] = None
+        self._mesh_cache_results: Optional[Any] = None
 
         if not USE_MEDIAPIPE:
             logger.warning(
@@ -1578,6 +1684,23 @@ class BlinkDetector:
             logger.info("Blink detector initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize blink detector: {e}")
+
+    def reset_frame_cache(self) -> None:
+        """Clear per-frame MediaPipe cache (call once per new camera frame)."""
+        self._mesh_cache_frame_id = None
+        self._mesh_cache_results = None
+
+    def cleanup_stale_tracking(self, max_age_seconds: float = 15.0) -> int:
+        """Remove face tracking entries not seen recently."""
+        now = time.time()
+        stale_face_ids = [
+            face_id
+            for face_id, state in self._tracking.items()
+            if now - state.get('last_seen', now) > max_age_seconds
+        ]
+        for face_id in stale_face_ids:
+            del self._tracking[face_id]
+        return len(stale_face_ids)
 
     def _calculate_ear(self, eye_landmarks: List[Tuple[float, float]]) -> float:
         """
@@ -1645,7 +1768,10 @@ class BlinkDetector:
             - awaiting_blink: True if actively waiting for user to blink
         """
         if not self.available or not Config.ENABLE_BLINK_DETECTION:
-            return True, 0, 1.0, False, False  # Pass if detection disabled
+            # Fail closed by default for physical access control deployments.
+            if Config.REQUIRE_LIVENESS_FOR_ACCESS:
+                return False, 0, 0.0, False
+            return True, 0, 1.0, False
 
         face_id = self._get_face_id(bbox, name)
         now = time.time()
@@ -1689,11 +1815,16 @@ class BlinkDetector:
             state['awaiting_blink'] = True
             state['liveness_passed'] = False  # Allow new verification attempt
 
-        # Convert to RGB for MediaPipe
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
         try:
-            results = self.face_mesh.process(rgb_frame)
+            frame_id = id(frame)
+            if self._mesh_cache_frame_id == frame_id and self._mesh_cache_results is not None:
+                results = self._mesh_cache_results
+            else:
+                # Convert to RGB for MediaPipe
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = self.face_mesh.process(rgb_frame)
+                self._mesh_cache_frame_id = frame_id
+                self._mesh_cache_results = results
 
             if not results.multi_face_landmarks:
                 return False, state['blink_count'], state['last_ear'], state['awaiting_blink']
@@ -1884,9 +2015,9 @@ class FaceRecognitionSystem:
 
         Args:
             dataset_path: Directory containing person face images
-            encodings_path: Path to pickle file with face encodings
+            encodings_path: Path to serialized file with face encodings
         """
-        self.dataset_path = dataset_path or Config.DATASET_PATH
+        self.dataset_path = os.path.realpath(dataset_path or Config.DATASET_PATH)
         self.encodings_path = encodings_path or Config.ENCODINGS_PATH
         self.disabled_encodings_path = Config.DISABLED_ENCODINGS_PATH
         self.known_encodings = []
@@ -1937,6 +2068,9 @@ class FaceRecognitionSystem:
             else:
                 logger.warning(
                     "Blink detection requested but MediaPipe not available")
+        if Config.REQUIRE_LIVENESS_FOR_ACCESS and (not self.blink_detector or not self.blink_detector.available):
+            logger.warning(
+                "Liveness is required for access, but liveness detector is unavailable. Access will remain blocked.")
 
         # Frame skip counter for performance
         self.frame_count = 0
@@ -1963,20 +2097,30 @@ class FaceRecognitionSystem:
 
         # Ensure dataset directory exists
         if not os.path.exists(self.dataset_path):
-            os.makedirs(self.dataset_path)
+            os.makedirs(self.dataset_path, mode=Config.SECURE_DIR_MODE)
+        set_secure_permissions(
+            self.dataset_path, Config.SECURE_FILE_MODE, Config.SECURE_DIR_MODE)
 
         self.load_encodings()
         self.load_disabled_encodings()
+
+    def _save_pickle_payload(self, path: str, payload: Any) -> None:
+        """Persist sanitized data using highest pickle protocol with secure permissions."""
+        with open(path, "wb") as f:
+            f.write(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
+        set_secure_permissions(path, Config.SECURE_FILE_MODE, Config.SECURE_DIR_MODE)
 
     def load_disabled_encodings(self):
         """Load revoked user encodings from disk."""
         if os.path.exists(self.disabled_encodings_path):
             try:
-                with open(self.disabled_encodings_path, "rb") as f:
-                    self.disabled_encodings = pickle.loads(f.read())
+                raw = safe_pickle_load(self.disabled_encodings_path)
+                self.disabled_encodings = parse_disabled_encodings_payload(raw)
+                set_secure_permissions(
+                    self.disabled_encodings_path, Config.SECURE_FILE_MODE, Config.SECURE_DIR_MODE)
                 logger.info(
                     f"Loaded {len(self.disabled_encodings)} disabled users")
-            except (OSError, IOError, pickle.UnpicklingError, KeyError) as e:
+            except (OSError, IOError, ValueError, TypeError, pickle.UnpicklingError) as e:
                 logger.warning(
                     f"Could not load disabled encodings: {e}", exc_info=True)
                 self.disabled_encodings = {}
@@ -1986,9 +2130,10 @@ class FaceRecognitionSystem:
     def save_disabled_encodings(self):
         """Save revoked user encodings to disk."""
         try:
-            with open(self.disabled_encodings_path, "wb") as f:
-                f.write(pickle.dumps(self.disabled_encodings))
-        except IOError as e:
+            sanitized = parse_disabled_encodings_payload(self.disabled_encodings)
+            self._save_pickle_payload(self.disabled_encodings_path, sanitized)
+            self.disabled_encodings = sanitized
+        except (IOError, OSError, ValueError, TypeError) as e:
             logger.error(f"Failed to save disabled encodings: {e}")
 
     def load_encodings(self):
@@ -1998,20 +2143,18 @@ class FaceRecognitionSystem:
         """
         if os.path.exists(self.encodings_path):
             try:
-                with open(self.encodings_path, "rb") as f:
-                    data = pickle.loads(f.read())
-
-                # Convert to float32 arrays for memory efficiency
-                self.known_encodings = [
-                    np.array(enc, dtype=np.float32) for enc in data["encodings"]]
-                self.known_names = data["names"]
+                data = safe_pickle_load(self.encodings_path)
+                self.known_encodings, self.known_names = parse_encodings_payload(
+                    data)
+                set_secure_permissions(
+                    self.encodings_path, Config.SECURE_FILE_MODE, Config.SECURE_DIR_MODE)
 
                 # Pre-normalize for vectorized similarity computation
                 self._update_normalized_encodings()
                 logger.info(
                     f"Loaded {len(self.known_encodings)} encodings for {len(set(self.known_names))} persons")
                 return True
-            except (OSError, IOError, pickle.UnpicklingError, KeyError) as e:
+            except (OSError, IOError, ValueError, TypeError, pickle.UnpicklingError) as e:
                 logger.error(f"Failed to load encodings: {e}", exc_info=True)
                 return False
         return False
@@ -2095,7 +2238,7 @@ class FaceRecognitionSystem:
         if os.path.exists(self.dataset_path):
             for name in os.listdir(self.dataset_path):
                 person_path = os.path.join(self.dataset_path, name)
-                if os.path.isdir(person_path):
+                if os.path.isdir(person_path) and not os.path.islink(person_path):
                     image_count = len([f for f in os.listdir(person_path)
                                       if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
                     persons.append((name, image_count))
@@ -2105,12 +2248,60 @@ class FaceRecognitionSystem:
         """Get list of unique names that have been trained (have encodings)."""
         return list(set(self.known_names))
 
+    def validate_person_name(self, name: str) -> Tuple[bool, str]:
+        """
+        Validate person names used as both labels and filesystem folder names.
+        """
+        clean_name = (name or "").strip()
+        if not clean_name:
+            return False, "Name cannot be empty."
+        if len(clean_name) > 64:
+            return False, "Name is too long (max 64 characters)."
+        if any(ord(ch) < 32 for ch in clean_name):
+            return False, "Name contains invalid control characters."
+        if clean_name in (".", "..") or ".." in clean_name:
+            return False, "Name cannot contain path traversal patterns."
+        separators = [sep for sep in (os.sep, os.altsep) if sep]
+        if any(sep in clean_name for sep in separators):
+            return False, "Name cannot contain path separators."
+        return True, ""
+
+    def _resolve_person_folder(self, name: str, create: bool = False) -> str:
+        """
+        Resolve and validate a person's dataset folder path safely.
+        """
+        clean_name = (name or "").strip()
+        is_valid, reason = self.validate_person_name(clean_name)
+        if not is_valid:
+            raise ValueError(reason)
+
+        dataset_root = os.path.realpath(os.path.abspath(self.dataset_path))
+        person_folder = os.path.abspath(os.path.join(dataset_root, clean_name))
+        resolved_person_folder = os.path.realpath(person_folder)
+
+        if os.path.commonpath([dataset_root, resolved_person_folder]) != dataset_root:
+            raise ValueError("Resolved person path escapes dataset directory.")
+        if resolved_person_folder == dataset_root:
+            raise ValueError("Person folder cannot be the dataset root.")
+        if os.path.islink(person_folder):
+            raise ValueError("Person folder cannot be a symbolic link.")
+
+        if create and not os.path.exists(person_folder):
+            os.makedirs(person_folder, mode=Config.SECURE_DIR_MODE)
+        if os.path.exists(person_folder):
+            if os.path.islink(person_folder):
+                raise ValueError("Person folder cannot be a symbolic link.")
+            set_secure_permissions(
+                person_folder, Config.SECURE_FILE_MODE, Config.SECURE_DIR_MODE)
+        return person_folder
+
+    def get_person_folder(self, name: str) -> str:
+        """Public helper to safely resolve a person's folder path."""
+        return self._resolve_person_folder(name, create=False)
+
     def create_person_folder(self, name: str) -> str:
         """Create a directory for storing a person's face images."""
-        person_folder = os.path.join(self.dataset_path, name)
-        if not os.path.exists(person_folder):
-            os.makedirs(person_folder)
-        return person_folder
+        return self._resolve_person_folder(name, create=True)
 
     def save_face_image(self, frame: np.ndarray, name: str) -> str:
         """
@@ -2128,6 +2319,8 @@ class FaceRecognitionSystem:
         filename = f"{name}_{timestamp}.jpg"
         filepath = os.path.join(folder, filename)
         cv2.imwrite(filepath, frame)
+        set_secure_permissions(
+            filepath, Config.SECURE_FILE_MODE, Config.SECURE_DIR_MODE)
         return filepath
 
     def train_model(self, progress_callback: Optional[Callable[[int, int, str], None]] = None) -> Tuple[bool, str]:
@@ -2182,8 +2375,7 @@ class FaceRecognitionSystem:
         # Save encodings to disk
         data = {"encodings": [enc.tolist()
                               for enc in known_encodings], "names": known_names}
-        with open(self.encodings_path, "wb") as f:
-            f.write(pickle.dumps(data))
+        self._save_pickle_payload(self.encodings_path, data)
 
         # Update in-memory encodings
         self.known_encodings = [np.array(enc) for enc in known_encodings]
@@ -2208,7 +2400,10 @@ class FaceRecognitionSystem:
         """
         from imutils import paths
 
-        person_folder = os.path.join(self.dataset_path, person_name)
+        try:
+            person_folder = self.get_person_folder(person_name)
+        except ValueError as e:
+            return False, f"Invalid person name '{person_name}': {e}"
         if not os.path.exists(person_folder):
             return False, f"No folder found for {person_name}"
 
@@ -2256,8 +2451,7 @@ class FaceRecognitionSystem:
         # Persist updated encodings to disk
         data = {"encodings": [enc.tolist() if hasattr(
             enc, 'tolist') else enc for enc in self.known_encodings], "names": self.known_names}
-        with open(self.encodings_path, "wb") as f:
-            f.write(pickle.dumps(data))
+        self._save_pickle_payload(self.encodings_path, data)
 
         # Refresh normalized matrix for similarity calculations
         self._update_normalized_encodings()
@@ -2303,8 +2497,7 @@ class FaceRecognitionSystem:
         if self.known_encodings:
             data = {"encodings": [enc.tolist() if hasattr(
                 enc, 'tolist') else enc for enc in self.known_encodings], "names": self.known_names}
-            with open(self.encodings_path, "wb") as f:
-                f.write(pickle.dumps(data))
+            self._save_pickle_payload(self.encodings_path, data)
             self._update_normalized_encodings()
         else:
             # No encodings left, clean up
@@ -2357,8 +2550,7 @@ class FaceRecognitionSystem:
         if self.known_encodings:
             data = {"encodings": [enc.tolist() if hasattr(
                 enc, 'tolist') else enc for enc in self.known_encodings], "names": self.known_names}
-            with open(self.encodings_path, "wb") as f:
-                f.write(pickle.dumps(data))
+            self._save_pickle_payload(self.encodings_path, data)
             self._update_normalized_encodings()
         else:
             if os.path.exists(self.encodings_path):
@@ -2403,8 +2595,7 @@ class FaceRecognitionSystem:
 
         data = {"encodings": [enc.tolist() if hasattr(
             enc, 'tolist') else enc for enc in self.known_encodings], "names": self.known_names}
-        with open(self.encodings_path, "wb") as f:
-            f.write(pickle.dumps(data))
+        self._save_pickle_payload(self.encodings_path, data)
 
         self._update_normalized_encodings()
         self.face_cache.clear()
@@ -2476,6 +2667,16 @@ class FaceRecognitionSystem:
             faces = self.detect_faces_robust(frame)
 
         return faces
+
+    def _get_stability_id(self, location: Tuple[int, int, int, int]) -> Tuple[int, int]:
+        """
+        Build a stable face tracking key from location bins instead of detection index.
+        """
+        top, right, bottom, left = location
+        center_x = (left + right) // 2
+        center_y = (top + bottom) // 2
+        bin_size = max(40, int(Config.FACE_POSITION_TOLERANCE))
+        return (center_x // bin_size, center_y // bin_size)
 
     # ========== BACKGROUND RECOGNITION THREAD/PROCESS METHODS ==========
 
@@ -2562,6 +2763,7 @@ class FaceRecognitionSystem:
         if self._recognition_thread is not None:
             self._recognition_thread.join(timeout=2.0)
             self._recognition_thread = None
+        self._mp_pending_requests.clear()
         logger.info("Background recognition stopped")
 
     def _recognition_loop(self) -> None:
@@ -2605,13 +2807,28 @@ class FaceRecognitionSystem:
         if self._mp_output_queue is None:
             return
 
-        try:
-            while not self._mp_output_queue.empty():
+        while True:
+            try:
                 request_id, results = self._mp_output_queue.get_nowait()
-                # Store results keyed by request ID
-                self._mp_pending_requests[request_id] = results
-        except:
-            pass
+            except Empty:
+                break
+            except (EOFError, OSError, ValueError) as e:
+                logger.warning(f"Failed to collect MP recognition result: {e}")
+                break
+
+            # Store results keyed by request ID
+            self._mp_pending_requests[request_id] = results
+
+        self._prune_mp_pending_requests()
+
+    def _prune_mp_pending_requests(self, max_entries: int = 64) -> None:
+        """Bound pending MP results to avoid unbounded growth on timeouts."""
+        if len(self._mp_pending_requests) <= max_entries:
+            return
+
+        stale_request_ids = sorted(self._mp_pending_requests.keys())[:-max_entries]
+        for request_id in stale_request_ids:
+            self._mp_pending_requests.pop(request_id, None)
 
     def _process_recognition_mp(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """
@@ -2631,7 +2848,7 @@ class FaceRecognitionSystem:
         embeddings_to_match = []
         face_metadata = []  # Store metadata for each face to correlate with results
 
-        for face_idx, face in enumerate(faces):
+        for face in faces:
             if face.embedding is None:
                 continue
 
@@ -2639,10 +2856,11 @@ class FaceRecognitionSystem:
             bbox = face.bbox.astype(int)
             left, top, right, bottom = bbox[0], bbox[1], bbox[2], bbox[3]
             location = (top, right, bottom, left)
+            stability_id = self._get_stability_id(location)
 
             # Check face stability
             is_stable = self.stability_tracker.update_and_check_stability(
-                face_idx, location)
+                stability_id, location)
 
             # Try cache lookup first
             cached = self.face_cache.get_by_embedding(face_encoding)
@@ -2697,8 +2915,10 @@ class FaceRecognitionSystem:
             try:
                 self._mp_input_queue.put_nowait(
                     (self._mp_request_id, embeddings_to_match))
-            except:
+            except Full:
                 pass  # Queue full, will retry next frame
+            except (OSError, ValueError) as e:
+                logger.warning(f"Failed to enqueue MP recognition request: {e}")
 
             # Wait briefly for result (with timeout to stay responsive)
             start_wait = time.time()
@@ -2749,7 +2969,7 @@ class FaceRecognitionSystem:
         # Run InsightFace detection and embedding extraction
         faces = self.face_app.get(frame)
 
-        for face_idx, face in enumerate(faces):
+        for face in faces:
             if face.embedding is None:
                 continue
 
@@ -2757,10 +2977,11 @@ class FaceRecognitionSystem:
             bbox = face.bbox.astype(int)
             left, top, right, bottom = bbox[0], bbox[1], bbox[2], bbox[3]
             location = (top, right, bottom, left)
+            stability_id = self._get_stability_id(location)
 
             # Check face stability before attempting recognition
             is_stable = self.stability_tracker.update_and_check_stability(
-                face_idx, location)
+                stability_id, location)
 
             # Try cache lookup by embedding similarity first
             cached = self.face_cache.get_by_embedding(face_encoding)
@@ -2872,8 +3093,10 @@ class FaceRecognitionSystem:
                     self._frame_queue.get_nowait()
                 except Empty:
                     break
+            # Defensive copy avoids backend-specific shared-buffer mutation
+            # while keeping camera thread non-blocking.
             self._frame_queue.put_nowait(frame.copy())
-        except:
+        except Full:
             pass  # Queue full - drop this frame
 
         # Return immediately with cached results
@@ -3116,19 +3339,6 @@ class DoorEntryKiosk:
         self.door_controller = DoorController()
         self.access_log = AccessLog()
 
-        # Auto-migrate from JSON if old log exists
-        old_json_log = "access_log.json"
-        if os.path.exists(old_json_log):
-            migrated = self.access_log.migrate_from_json(old_json_log)
-            if migrated > 0:
-                # Rename old file to prevent re-migration
-                backup_path = "access_log.json.migrated"
-                try:
-                    os.rename(old_json_log, backup_path)
-                    logger.info(f"Old JSON log backed up to {backup_path}")
-                except OSError as e:
-                    logger.warning(f"Could not rename old JSON log: {e}")
-
         # ========== Application State ==========
         self.is_running = True
         self.is_scanning = True
@@ -3139,6 +3349,8 @@ class DoorEntryKiosk:
         self.status_set_time = 0
         self.last_access = {}  # Cooldown tracking per person
         self.admin_mode = False
+        self.admin_failed_attempts = 0
+        self.admin_lockout_until = 0.0
 
         # Blink detection mode - when active, skip face recognition to save resources
         self.awaiting_blink_mode = False
@@ -3149,12 +3361,17 @@ class DoorEntryKiosk:
         # Key: name, Value: timestamp when blink was verified
         # This prevents granting access without blink verification
         self.blink_verified = {}  # {name: verification_timestamp}
+        self._blink_prescan_counter = 0  # Throttle pre-calibration workload
+        self.last_liveness_warning = 0.0  # Throttle repeated fail-closed warnings
 
         # ========== Registration State ==========
         self.registration_mode = False
         self.registration_name = ""
         self.captured_count = 0
         self.current_frame = None
+        self._pending_display_frame = None
+        self._display_update_scheduled = False
+        self._display_lock = threading.Lock()
 
         # Face ID style auto-capture settings
         self.auto_capture_mode = False
@@ -3523,17 +3740,24 @@ class DoorEntryKiosk:
         Main camera processing loop running in background thread.
         Handles frame capture, face recognition, and access decisions.
         """
+        restart_requested = False
+
         try:
             self.camera.start()
-            frame_time = time.time()
 
             while self.is_running:
                 loop_start = time.time()
 
                 # Grab latest frame from camera
-                frame = self.camera.capture_frame()
+                frame = self.camera.capture_frame(copy_frame=False)
                 if frame is None:
+                    time.sleep(0.002)
                     continue
+
+                # Enable per-frame blink mesh cache reuse (avoids repeated
+                # MediaPipe processing for multiple check_blink() calls).
+                if self.face_system.blink_detector and self.face_system.blink_detector.available:
+                    self.face_system.blink_detector.reset_frame_cache()
 
                 display_frame = frame.copy()
 
@@ -3596,6 +3820,16 @@ class DoorEntryKiosk:
                                 self.awaiting_blink_name = None
                                 self.awaiting_blink_location = None
                                 self.root.after(0, self._set_status_scanning)
+                        else:
+                            # Detector became unavailable while waiting for blink.
+                            self.awaiting_blink_mode = False
+                            self.awaiting_blink_name = None
+                            self.awaiting_blink_location = None
+                            if Config.REQUIRE_LIVENESS_FOR_ACCESS:
+                                self._notify_liveness_unavailable()
+                                self.root.after(0, lambda: self.set_status("denied"))
+                            else:
+                                self.root.after(0, self._set_status_scanning)
 
                         # Clean up stale blink verifications (older than 5 seconds)
                         now = time.time()
@@ -3611,19 +3845,45 @@ class DoorEntryKiosk:
                         _, results = self.face_system.recognize_faces(
                             frame, idle_mode=is_idle)
                         self.faces_detected = len(results)
+                        liveness_available = bool(
+                            Config.ENABLE_BLINK_DETECTION
+                            and self.face_system.blink_detector
+                            and self.face_system.blink_detector.available
+                        )
+                        liveness_required = Config.REQUIRE_LIVENESS_FOR_ACCESS
 
-                        # Pre-calibrate blink detection on any detected face (before recognition completes)
-                        # This eliminates calibration delay when entering blink mode
-                        if self.face_system.blink_detector and self.face_system.blink_detector.available:
-                            for result in results:
-                                location = result.get('location', (0, 0, 0, 0))
-                                if location != (0, 0, 0, 0):
+                        # Pre-calibrate blink detection periodically on a limited
+                        # subset of stable recognized faces to reduce CPU load.
+                        if liveness_available:
+                            self._blink_prescan_counter += 1
+                            should_prescan = (
+                                self._blink_prescan_counter %
+                                max(1, Config.BLINK_PRESCAN_INTERVAL_FRAMES)
+                            ) == 0
+
+                            if should_prescan:
+                                prescan_count = 0
+                                max_prescan = max(1, Config.BLINK_PRESCAN_MAX_FACES)
+                                for result in results:
+                                    if prescan_count >= max_prescan:
+                                        break
+
+                                    name_for_prescan = result.get('name')
+                                    is_stable = result.get('is_stable', True)
+                                    if not is_stable or name_for_prescan in ("Unknown", "Scanning...", None):
+                                        continue
+
+                                    location = result.get('location', (0, 0, 0, 0))
+                                    if location == (0, 0, 0, 0):
+                                        continue
+
                                     top, right, bottom, left = location
                                     bbox = (left, top, right, bottom)
-                                    # Call check_blink just for calibration - ignore result
-                                    # Use a generic face_id during scanning, will be replaced with name later
+
+                                    # Warm calibration state; result intentionally ignored.
                                     self.face_system.blink_detector.check_blink(
-                                        frame, bbox, result.get('name'))
+                                        frame, bbox, name_for_prescan)
+                                    prescan_count += 1
 
                         # Track if any face is awaiting blink verification
                         any_awaiting_blink = False
@@ -3646,7 +3906,7 @@ class DoorEntryKiosk:
                                 if name in self.last_access and (now - self.last_access[name]) <= Config.COOLDOWN_SECONDS:
                                     continue  # Still in cooldown, don't request blink
 
-                                if self.face_system.blink_detector and self.face_system.blink_detector.available:
+                                if liveness_available:
                                     top, right, bottom, left = location
                                     bbox = (left, top, right, bottom)
 
@@ -3720,8 +3980,12 @@ class DoorEntryKiosk:
                                                              (now - self.last_access[name]) > Config.COOLDOWN_SECONDS)
 
                                     if is_new_access_attempt:
+                                        if liveness_required and not liveness_available:
+                                            self._notify_liveness_unavailable()
+                                            continue
+
                                         # For new access attempts, require blink verification
-                                        if self.face_system.blink_detector and self.face_system.blink_detector.available and Config.ENABLE_BLINK_DETECTION:
+                                        if liveness_available:
                                             # Check if they have a valid (recent) blink verification
                                             blink_time = self.blink_verified.get(
                                                 name, 0)
@@ -3739,7 +4003,7 @@ class DoorEntryKiosk:
                                                     0, lambda n=name, c=confidence: self.grant_access(n, c))
                                             # else: awaiting blink - handled by first pass that sets awaiting_blink_mode
                                         else:
-                                            # Blink detection disabled, grant access directly
+                                            # Liveness not required, grant access directly
                                             self.last_access[name] = now
                                             self.root.after(
                                                 0, lambda n=name, c=confidence: self.grant_access(n, c))
@@ -3874,6 +4138,9 @@ class DoorEntryKiosk:
                     if expired_count and expired_count > 0:
                         logger.debug(
                             f"Cache cleanup: removed {expired_count} expired entries")
+                    if self.face_system.blink_detector and self.face_system.blink_detector.available:
+                        self.face_system.blink_detector.cleanup_stale_tracking(
+                            Config.BLINK_TRACKING_TTL_SECONDS)
                     # Also clean up old last_access entries to prevent memory leak
                     self._cleanup_old_access_entries(now)
                     self.last_cache_cleanup = now
@@ -3894,8 +4161,7 @@ class DoorEntryKiosk:
                 self.current_frame = frame
 
                 # Update display
-                self.root.after(
-                    0, lambda f=display_frame: self.display_frame(f))
+                self._queue_display_frame(display_frame)
 
                 # Explicit cleanup of frame objects to help garbage collector
                 # (display_frame and frame are large numpy arrays)
@@ -3913,12 +4179,14 @@ class DoorEntryKiosk:
             logger.error(f"OpenCV camera error: {e}", exc_info=True)
             self.root.after(0, lambda: self.show_toast(
                 "Camera error - restarting...", "error"))
-            self._attempt_camera_recovery()
+            if self._attempt_camera_recovery() and self.is_running:
+                restart_requested = True
         except OSError as e:
             logger.error(f"Camera OS error: {e}", exc_info=True)
             self.root.after(0, lambda: self.show_toast(
                 "Camera hardware error", "error"))
-            self._attempt_camera_recovery()
+            if self._attempt_camera_recovery() and self.is_running:
+                restart_requested = True
         except (tk.TclError, RuntimeError) as e:
             logger.error(f"UI error in camera loop: {e}", exc_info=True)
         finally:
@@ -3927,34 +4195,89 @@ class DoorEntryKiosk:
             except Exception:
                 pass
 
-    def _attempt_camera_recovery(self) -> None:
-        """Attempt to recover from camera errors by restarting the camera."""
+        # Restart only after this loop has fully cleaned up camera resources.
+        if restart_requested and self.is_running:
+            self.camera_thread = threading.Thread(
+                target=self.camera_loop, daemon=True)
+            self.camera_thread.start()
+
+    def _attempt_camera_recovery(self) -> bool:
+        """Attempt to recover from camera errors and request loop restart."""
         try:
             time.sleep(2)  # Wait before retry
             if self.is_running:
                 logger.info("Attempting camera recovery...")
-                self.camera.stop()
                 time.sleep(1)
-                self.camera.start()
-                logger.info("Camera recovered successfully")
+                logger.info("Camera recovery reset complete")
+                return True
+            return False
         except (cv2.error, OSError) as recovery_error:
             logger.error(
                 f"Camera recovery failed: {recovery_error}", exc_info=True)
+            return False
+
+    def _queue_display_frame(self, frame) -> None:
+        """
+        Queue latest frame for UI rendering without building up stale after() callbacks.
+        """
+        with self._display_lock:
+            self._pending_display_frame = frame
+            if self._display_update_scheduled:
+                return
+            self._display_update_scheduled = True
+
+        try:
+            self.root.after(0, self._flush_display_frame)
+        except tk.TclError:
+            with self._display_lock:
+                self._display_update_scheduled = False
+
+    def _flush_display_frame(self) -> None:
+        """Render the most recent queued frame and reschedule if a newer one arrived."""
+        with self._display_lock:
+            frame = self._pending_display_frame
+            self._pending_display_frame = None
+            self._display_update_scheduled = False
+
+        if frame is None:
+            return
+
+        try:
+            self.display_frame(frame)
+        except tk.TclError:
+            return
+
+        with self._display_lock:
+            should_reschedule = self._pending_display_frame is not None and not self._display_update_scheduled
+            if should_reschedule:
+                self._display_update_scheduled = True
+
+        if should_reschedule and self.is_running:
+            try:
+                self.root.after(0, self._flush_display_frame)
+            except tk.TclError:
+                with self._display_lock:
+                    self._display_update_scheduled = False
 
     def display_frame(self, frame):
         """
         Display a frame on the video label.
         Also updates admin preview if admin panel is open.
         """
+        target_w, target_h = 440, 330
+
         if USE_PICAMERA:
             frame_rgb = frame
+            frame_h, frame_w = frame_rgb.shape[:2]
+            if frame_w != target_w or frame_h != target_h:
+                frame_rgb = cv2.resize(frame_rgb, (target_w, target_h))
         else:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # Ensure consistent display size
-        frame_h, frame_w = frame_rgb.shape[:2]
-        if frame_w != 440 or frame_h != 330:
-            frame_rgb = cv2.resize(frame_rgb, (440, 330))
+            # Resize first to reduce total pixels processed in color conversion.
+            frame_bgr = frame
+            frame_h, frame_w = frame_bgr.shape[:2]
+            if frame_w != target_w or frame_h != target_h:
+                frame_bgr = cv2.resize(frame_bgr, (target_w, target_h))
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
         img = Image.fromarray(frame_rgb)
         imgtk = ImageTk.PhotoImage(image=img)
@@ -4329,6 +4652,18 @@ class DoorEntryKiosk:
         for key in keys_to_remove:
             del self.last_access[key]
 
+    def _notify_liveness_unavailable(self) -> None:
+        """Rate-limit UI/log warnings when fail-closed liveness blocks access."""
+        now = time.time()
+        if now - self.last_liveness_warning < 5.0:
+            return
+
+        self.last_liveness_warning = now
+        logger.warning(
+            "Access blocked: liveness is required but blink detection is unavailable.")
+        self.root.after(
+            0, lambda: self.show_toast("Liveness unavailable - access blocked", "error"))
+
     def show_admin_login(self):
         """Display the admin login dialog for authentication.
 
@@ -4400,13 +4735,42 @@ class DoorEntryKiosk:
             self.is_scanning = was_scanning
 
         def on_ok(event=None):
+            now = time.time()
+            if self.admin_lockout_until > now:
+                wait_seconds = int(self.admin_lockout_until - now) + 1
+                self.show_warning_dialog(
+                    "Login Locked",
+                    f"Too many failed attempts. Try again in {wait_seconds} seconds."
+                )
+                password_entry.delete(0, tk.END)
+                return
+
             password = password_entry.get()
             if password and verify_password(password, Config.ADMIN_PASSWORD_HASH):
                 logger.info("Admin login successful")
+                self.admin_failed_attempts = 0
+                self.admin_lockout_until = 0.0
                 cleanup_and_restore()
                 self.show_admin_panel()
             elif password:
-                logger.warning("Failed admin login attempt")
+                self.admin_failed_attempts += 1
+                attempts_left = max(
+                    0, Config.ADMIN_MAX_FAILED_ATTEMPTS - self.admin_failed_attempts)
+                logger.warning(
+                    f"Failed admin login attempt ({self.admin_failed_attempts}/{Config.ADMIN_MAX_FAILED_ATTEMPTS})")
+
+                if self.admin_failed_attempts >= Config.ADMIN_MAX_FAILED_ATTEMPTS:
+                    self.admin_lockout_until = time.time() + \
+                        Config.ADMIN_LOCKOUT_SECONDS
+                    self.admin_failed_attempts = 0
+                    self.show_error_dialog(
+                        "Login Locked",
+                        f"Too many failed attempts. Login is locked for {Config.ADMIN_LOCKOUT_SECONDS} seconds."
+                    )
+                elif attempts_left > 0:
+                    self.show_toast(
+                        f"Invalid password ({attempts_left} attempt(s) left)", "warning")
+
                 # Show error inline without leaving login screen
                 password_entry.delete(0, tk.END)
                 # Flash the entry red briefly to indicate error
@@ -4417,6 +4781,8 @@ class DoorEntryKiosk:
                     bg=Config.COLOR_DENIED))
                 self.root.after(
                     450, lambda: password_entry.config(bg=Config.COLOR_BG))
+            else:
+                self.show_toast("Password is required", "warning")
 
         def on_cancel(event=None):
             cleanup_and_restore()
@@ -5360,6 +5726,12 @@ class DoorEntryKiosk:
             self.reg_name_entry.focus_set()
             return
 
+        is_valid_name, name_error = self.face_system.validate_person_name(name)
+        if not is_valid_name:
+            self.show_warning_dialog("Invalid Name", name_error)
+            self.reg_name_entry.focus_set()
+            return
+
         # Check for duplicate names with case-insensitive comparison
         existing_persons = [p[0].lower()
                             for p in self.face_system.get_registered_persons()]
@@ -5660,8 +6032,10 @@ class DoorEntryKiosk:
             nonlocal total_images
             # Count images for progress tracking
             from imutils import paths
-            person_folder = os.path.join(
-                self.face_system.dataset_path, person_name)
+            try:
+                person_folder = self.face_system.get_person_folder(person_name)
+            except ValueError:
+                person_folder = ""
             if os.path.exists(person_folder):
                 total_images = len(list(paths.list_images(person_folder)))
 
@@ -5931,7 +6305,14 @@ class DoorEntryKiosk:
             import shutil
 
             # Delete image folder from dataset
-            person_folder = os.path.join(self.face_system.dataset_path, name)
+            try:
+                person_folder = self.face_system.get_person_folder(name)
+            except ValueError as e:
+                self.show_error_dialog(
+                    "Invalid User Data",
+                    f"Unsafe folder path for '{name}': {e}\n\nDeletion was blocked for safety."
+                )
+                return
             if os.path.exists(person_folder):
                 shutil.rmtree(person_folder)
                 logger.info(f"Deleted photo folder: {person_folder}")
@@ -6081,6 +6462,9 @@ class DoorEntryKiosk:
         # Signal all loops to stop
         self.is_running = False
         self.is_scanning = False
+        with self._display_lock:
+            self._pending_display_frame = None
+            self._display_update_scheduled = False
 
         # Stop the background recognition thread
         self.face_system.stop_recognition_thread()
