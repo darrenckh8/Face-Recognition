@@ -3416,6 +3416,7 @@ class DoorEntryKiosk:
         }
         self.last_head_pose = (0.0, 0.0, 0.0)  # yaw, pitch, roll
         self.last_capture_pose_by_bucket: Dict[str, Tuple[float, float, float]] = {}
+        self.overlay_face_location: Optional[Tuple[int, int, int, int]] = None
         self.auto_capture_target = sum(self.zone_targets.values())
 
         # ========== Training State ==========
@@ -4060,16 +4061,19 @@ class DoorEntryKiosk:
 
                         if target_bucket is None or self.captured_count >= self.auto_capture_target:
                             self.auto_capture_mode = False
+                            self.overlay_face_location = None
                             self.root.after(0, self.complete_auto_registration)
                         elif len(faces) == 1:
                             face = faces[0]
                             location = self._extract_face_location(
                                 face, frame.shape)
                             if location is None:
+                                self.overlay_face_location = None
                                 cv2.putText(display_frame, "Face detection unstable", (frame_width // 2 - 140, frame_height // 2),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
                             else:
                                 top, right, bottom, left = location
+                                self.overlay_face_location = location
                                 pose = self._estimate_head_pose(face)
 
                                 if pose is None:
@@ -4122,9 +4126,11 @@ class DoorEntryKiosk:
 
                         elif len(faces) == 0:
                             self.last_head_pose = (0.0, 0.0, 0.0)
+                            self.overlay_face_location = None
                             cv2.putText(display_frame, "Position your face in frame", (frame_width // 2 - 150, frame_height // 2),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
                         else:
+                            self.overlay_face_location = None
                             cv2.putText(display_frame, "Only one face please", (frame_width // 2 - 100, frame_height // 2),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
@@ -5788,6 +5794,7 @@ class DoorEntryKiosk:
         self.current_zone = 'mid_center'
         self.last_head_pose = (0.0, 0.0, 0.0)
         self.last_capture_pose_by_bucket = {}
+        self.overlay_face_location = None
         self.reg_process_locked = True  # Lock tab navigation during registration
         self.already_trained = False  # Reset for new registration
 
@@ -5833,6 +5840,7 @@ class DoorEntryKiosk:
         self.current_zone = 'mid_center'
         self.last_head_pose = (0.0, 0.0, 0.0)
         self.last_capture_pose_by_bucket = {}
+        self.overlay_face_location = None
         self.reg_process_locked = False  # Unlock tab navigation
 
         # Transition UI back to setup panel
@@ -5881,6 +5889,7 @@ class DoorEntryKiosk:
         self.current_zone = 'mid_center'
         self.last_head_pose = (0.0, 0.0, 0.0)
         self.last_capture_pose_by_bucket = {}
+        self.overlay_face_location = None
         self.auto_capture_target = sum(self.zone_targets.values())
 
         # Update button state
@@ -5903,6 +5912,7 @@ class DoorEntryKiosk:
         self.auto_capture_mode = False
         self.reg_process_locked = False
         self.last_capture_pose_by_bucket = {}
+        self.overlay_face_location = None
         self.auto_capture_btn.config(
             text=f"⟳ Start Auto Capture ({self.auto_capture_target})", bg="#5856D6", command=self.start_auto_capture, state=tk.NORMAL)
         self.update_registration_ui()
@@ -6066,104 +6076,76 @@ class DoorEntryKiosk:
 
         return True, "Capture ready"
 
+    def _faceid_progress_color(self, progress: float) -> Tuple[int, int, int]:
+        """Interpolate ring color from red to green based on progress."""
+        p = float(np.clip(progress, 0.0, 1.0))
+        start = np.array([70.0, 80.0, 255.0], dtype=np.float32)   # Red-ish (BGR)
+        end = np.array([90.0, 220.0, 105.0], dtype=np.float32)    # Green-ish (BGR)
+        mixed = start + (end - start) * p
+        return (int(mixed[0]), int(mixed[1]), int(mixed[2]))
+
     def draw_faceid_overlay(self, frame):
-        """Draw head-pose mapping overlay for auto-capture."""
+        """Draw a Face ID style circular enrollment overlay."""
         frame_height, frame_width = frame.shape[:2]
-        center_x = frame_width // 2
+        progress = min(1.0, self.captured_count / max(1, self.auto_capture_target))
+        ring_color = self._faceid_progress_color(progress)
 
-        mode_text = "HEAD POSE MAPPER" if self.auto_capture_mode else "REGISTRATION"
-        cv2.putText(frame, mode_text, (15, 32),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (130, 220, 255), 2)
-        cv2.putText(frame, self.registration_name, (15, 58),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        # Header
+        cv2.putText(frame, "FACE ID", (15, 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.86, (230, 230, 230), 2)
+        cv2.putText(frame, self.registration_name, (15, 62),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
 
-        yaw, pitch, roll = self.last_head_pose
-        cv2.putText(
-            frame,
-            f"Yaw {yaw:+.0f}  Pitch {pitch:+.0f}  Roll {roll:+.0f}",
-            (15, 84),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            (230, 230, 230),
-            1
+        # Ring follows the detected face when available.
+        location = self.overlay_face_location
+        if location is not None:
+            top, right, bottom, left = location
+            center_x = (left + right) // 2
+            center_y = (top + bottom) // 2
+            face_size = max(right - left, bottom - top)
+            radius = int(face_size * 0.72) + 22
+        else:
+            center_x = frame_width // 2
+            center_y = frame_height // 2
+            radius = min(frame_width, frame_height) // 5
+
+        max_radius = max(42, min(frame_width, frame_height) // 2 - 18)
+        radius = max(52, min(radius, max_radius))
+
+        # Base track + active progress arc
+        cv2.circle(frame, (center_x, center_y), radius,
+                   (44, 44, 44), 10, cv2.LINE_AA)
+        cv2.circle(frame, (center_x, center_y), radius + 7,
+                   ring_color, 2, cv2.LINE_AA)
+        end_angle = -90 + int(360 * progress)
+        cv2.ellipse(frame, (center_x, center_y), (radius, radius),
+                    0, -90, end_angle, ring_color, 10, cv2.LINE_AA)
+
+        # Inner guide ring gives a cleaner "enrollment target" look.
+        cv2.circle(frame, (center_x, center_y), max(20, radius - 18),
+                   (110, 110, 110), 1, cv2.LINE_AA)
+        cv2.circle(frame, (center_x, center_y), 2, (220, 220, 220), -1, cv2.LINE_AA)
+
+        bins_done = sum(
+            1 for z in self.zone_captures
+            if self.zone_captures[z] >= self.zone_targets.get(z, 0)
         )
+        total_bins = len(self.zone_targets)
+        cv2.putText(frame, f"{self.captured_count}/{self.auto_capture_target} captures",
+                    (15, frame_height - 34), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (245, 245, 245), 1)
+        cv2.putText(frame, f"Coverage {bins_done}/{total_bins} angles",
+                    (15, frame_height - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
 
-        # Pose map card (3x3 grid)
-        grid_cell = 46
-        grid_gap = 7
-        grid_w = grid_cell * 3 + grid_gap * 2
-        grid_h = grid_cell * 3 + grid_gap * 2
-        grid_x = frame_width - grid_w - 20
-        grid_y = 72
-
-        cv2.rectangle(frame, (grid_x - 10, grid_y - 32),
-                      (grid_x + grid_w + 10, grid_y + grid_h + 10), (28, 28, 28), -1)
-        cv2.rectangle(frame, (grid_x - 10, grid_y - 32),
-                      (grid_x + grid_w + 10, grid_y + grid_h + 10), (70, 70, 70), 1)
-        cv2.putText(frame, "Pose Map", (grid_x - 2, grid_y - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
-
-        pitch_rows = ['up', 'mid', 'down']
-        yaw_cols = ['left', 'center', 'right']
-
-        for row_idx, pitch_band in enumerate(pitch_rows):
-            for col_idx, yaw_band in enumerate(yaw_cols):
-                bucket = f"{pitch_band}_{yaw_band}"
-                current = self.zone_captures.get(bucket, 0)
-                target = self.zone_targets.get(bucket, 1)
-                fill_pct = min(1.0, current / target) if target > 0 else 1.0
-
-                cell_x = grid_x + col_idx * (grid_cell + grid_gap)
-                cell_y = grid_y + row_idx * (grid_cell + grid_gap)
-
-                if fill_pct >= 1.0:
-                    bg_color = (28, 145, 28)
-                elif fill_pct > 0:
-                    bg_color = (36, 124, 180)
-                else:
-                    bg_color = (55, 55, 55)
-
-                cv2.rectangle(frame, (cell_x, cell_y),
-                              (cell_x + grid_cell, cell_y + grid_cell), bg_color, -1)
-                border_color = (255, 255, 255) if bucket == self.current_zone else (95, 95, 95)
-                border_thickness = 2 if bucket == self.current_zone else 1
-                cv2.rectangle(frame, (cell_x, cell_y), (cell_x + grid_cell,
-                              cell_y + grid_cell), border_color, border_thickness)
-
-                cv2.putText(frame, f"{current}/{target}", (cell_x + 6, cell_y + 29),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.43, (245, 245, 245), 1)
-
-        # Progress bar
-        if self.auto_capture_mode:
-            bar_w = 330
-            bar_h = 14
-            bar_x = center_x - bar_w // 2
-            bar_y = frame_height - 44
-            progress = min(1.0, self.captured_count / max(1, self.auto_capture_target))
-
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w,
-                          bar_y + bar_h), (40, 40, 40), -1)
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + int(bar_w *
-                          progress), bar_y + bar_h), (0, 200, 0), -1)
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w,
-                          bar_y + bar_h), (110, 110, 110), 1)
-            cv2.putText(frame, f"{self.captured_count}/{self.auto_capture_target}",
-                        (bar_x + bar_w + 10, bar_y + 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-            next_bucket = self._next_incomplete_pose_bucket()
-            if next_bucket:
-                target_yaw, target_pitch = self.pose_bucket_centers.get(
-                    next_bucket, (0.0, 0.0))
-                hint = self.pose_bucket_hints.get(next_bucket, "Adjust head pose")
-                cv2.putText(frame, f"Next: {hint}", (center_x - 120, bar_y - 14),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-                cv2.putText(frame, f"Target yaw {target_yaw:+.0f}, pitch {target_pitch:+.0f}",
-                            (center_x - 150, bar_y - 34),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (190, 220, 255), 1)
-            else:
-                cv2.putText(frame, "All pose bins captured!", (center_x - 110, bar_y - 14),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+        next_bucket = self._next_incomplete_pose_bucket()
+        if next_bucket:
+            hint = self.pose_bucket_hints.get(next_bucket, "Move head")
+            hint_x = max(12, min(frame_width - 250, center_x - radius))
+            hint_y = max(24, center_y - radius - 14)
+            cv2.putText(frame, f"Move: {hint}", (hint_x, hint_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.56, (255, 255, 255), 1)
+        else:
+            cv2.putText(frame, "Face map complete", (center_x - 78, center_y + 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.56, (130, 255, 140), 2)
 
     def update_registration_ui(self):
         """Update the registration UI labels with current capture progress."""
