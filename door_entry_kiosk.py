@@ -1604,7 +1604,16 @@ def _embedding_worker_process(
             for face_data in embeddings:
                 face_encoding = np.array(
                     face_data['embedding'], dtype=np.float32)
-                face_norm = face_encoding / np.linalg.norm(face_encoding)
+                encoding_norm = float(np.linalg.norm(face_encoding))
+                if (not np.isfinite(encoding_norm)) or encoding_norm <= 1e-12:
+                    results.append({
+                        'name': "Unknown",
+                        'confidence': 0.0,
+                        'location': face_data['location'],
+                        'is_stable': face_data['is_stable']
+                    })
+                    continue
+                face_norm = face_encoding / encoding_norm
 
                 # Use FAISS or linear search
                 if faiss_index is not None:
@@ -2168,6 +2177,8 @@ class FaceRecognitionSystem:
         if len(self.known_encodings) > 0:
             encodings_matrix = np.array(self.known_encodings, dtype=np.float32)
             norms = np.linalg.norm(encodings_matrix, axis=1, keepdims=True)
+            invalid_norms = ~np.isfinite(norms) | (norms <= 1e-12)
+            norms[invalid_norms] = 1.0
             self.known_encodings_normalized = (
                 encodings_matrix / norms).astype(np.float32)
 
@@ -2657,12 +2668,14 @@ class FaceRecognitionSystem:
 
     def detect_faces_combined(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
         """
-        Hybrid detection: fast Haar cascade first, then InsightFace fallback.
-        Optimizes for speed while maintaining detection reliability.
+        Detection strategy controlled by Config.USE_FAST_DETECTION.
+        When enabled: fast Haar first, then InsightFace fallback.
+        When disabled: use InsightFace directly for consistency.
         """
-        faces = self.detect_faces_fast(frame)
+        if not Config.USE_FAST_DETECTION:
+            return self.detect_faces_robust(frame)
 
-        # Fall back to robust detection if fast detection finds nothing
+        faces = self.detect_faces_fast(frame)
         if not faces:
             faces = self.detect_faces_robust(frame)
 
@@ -2797,6 +2810,9 @@ class FaceRecognitionSystem:
                 except RuntimeError as e:
                     logger.error(
                         f"Recognition runtime error: {e}", exc_info=True)
+                except Exception as e:
+                    logger.error(
+                        f"Unexpected recognition error: {e}", exc_info=True)
                 finally:
                     self._recognition_running = False
                     # Help GC by clearing reference
@@ -2895,6 +2911,18 @@ class FaceRecognitionSystem:
                     'location': location,
                     'from_cache': False,
                     'is_stable': False
+                })
+                continue
+
+            # Guard against invalid embeddings (zero/NaN norm).
+            embedding_norm = float(np.linalg.norm(face_encoding))
+            if (not np.isfinite(embedding_norm)) or embedding_norm <= 1e-12:
+                results.append({
+                    'name': "Unknown",
+                    'confidence': 0.0,
+                    'location': location,
+                    'from_cache': False,
+                    'is_stable': True
                 })
                 continue
 
@@ -3025,8 +3053,17 @@ class FaceRecognitionSystem:
             confidence = 0.0
 
             # Normalize current embedding
-            face_norm = (face_encoding /
-                         np.linalg.norm(face_encoding)).astype(np.float32)
+            embedding_norm = float(np.linalg.norm(face_encoding))
+            if (not np.isfinite(embedding_norm)) or embedding_norm <= 1e-12:
+                results.append({
+                    'name': "Unknown",
+                    'confidence': 0.0,
+                    'location': location,
+                    'from_cache': False,
+                    'is_stable': True
+                })
+                continue
+            face_norm = (face_encoding / embedding_norm).astype(np.float32)
 
             # Use FAISS index if available, otherwise fall back to linear search
             if self.faiss_index is not None:
@@ -3621,7 +3658,7 @@ class DoorEntryKiosk:
         self.info_label = tk.Label(
             bottom_bar,
             text=f"{len(self.face_system.get_trained_persons())} Users",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_TEXT_TERTIARY,
             bg=Config.COLOR_BG
         )
@@ -4350,6 +4387,20 @@ class DoorEntryKiosk:
         if duration is None:
             duration = Config.TOAST_DURATION
 
+        payload = (message, toast_type, duration)
+        toast_visible = (
+            hasattr(self, 'toast_label')
+            and self.toast_label.winfo_exists()
+            and self.toast_label.winfo_ismapped()
+        )
+        if self._toast_id and toast_visible:
+            # Queue sequential toasts instead of replacing current feedback.
+            if not self._pending_toasts or self._pending_toasts[-1] != payload:
+                if len(self._pending_toasts) >= 12:
+                    self._pending_toasts.pop(0)
+                self._pending_toasts.append(payload)
+            return
+
         # Color schemes for each toast type
         colors = {
             "success": (Config.COLOR_GRANTED, "#FFFFFF"),
@@ -4406,6 +4457,16 @@ class DoorEntryKiosk:
         if hasattr(self, 'toast_label') and self.toast_label.winfo_exists():
             self.toast_label.place_forget()
         self._toast_id = None
+
+        if self._pending_toasts and self.is_running:
+            next_message, next_type, next_duration = self._pending_toasts.pop(0)
+            try:
+                self.root.after(
+                    0,
+                    lambda m=next_message, t=next_type, d=next_duration: self.show_toast(m, t, d)
+                )
+            except (tk.TclError, RuntimeError):
+                self._pending_toasts.clear()
 
     # ==================== INLINE DIALOG SYSTEM ====================
     # These replace Tkinter messagebox dialogs for Cage/Wayland kiosk compatibility
@@ -4664,7 +4725,13 @@ class DoorEntryKiosk:
         """Perform database write and UI update in background thread."""
         self.access_log.add_entry(name, access_granted, confidence)
         # Schedule UI update on main thread
-        self.root.after(0, self.update_log_display)
+        if not self.is_running:
+            return
+        try:
+            self.root.after(0, self.update_log_display)
+        except (tk.TclError, RuntimeError):
+            # App is closing/destroyed; ignore late async update.
+            pass
 
     def _pulse_border(self, color, duration=300):
         """Create a brief color pulse on the video container border."""
@@ -4923,8 +4990,8 @@ class DoorEntryKiosk:
         style = ttk.Style()
         style.configure('TNotebook', background=Config.COLOR_BG, borderwidth=0)
         style.configure('TNotebook.Tab',
-                        font=(Config.FONT_FAMILY, 9),
-                        padding=[10, 6],
+                        font=(Config.FONT_FAMILY, 10),
+                        padding=[12, 8],
                         background=Config.COLOR_BG,
                         foreground=Config.COLOR_TEXT_SECONDARY)
         style.map('TNotebook.Tab',
@@ -5049,7 +5116,7 @@ class DoorEntryKiosk:
         self.reg_count_label = tk.Label(
             top_row,
             text="0 photos",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD
         )
@@ -5058,7 +5125,7 @@ class DoorEntryKiosk:
         self.stop_reg_btn = tk.Button(
             top_row,
             text="Stop",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg="#FFFFFF",
             bg=Config.COLOR_DENIED,
             activeforeground="#FFFFFF",
@@ -5076,7 +5143,7 @@ class DoorEntryKiosk:
         self.auto_capture_btn = tk.Button(
             btn_row,
             text=f"⟳ Start Auto Capture ({self.auto_capture_target})",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg="#FFFFFF",
             bg="#5856D6",
             activebackground="#4744c4",
@@ -5116,7 +5183,7 @@ class DoorEntryKiosk:
         tk.Label(
             inner,
             text="Process photos to train recognition",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD
         ).pack(anchor=tk.W, pady=(3, 15))
@@ -5156,7 +5223,7 @@ class DoorEntryKiosk:
         self.train_status_label = tk.Label(
             inner,
             text="Ready to train",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD
         )
@@ -5209,8 +5276,11 @@ class DoorEntryKiosk:
                         highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
         card.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
+        users_list_frame = tk.Frame(card, bg=Config.COLOR_CARD)
+        users_list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
+
         self.manage_listbox = tk.Listbox(
-            card,
+            users_list_frame,
             font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_CARD,
@@ -5221,8 +5291,13 @@ class DoorEntryKiosk:
             relief=tk.FLAT,
             activestyle='none'
         )
-        self.manage_listbox.pack(
-            fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
+        self.manage_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.manage_scrollbar = tk.Scrollbar(
+            users_list_frame, orient=tk.VERTICAL, command=self.manage_listbox.yview
+        )
+        self.manage_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.manage_listbox.config(yscrollcommand=self.manage_scrollbar.set)
 
         # Pagination controls
         pagination_frame = tk.Frame(card, bg=Config.COLOR_CARD)
@@ -5231,7 +5306,7 @@ class DoorEntryKiosk:
         self.users_prev_btn = tk.Button(
             pagination_frame,
             text="◀ Previous",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_CARD,
             activeforeground=Config.COLOR_SCANNING,
@@ -5245,7 +5320,7 @@ class DoorEntryKiosk:
         self.users_page_label = tk.Label(
             pagination_frame,
             text="Page 1 of 1",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD
         )
@@ -5254,7 +5329,7 @@ class DoorEntryKiosk:
         self.users_next_btn = tk.Button(
             pagination_frame,
             text="Next ▶",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_CARD,
             activeforeground=Config.COLOR_SCANNING,
@@ -5274,7 +5349,7 @@ class DoorEntryKiosk:
         tk.Button(
             btn_frame1,
             text="Revoke Access",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_SCANNING,
@@ -5286,7 +5361,7 @@ class DoorEntryKiosk:
         tk.Button(
             btn_frame1,
             text="Delete + Photos",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_DENIED,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_DENIED,
@@ -5302,7 +5377,7 @@ class DoorEntryKiosk:
         tk.Button(
             btn_frame2,
             text="Restore Access",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_GRANTED,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_GRANTED,
@@ -5319,7 +5394,7 @@ class DoorEntryKiosk:
         self.log_total_count = 0
         self.log_date_from = None
         self.log_date_to = None
-        self.log_name_var = tk.StringVar(value="All")
+        self.log_name_var = tk.StringVar(value="")
 
         # Header with title and clear button
         header = tk.Frame(parent, bg=Config.COLOR_BG)
@@ -5336,7 +5411,7 @@ class DoorEntryKiosk:
         tk.Button(
             header,
             text="Clear",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_DENIED,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_DENIED,
@@ -5352,7 +5427,7 @@ class DoorEntryKiosk:
         tk.Button(
             filter_frame,
             text="Today",
-            font=(Config.FONT_FAMILY, 8),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_SCANNING,
@@ -5364,7 +5439,7 @@ class DoorEntryKiosk:
         tk.Button(
             filter_frame,
             text="7 Days",
-            font=(Config.FONT_FAMILY, 8),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_SCANNING,
@@ -5376,7 +5451,7 @@ class DoorEntryKiosk:
         tk.Button(
             filter_frame,
             text="30 Days",
-            font=(Config.FONT_FAMILY, 8),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_SCANNING,
@@ -5388,7 +5463,7 @@ class DoorEntryKiosk:
         tk.Button(
             filter_frame,
             text="All",
-            font=(Config.FONT_FAMILY, 8),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_TEXT,
@@ -5397,14 +5472,68 @@ class DoorEntryKiosk:
             command=self.clear_log_filter
         ).pack(side=tk.LEFT, padx=2)
 
+        # Name filter row
+        name_filter_row = tk.Frame(parent, bg=Config.COLOR_BG)
+        name_filter_row.pack(fill=tk.X, padx=10, pady=(0, 5))
+
+        tk.Label(
+            name_filter_row,
+            text="Name:",
+            font=(Config.FONT_FAMILY, 10),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_BG
+        ).pack(side=tk.LEFT)
+
+        self.log_name_entry = tk.Entry(
+            name_filter_row,
+            textvariable=self.log_name_var,
+            font=(Config.FONT_FAMILY, 10),
+            bg=Config.COLOR_CARD_SECONDARY,
+            fg=Config.COLOR_TEXT,
+            relief=tk.FLAT,
+            highlightbackground=Config.COLOR_BORDER,
+            highlightthickness=1
+        )
+        self.log_name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6), ipady=2)
+        self.log_name_entry.bind('<Return>', lambda e: self.apply_log_name_filter())
+        self.log_name_entry.bind('<Button-1>', lambda e: show_keyboard(
+            parent, self.log_name_entry, self.root))
+
+        tk.Button(
+            name_filter_row,
+            text="Apply",
+            font=(Config.FONT_FAMILY, 10),
+            fg=Config.COLOR_SCANNING,
+            bg=Config.COLOR_BG,
+            activeforeground=Config.COLOR_SCANNING,
+            bd=0,
+            cursor="hand2",
+            command=self.apply_log_name_filter
+        ).pack(side=tk.LEFT, padx=(0, 4))
+
+        tk.Button(
+            name_filter_row,
+            text="Reset",
+            font=(Config.FONT_FAMILY, 10),
+            fg=Config.COLOR_TEXT_SECONDARY,
+            bg=Config.COLOR_BG,
+            activeforeground=Config.COLOR_TEXT,
+            bd=0,
+            cursor="hand2",
+            command=self.clear_log_filter
+        ).pack(side=tk.LEFT)
+
         # Log entries list
         card = tk.Frame(parent, bg=Config.COLOR_CARD,
                         highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
         card.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
+        log_list_frame = tk.Frame(card, bg=Config.COLOR_CARD)
+        log_list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
+
         self.admin_log_listbox = tk.Listbox(
-            card,
-            font=(Config.FONT_FAMILY_MONO, 9),
+            log_list_frame,
+            font=(Config.FONT_FAMILY_MONO, 10),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_CARD,
             selectbackground=Config.COLOR_CARD_SECONDARY,
@@ -5414,8 +5543,13 @@ class DoorEntryKiosk:
             relief=tk.FLAT,
             activestyle='none'
         )
-        self.admin_log_listbox.pack(
-            fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
+        self.admin_log_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.admin_log_scrollbar = tk.Scrollbar(
+            log_list_frame, orient=tk.VERTICAL, command=self.admin_log_listbox.yview
+        )
+        self.admin_log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.admin_log_listbox.config(yscrollcommand=self.admin_log_scrollbar.set)
 
         # Pagination controls
         pagination_frame = tk.Frame(card, bg=Config.COLOR_CARD)
@@ -5424,7 +5558,7 @@ class DoorEntryKiosk:
         self.log_prev_btn = tk.Button(
             pagination_frame,
             text="◀ Previous",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_CARD,
             activeforeground=Config.COLOR_SCANNING,
@@ -5438,7 +5572,7 @@ class DoorEntryKiosk:
         self.log_page_label = tk.Label(
             pagination_frame,
             text="Page 1 of 1",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD
         )
@@ -5447,7 +5581,7 @@ class DoorEntryKiosk:
         self.log_next_btn = tk.Button(
             pagination_frame,
             text="Next ▶",
-            font=(Config.FONT_FAMILY, 9),
+            font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_CARD,
             activeforeground=Config.COLOR_SCANNING,
@@ -5477,9 +5611,14 @@ class DoorEntryKiosk:
 
     def clear_log_filter(self):
         """Remove all filters and show all log entries."""
-        self.log_name_var.set("All")
+        self.log_name_var.set("")
         self.log_date_from = None
         self.log_date_to = None
+        self.log_current_page = 0
+        self.refresh_log_page()
+
+    def apply_log_name_filter(self):
+        """Apply name filter from the Activity tab input."""
         self.log_current_page = 0
         self.refresh_log_page()
 
@@ -5502,7 +5641,7 @@ class DoorEntryKiosk:
             page_size=Config.LOG_PAGE_SIZE,
             date_from=self.log_date_from,
             date_to=self.log_date_to,
-            name_filter=None if self.log_name_var.get() == "All" else self.log_name_var.get()
+            name_filter=self.log_name_var.get().strip() or None
         )
 
         self.log_total_count = total_count
@@ -5795,7 +5934,9 @@ class DoorEntryKiosk:
         self.last_head_pose = (0.0, 0.0, 0.0)
         self.last_capture_pose_by_bucket = {}
         self.overlay_face_location = None
-        self.reg_process_locked = True  # Lock tab navigation during registration
+        # Keep navigation unlocked during manual registration setup/capture.
+        # Locking is enabled only for auto-capture/training operations.
+        self.reg_process_locked = False
         self.already_trained = False  # Reset for new registration
 
         # Transition UI from setup panel to capture panel
@@ -6207,30 +6348,46 @@ class DoorEntryKiosk:
                 pass
 
         def training_thread():
-            nonlocal total_images
-            # Count images for progress tracking
-            from imutils import paths
+            success = False
+            message = "Training failed"
             try:
-                person_folder = self.face_system.get_person_folder(person_name)
-            except ValueError:
-                person_folder = ""
-            if os.path.exists(person_folder):
-                total_images = len(list(paths.list_images(person_folder)))
+                nonlocal total_images
+                # Count images for progress tracking
+                from imutils import paths
+                try:
+                    person_folder = self.face_system.get_person_folder(person_name)
+                except ValueError:
+                    person_folder = ""
+                if os.path.exists(person_folder):
+                    total_images = len(list(paths.list_images(person_folder)))
 
-            def progress_callback(current, total, filepath):
-                """Update UI with encoding progress."""
-                if current == total:
-                    self.root.after(0, lambda: update_progress_label(
-                        "Saving encodings..."))
-                else:
-                    self.root.after(0, lambda c=current, t=total: update_progress_label(
-                        f"Encoding {c}/{t}..."))
+                def progress_callback(current, total, filepath):
+                    """Update UI with encoding progress."""
+                    try:
+                        if current == total:
+                            self.root.after(0, lambda: update_progress_label(
+                                "Saving encodings..."))
+                        else:
+                            self.root.after(0, lambda c=current, t=total: update_progress_label(
+                                f"Encoding {c}/{t}..."))
+                    except (tk.TclError, RuntimeError):
+                        pass
 
-            success, message = self.face_system.train_single_person(
-                person_name, progress_callback)
-            # Schedule completion on main thread
-            self.root.after(
-                0, lambda: self.training_with_progress_complete(success, message))
+                success, message = self.face_system.train_single_person(
+                    person_name, progress_callback)
+            except Exception as e:
+                logger.error(
+                    f"Auto-capture training thread failed for '{person_name}': {e}",
+                    exc_info=True
+                )
+                message = f"Training failed: {e}"
+            finally:
+                # Always schedule completion to release lock/UI state.
+                try:
+                    self.root.after(
+                        0, lambda s=success, m=message: self.training_with_progress_complete(s, m))
+                except (tk.TclError, RuntimeError):
+                    pass
 
         thread = threading.Thread(target=training_thread, daemon=True)
         thread.start()
@@ -6293,10 +6450,23 @@ class DoorEntryKiosk:
         self.is_training = True  # Pause live recognition during training
 
         def training_thread():
-            success, message = self.face_system.train_single_person(
-                person_name)
-            self.root.after(
-                0, lambda: self.single_training_complete(success, message))
+            success = False
+            message = "Training failed"
+            try:
+                success, message = self.face_system.train_single_person(
+                    person_name)
+            except Exception as e:
+                logger.error(
+                    f"Single-person training thread failed for '{person_name}': {e}",
+                    exc_info=True
+                )
+                message = f"Training failed: {e}"
+            finally:
+                try:
+                    self.root.after(
+                        0, lambda s=success, m=message: self.single_training_complete(s, m))
+                except (tk.TclError, RuntimeError):
+                    pass
 
         thread = threading.Thread(target=training_thread, daemon=True)
         thread.start()
@@ -6349,17 +6519,33 @@ class DoorEntryKiosk:
         self.reg_process_locked = True  # Lock tab navigation during training
 
         def training_thread():
-            def progress_callback(current, total, filepath):
-                """Update progress bar and status from training thread."""
-                progress = (current / total) * 100
-                self.root.after(
-                    0, lambda: self.train_progress.configure(value=progress))
-                self.root.after(0, lambda: self.train_status_label.config(
-                    text=f"Processing {current}/{total}..."))
+            success = False
+            message = "Training failed"
+            try:
+                def progress_callback(current, total, filepath):
+                    """Update progress bar and status from training thread."""
+                    progress = (current / total) * 100
+                    try:
+                        self.root.after(
+                            0, lambda: self.train_progress.configure(value=progress))
+                        self.root.after(0, lambda: self.train_status_label.config(
+                            text=f"Processing {current}/{total}..."))
+                    except (tk.TclError, RuntimeError):
+                        pass
 
-            success, message = self.face_system.train_model(progress_callback)
-            self.root.after(
-                0, lambda: self.training_complete(success, message))
+                success, message = self.face_system.train_model(progress_callback)
+            except Exception as e:
+                logger.error(
+                    f"Full training thread failed: {e}",
+                    exc_info=True
+                )
+                message = f"Training failed: {e}"
+            finally:
+                try:
+                    self.root.after(
+                        0, lambda s=success, m=message: self.training_complete(s, m))
+                except (tk.TclError, RuntimeError):
+                    pass
 
         thread = threading.Thread(target=training_thread, daemon=True)
         thread.start()
@@ -6563,7 +6749,7 @@ class DoorEntryKiosk:
                     self.admin_notebook.select(0)
                     # Use toast instead of blocking dialog to avoid stuck state
                     self.show_toast(
-                        "Please wait for capture and encoding to complete", "warning")
+                        "Please wait for auto-capture or encoding to complete", "warning")
                 elif self.is_training:
                     # Full model training from Train tab - force back to train tab (index 1)
                     self.admin_notebook.select(1)
@@ -6593,7 +6779,7 @@ class DoorEntryKiosk:
         # Prevent closing during active process
         if self.reg_process_locked:
             self.show_toast(
-                "Please wait for capture and encoding to complete", "warning")
+                "Please wait for auto-capture or training to complete", "warning")
             return
 
         # Clean up any in-progress registration
