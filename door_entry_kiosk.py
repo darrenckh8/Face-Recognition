@@ -306,6 +306,8 @@ class Config:
     # ----- Camera Settings -----
     # Camera capture resolution (width, height)
     CAMERA_RESOLUTION = (640, 480)
+    # Rotate camera frames clockwise: 0, 90, 180, or 270
+    CAMERA_ROTATION = 0
 
     # ----- Face Recognition Settings -----
     RECOGNITION_THRESHOLD = 0.8          # Minimum cosine similarity for a match
@@ -1365,16 +1367,23 @@ class CameraManager:
     Supports both USB webcams and Raspberry Pi camera module.
     """
 
-    def __init__(self, use_picamera=False, resolution=(640, 480)):
+    def __init__(self, use_picamera=False, resolution=(640, 480), rotation=0):
         """
         Initialize camera manager.
 
         Args:
             use_picamera: Use Raspberry Pi camera instead of USB webcam
             resolution: Capture resolution as (width, height)
+            rotation: Clockwise frame rotation in degrees (0/90/180/270)
         """
         self.use_picamera = use_picamera
         self.resolution = resolution
+        valid_rotations = {0, 90, 180, 270}
+        if rotation not in valid_rotations:
+            logger.warning(
+                f"Invalid camera rotation '{rotation}'. Using 0. Valid values: {sorted(valid_rotations)}")
+            rotation = 0
+        self.rotation = rotation
         self.camera = None
         self.is_running = False
 
@@ -1432,6 +1441,16 @@ class CameraManager:
         # Allow camera to warm up
         time.sleep(0.3)
 
+    def _rotate_frame(self, frame):
+        """Rotate frame clockwise based on configured camera rotation."""
+        if self.rotation == 90:
+            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        if self.rotation == 180:
+            return cv2.rotate(frame, cv2.ROTATE_180)
+        if self.rotation == 270:
+            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return frame
+
     def _capture_loop(self):
         """
         Continuous frame capture running in background thread.
@@ -1448,6 +1467,8 @@ class CameraManager:
                     if not ret:
                         time.sleep(0.01)  # Brief sleep on failed read
                         continue
+
+                frame = self._rotate_frame(frame)
 
                 # Thread-safe frame update
                 with self.frame_lock:
@@ -3371,7 +3392,10 @@ class DoorEntryKiosk:
 
         # Initialize core system components
         self.camera = CameraManager(
-            use_picamera=USE_PICAMERA, resolution=Config.CAMERA_RESOLUTION)
+            use_picamera=USE_PICAMERA,
+            resolution=Config.CAMERA_RESOLUTION,
+            rotation=Config.CAMERA_ROTATION,
+        )
         self.face_system = FaceRecognitionSystem()
         self.door_controller = DoorController()
         self.access_log = AccessLog()
