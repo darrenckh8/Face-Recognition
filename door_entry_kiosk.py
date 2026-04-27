@@ -2350,7 +2350,9 @@ class FaceRecognitionSystem:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"{name}_{timestamp}.jpg"
         filepath = os.path.join(folder, filename)
-        cv2.imwrite(filepath, frame)
+        write_ok = cv2.imwrite(filepath, frame)
+        if not write_ok:
+            raise IOError(f"Failed to write image file: {filepath}")
         set_secure_permissions(
             filepath, Config.SECURE_FILE_MODE, Config.SECURE_DIR_MODE)
         return filepath
@@ -3438,6 +3440,9 @@ class DoorEntryKiosk:
         self.auto_capture_mode = False
         self.auto_capture_interval = 0.2  # Seconds between captures
         self.last_auto_capture = 0
+        # If strict pose gates block progress, force-capture after a short stall.
+        self.auto_capture_stall_started = 0.0
+        self.auto_capture_force_after = 1.2
 
         # Head-pose mapper state (3x3 pitch/yaw bins)
         self.pose_bucket_order = [
@@ -4148,6 +4153,8 @@ class DoorEntryKiosk:
                                         self.last_head_pose = (0.0, 0.0, 0.0)
                                         box_color = (0, 200, 255)
                                         status_text = "Turn slightly toward camera"
+                                        can_capture = False
+                                        fallback_bucket = target_bucket
                                     else:
                                         yaw_raw, pitch_raw, roll = pose
 
@@ -4169,11 +4176,29 @@ class DoorEntryKiosk:
                                             frame, location, target_bucket, yaw, pitch, roll)
                                         box_color = (0, 255, 0) if can_capture else (
                                             0, 200, 255)
+                                        if (live_bucket in self.zone_targets
+                                                and self.zone_captures.get(live_bucket, 0) < self.zone_targets.get(live_bucket, 0)):
+                                            fallback_bucket = live_bucket
+                                        else:
+                                            fallback_bucket = target_bucket
 
-                                        now = time.time()
-                                        if (can_capture
-                                                and self.captured_count < self.auto_capture_target
-                                                and now - self.last_auto_capture >= self.auto_capture_interval):
+                                    now = time.time()
+
+                                    if can_capture:
+                                        self.auto_capture_stall_started = 0.0
+                                    else:
+                                        if self.auto_capture_stall_started <= 0.0:
+                                            self.auto_capture_stall_started = now
+
+                                    force_capture = (
+                                        not can_capture
+                                        and self.auto_capture_stall_started > 0.0
+                                        and (now - self.auto_capture_stall_started) >= self.auto_capture_force_after
+                                    )
+
+                                    if ((can_capture or force_capture)
+                                            and self.captured_count < self.auto_capture_target
+                                            and now - self.last_auto_capture >= self.auto_capture_interval):
                                             try:
                                                 self.face_system.save_face_image(
                                                     frame, self.registration_name)
@@ -4182,17 +4207,25 @@ class DoorEntryKiosk:
                                                     f"Auto-capture save failed for '{self.registration_name}': {capture_error}",
                                                     exc_info=True
                                                 )
+                                                self.last_auto_capture = now
                                                 self.root.after(
                                                     0, lambda: self.show_toast("Failed to save capture", "error"))
                                             else:
+                                                bucket_to_increment = target_bucket if can_capture else fallback_bucket
                                                 self.captured_count += 1
-                                                self.zone_captures[target_bucket] = self.zone_captures.get(
-                                                    target_bucket, 0) + 1
+                                                self.zone_captures[bucket_to_increment] = self.zone_captures.get(
+                                                    bucket_to_increment, 0) + 1
                                                 self.last_auto_capture = now
-                                                self.last_capture_pose_by_bucket[target_bucket] = (
-                                                    yaw, pitch, roll)
+                                                self.auto_capture_stall_started = 0.0
+                                                if pose is not None:
+                                                    self.last_capture_pose_by_bucket[bucket_to_increment] = (
+                                                        yaw, pitch, roll)
                                                 self.root.after(
                                                     0, self.update_registration_ui)
+
+                                                if force_capture:
+                                                    status_text = "Auto-capture assist"
+                                                    box_color = (0, 255, 0)
 
                                                 if (self.captured_count >= self.auto_capture_target
                                                         or self._next_incomplete_pose_bucket() is None):
@@ -4218,6 +4251,7 @@ class DoorEntryKiosk:
                         elif len(faces) == 0:
                             self.last_head_pose = (0.0, 0.0, 0.0)
                             self.overlay_face_location = None
+                            self.auto_capture_stall_started = 0.0
                             cv2.putText(display_frame, "Position your face in frame", (frame_width // 2 - 150, frame_height // 2),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
 
@@ -5983,6 +6017,7 @@ class DoorEntryKiosk:
         self.current_zone = 'mid_center'
         self.last_head_pose = (0.0, 0.0, 0.0)
         self.pose_anchor = None
+        self.auto_capture_stall_started = 0.0
         self.last_capture_pose_by_bucket = {}
         self.overlay_face_location = None
         # Keep navigation unlocked during manual registration setup/capture.
@@ -6032,6 +6067,7 @@ class DoorEntryKiosk:
         self.current_zone = 'mid_center'
         self.last_head_pose = (0.0, 0.0, 0.0)
         self.pose_anchor = None
+        self.auto_capture_stall_started = 0.0
         self.last_capture_pose_by_bucket = {}
         self.overlay_face_location = None
         self.reg_process_locked = False  # Unlock tab navigation
@@ -6077,7 +6113,8 @@ class DoorEntryKiosk:
         # Enable auto-capture and lock navigation
         self.auto_capture_mode = True
         self.reg_process_locked = True
-        self.last_auto_capture = time.time()
+        self.last_auto_capture = 0.0
+        self.auto_capture_stall_started = 0.0
         self.zone_captures = {bucket: 0 for bucket in self.zone_targets}
         self.current_zone = 'mid_center'
         self.last_head_pose = (0.0, 0.0, 0.0)
@@ -6106,6 +6143,7 @@ class DoorEntryKiosk:
         self.auto_capture_mode = False
         self.reg_process_locked = False
         self.pose_anchor = None
+        self.auto_capture_stall_started = 0.0
         self.last_capture_pose_by_bucket = {}
         self.overlay_face_location = None
         self.auto_capture_btn.config(
