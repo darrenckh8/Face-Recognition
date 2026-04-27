@@ -306,8 +306,6 @@ class Config:
     # ----- Camera Settings -----
     # Camera capture resolution (width, height)
     CAMERA_RESOLUTION = (640, 480)
-    # Rotate camera frames clockwise: 0, 90, 180, or 270
-    CAMERA_ROTATION = 0
 
     # ----- Face Recognition Settings -----
     RECOGNITION_THRESHOLD = 0.8          # Minimum cosine similarity for a match
@@ -1367,23 +1365,16 @@ class CameraManager:
     Supports both USB webcams and Raspberry Pi camera module.
     """
 
-    def __init__(self, use_picamera=False, resolution=(640, 480), rotation=0):
+    def __init__(self, use_picamera=False, resolution=(640, 480)):
         """
         Initialize camera manager.
 
         Args:
             use_picamera: Use Raspberry Pi camera instead of USB webcam
             resolution: Capture resolution as (width, height)
-            rotation: Clockwise frame rotation in degrees (0/90/180/270)
         """
         self.use_picamera = use_picamera
         self.resolution = resolution
-        valid_rotations = {0, 90, 180, 270}
-        if rotation not in valid_rotations:
-            logger.warning(
-                f"Invalid camera rotation '{rotation}'. Using 0. Valid values: {sorted(valid_rotations)}")
-            rotation = 0
-        self.rotation = rotation
         self.camera = None
         self.is_running = False
 
@@ -1441,16 +1432,6 @@ class CameraManager:
         # Allow camera to warm up
         time.sleep(0.3)
 
-    def _rotate_frame(self, frame):
-        """Rotate frame clockwise based on configured camera rotation."""
-        if self.rotation == 90:
-            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-        if self.rotation == 180:
-            return cv2.rotate(frame, cv2.ROTATE_180)
-        if self.rotation == 270:
-            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        return frame
-
     def _capture_loop(self):
         """
         Continuous frame capture running in background thread.
@@ -1467,8 +1448,6 @@ class CameraManager:
                     if not ret:
                         time.sleep(0.01)  # Brief sleep on failed read
                         continue
-
-                frame = self._rotate_frame(frame)
 
                 # Thread-safe frame update
                 with self.frame_lock:
@@ -1625,16 +1604,7 @@ def _embedding_worker_process(
             for face_data in embeddings:
                 face_encoding = np.array(
                     face_data['embedding'], dtype=np.float32)
-                encoding_norm = float(np.linalg.norm(face_encoding))
-                if (not np.isfinite(encoding_norm)) or encoding_norm <= 1e-12:
-                    results.append({
-                        'name': "Unknown",
-                        'confidence': 0.0,
-                        'location': face_data['location'],
-                        'is_stable': face_data['is_stable']
-                    })
-                    continue
-                face_norm = face_encoding / encoding_norm
+                face_norm = face_encoding / np.linalg.norm(face_encoding)
 
                 # Use FAISS or linear search
                 if faiss_index is not None:
@@ -2198,8 +2168,6 @@ class FaceRecognitionSystem:
         if len(self.known_encodings) > 0:
             encodings_matrix = np.array(self.known_encodings, dtype=np.float32)
             norms = np.linalg.norm(encodings_matrix, axis=1, keepdims=True)
-            invalid_norms = ~np.isfinite(norms) | (norms <= 1e-12)
-            norms[invalid_norms] = 1.0
             self.known_encodings_normalized = (
                 encodings_matrix / norms).astype(np.float32)
 
@@ -2350,9 +2318,7 @@ class FaceRecognitionSystem:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"{name}_{timestamp}.jpg"
         filepath = os.path.join(folder, filename)
-        write_ok = cv2.imwrite(filepath, frame)
-        if not write_ok:
-            raise IOError(f"Failed to write image file: {filepath}")
+        cv2.imwrite(filepath, frame)
         set_secure_permissions(
             filepath, Config.SECURE_FILE_MODE, Config.SECURE_DIR_MODE)
         return filepath
@@ -2691,14 +2657,12 @@ class FaceRecognitionSystem:
 
     def detect_faces_combined(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
         """
-        Detection strategy controlled by Config.USE_FAST_DETECTION.
-        When enabled: fast Haar first, then InsightFace fallback.
-        When disabled: use InsightFace directly for consistency.
+        Hybrid detection: fast Haar cascade first, then InsightFace fallback.
+        Optimizes for speed while maintaining detection reliability.
         """
-        if not Config.USE_FAST_DETECTION:
-            return self.detect_faces_robust(frame)
-
         faces = self.detect_faces_fast(frame)
+
+        # Fall back to robust detection if fast detection finds nothing
         if not faces:
             faces = self.detect_faces_robust(frame)
 
@@ -2833,9 +2797,6 @@ class FaceRecognitionSystem:
                 except RuntimeError as e:
                     logger.error(
                         f"Recognition runtime error: {e}", exc_info=True)
-                except Exception as e:
-                    logger.error(
-                        f"Unexpected recognition error: {e}", exc_info=True)
                 finally:
                     self._recognition_running = False
                     # Help GC by clearing reference
@@ -2934,18 +2895,6 @@ class FaceRecognitionSystem:
                     'location': location,
                     'from_cache': False,
                     'is_stable': False
-                })
-                continue
-
-            # Guard against invalid embeddings (zero/NaN norm).
-            embedding_norm = float(np.linalg.norm(face_encoding))
-            if (not np.isfinite(embedding_norm)) or embedding_norm <= 1e-12:
-                results.append({
-                    'name': "Unknown",
-                    'confidence': 0.0,
-                    'location': location,
-                    'from_cache': False,
-                    'is_stable': True
                 })
                 continue
 
@@ -3076,17 +3025,8 @@ class FaceRecognitionSystem:
             confidence = 0.0
 
             # Normalize current embedding
-            embedding_norm = float(np.linalg.norm(face_encoding))
-            if (not np.isfinite(embedding_norm)) or embedding_norm <= 1e-12:
-                results.append({
-                    'name': "Unknown",
-                    'confidence': 0.0,
-                    'location': location,
-                    'from_cache': False,
-                    'is_stable': True
-                })
-                continue
-            face_norm = (face_encoding / embedding_norm).astype(np.float32)
+            face_norm = (face_encoding /
+                         np.linalg.norm(face_encoding)).astype(np.float32)
 
             # Use FAISS index if available, otherwise fall back to linear search
             if self.faiss_index is not None:
@@ -3394,10 +3334,7 @@ class DoorEntryKiosk:
 
         # Initialize core system components
         self.camera = CameraManager(
-            use_picamera=USE_PICAMERA,
-            resolution=Config.CAMERA_RESOLUTION,
-            rotation=Config.CAMERA_ROTATION,
-        )
+            use_picamera=USE_PICAMERA, resolution=Config.CAMERA_RESOLUTION)
         self.face_system = FaceRecognitionSystem()
         self.door_controller = DoorController()
         self.access_log = AccessLog()
@@ -3438,54 +3375,16 @@ class DoorEntryKiosk:
 
         # Face ID style auto-capture settings
         self.auto_capture_mode = False
+        self.auto_capture_target = 100
         self.auto_capture_interval = 0.2  # Seconds between captures
         self.last_auto_capture = 0
-        # If strict pose gates block progress, force-capture after a short stall.
-        self.auto_capture_stall_started = 0.0
-        self.auto_capture_force_after = 1.2
 
-        # Head-pose mapper state (3x3 pitch/yaw bins)
-        self.pose_bucket_order = [
-            'mid_center', 'mid_left', 'mid_right',
-            'up_center', 'down_center',
-            'up_left', 'up_right', 'down_left', 'down_right'
-        ]
-        self.zone_targets = {
-            'mid_center': 8,
-            'mid_left': 6, 'mid_right': 6,
-            'up_center': 5, 'down_center': 5,
-            'up_left': 4, 'up_right': 4, 'down_left': 4, 'down_right': 4
-        }
-        self.zone_captures = {bucket: 0 for bucket in self.zone_targets}
-        self.current_zone = 'mid_center'
-        self.pose_bucket_centers = {
-            'up_left': (-25.0, -18.0),
-            'up_center': (0.0, -18.0),
-            'up_right': (25.0, -18.0),
-            'mid_left': (-25.0, 0.0),
-            'mid_center': (0.0, 0.0),
-            'mid_right': (25.0, 0.0),
-            'down_left': (-25.0, 18.0),
-            'down_center': (0.0, 18.0),
-            'down_right': (25.0, 18.0),
-        }
-        self.pose_bucket_hints = {
-            'up_left': "Look up-left",
-            'up_center': "Look up",
-            'up_right': "Look up-right",
-            'mid_left': "Turn left",
-            'mid_center': "Look straight",
-            'mid_right': "Turn right",
-            'down_left': "Look down-left",
-            'down_center': "Look down",
-            'down_right': "Look down-right",
-        }
-        self.last_head_pose = (0.0, 0.0, 0.0)  # yaw, pitch, roll
-        # Per-session neutral pose baseline so "look straight" adapts to camera angle.
-        self.pose_anchor: Optional[Tuple[float, float]] = None
-        self.last_capture_pose_by_bucket: Dict[str, Tuple[float, float, float]] = {}
-        self.overlay_face_location: Optional[Tuple[int, int, int, int]] = None
-        self.auto_capture_target = sum(self.zone_targets.values())
+        # Zone-based capture for multi-angle coverage
+        self.zone_captures = {'center': 0, 'left': 0,
+                              'right': 0, 'up': 0, 'down': 0}
+        self.current_zone = 'center'
+        self.zone_targets = {'center': 30, 'left': 18,
+                             'right': 18, 'up': 17, 'down': 17}
 
         # ========== Training State ==========
         self.is_training = False
@@ -3689,7 +3588,7 @@ class DoorEntryKiosk:
         self.info_label = tk.Label(
             bottom_bar,
             text=f"{len(self.face_system.get_trained_persons())} Users",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_TEXT_TERTIARY,
             bg=Config.COLOR_BG
         )
@@ -4119,141 +4018,78 @@ class DoorEntryKiosk:
                                                 0, self.deny_access)
 
                 elif self.registration_mode:
-                    # Registration mode with pose-map capture
+                    # Registration mode with zone-based capture
                     frame_height, frame_width = display_frame.shape[:2]
 
                     if self.auto_capture_mode:
-                        # Use InsightFace output directly for pose-aware capture
-                        faces = self.face_system.face_app.get(frame)
-                        target_bucket = self._next_incomplete_pose_bucket()
+                        # Active face capture with positioning overlay
+                        faces = self.face_system.detect_faces_combined(frame)
+                        frame_center_x = frame_width // 2
+                        frame_center_y = frame_height // 2
 
-                        if target_bucket is None or self.captured_count >= self.auto_capture_target:
-                            self.auto_capture_mode = False
-                            self.overlay_face_location = None
-                            self.root.after(0, self.complete_auto_registration)
-                        elif len(faces) >= 1:
-                            face = self._select_primary_face(faces)
-                            if face is None:
-                                self.overlay_face_location = None
-                                cv2.putText(display_frame, "Face detection unstable", (frame_width // 2 - 140, frame_height // 2),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+                        if len(faces) == 1:
+                            top, right, bottom, left = faces[0]
+
+                            # Calculate face position
+                            face_center_x = (left + right) / 2
+                            face_center_y = (top + bottom) / 2
+
+                            # Determine zone based on face position in frame
+                            offset_x = (face_center_x -
+                                        frame_center_x) / (frame_width / 2)
+                            offset_y = (face_center_y -
+                                        frame_center_y) / (frame_height / 2)
+
+                            # Determine zone with generous thresholds
+                            zone_threshold = 0.15
+                            if abs(offset_x) < zone_threshold and abs(offset_y) < zone_threshold:
+                                self.current_zone = 'center'
+                            elif abs(offset_x) > abs(offset_y):
+                                self.current_zone = 'left' if offset_x < 0 else 'right'
                             else:
-                                location = self._extract_face_location(
-                                    face, frame.shape)
-                                if location is None:
-                                    self.overlay_face_location = None
-                                    cv2.putText(display_frame, "Face detection unstable", (frame_width // 2 - 140, frame_height // 2),
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
-                                else:
-                                    top, right, bottom, left = location
-                                    self.overlay_face_location = location
-                                    pose = self._estimate_head_pose(face)
+                                self.current_zone = 'up' if offset_y < 0 else 'down'
 
-                                    if pose is None:
-                                        self.last_head_pose = (0.0, 0.0, 0.0)
-                                        box_color = (0, 200, 255)
-                                        status_text = "Turn slightly toward camera"
-                                        can_capture = False
-                                        fallback_bucket = target_bucket
-                                    else:
-                                        yaw_raw, pitch_raw, roll = pose
+                            # Get zone color based on fill status
+                            zone_filled = self.zone_captures.get(
+                                self.current_zone, 0) >= self.zone_targets.get(self.current_zone, 0)
+                            box_color = (0, 255, 0) if zone_filled else (
+                                0, 255, 255)
 
-                                        # Calibrate a neutral baseline once so the pose map works
-                                        # even when the camera is mounted above/below eye level.
-                                        if self.pose_anchor is None:
-                                            self.pose_anchor = (yaw_raw, pitch_raw)
+                            # Draw face box
+                            cv2.rectangle(display_frame, (int(left), int(
+                                top)), (int(right), int(bottom)), box_color, 3)
 
-                                        anchor_yaw, anchor_pitch = self.pose_anchor
-                                        yaw = yaw_raw - anchor_yaw
-                                        pitch = pitch_raw - anchor_pitch
+                            # Auto-capture logic
+                            now = time.time()
+                            zone_current = self.zone_captures.get(
+                                self.current_zone, 0)
+                            zone_target = self.zone_targets.get(
+                                self.current_zone, 0)
 
-                                        self.last_head_pose = (yaw, pitch, roll)
-                                        live_bucket = self._pose_bucket_from_angles(
-                                            yaw, pitch)
-                                        self.current_zone = live_bucket
+                            if now - self.last_auto_capture >= self.auto_capture_interval:
+                                if self.captured_count < self.auto_capture_target and zone_current < zone_target:
+                                    filepath = self.face_system.save_face_image(
+                                        frame, self.registration_name)
+                                    self.captured_count += 1
+                                    self.zone_captures[self.current_zone] = zone_current + 1
+                                    self.last_auto_capture = now
+                                    self.root.after(
+                                        0, self.update_registration_ui)
+                                elif self.captured_count >= self.auto_capture_target:
+                                    self.root.after(
+                                        0, self.complete_auto_registration)
 
-                                        can_capture, status_text = self._pose_capture_ready(
-                                            frame, location, target_bucket, yaw, pitch, roll)
-                                        box_color = (0, 255, 0) if can_capture else (
-                                            0, 200, 255)
-                                        if (live_bucket in self.zone_targets
-                                                and self.zone_captures.get(live_bucket, 0) < self.zone_targets.get(live_bucket, 0)):
-                                            fallback_bucket = live_bucket
-                                        else:
-                                            fallback_bucket = target_bucket
-
-                                    now = time.time()
-
-                                    if can_capture:
-                                        self.auto_capture_stall_started = 0.0
-                                    else:
-                                        if self.auto_capture_stall_started <= 0.0:
-                                            self.auto_capture_stall_started = now
-
-                                    force_capture = (
-                                        not can_capture
-                                        and self.auto_capture_stall_started > 0.0
-                                        and (now - self.auto_capture_stall_started) >= self.auto_capture_force_after
-                                    )
-
-                                    if ((can_capture or force_capture)
-                                            and self.captured_count < self.auto_capture_target
-                                            and now - self.last_auto_capture >= self.auto_capture_interval):
-                                            try:
-                                                self.face_system.save_face_image(
-                                                    frame, self.registration_name)
-                                            except Exception as capture_error:
-                                                logger.error(
-                                                    f"Auto-capture save failed for '{self.registration_name}': {capture_error}",
-                                                    exc_info=True
-                                                )
-                                                self.last_auto_capture = now
-                                                self.root.after(
-                                                    0, lambda: self.show_toast("Failed to save capture", "error"))
-                                            else:
-                                                bucket_to_increment = target_bucket if can_capture else fallback_bucket
-                                                self.captured_count += 1
-                                                self.zone_captures[bucket_to_increment] = self.zone_captures.get(
-                                                    bucket_to_increment, 0) + 1
-                                                self.last_auto_capture = now
-                                                self.auto_capture_stall_started = 0.0
-                                                if pose is not None:
-                                                    self.last_capture_pose_by_bucket[bucket_to_increment] = (
-                                                        yaw, pitch, roll)
-                                                self.root.after(
-                                                    0, self.update_registration_ui)
-
-                                                if force_capture:
-                                                    status_text = "Auto-capture assist"
-                                                    box_color = (0, 255, 0)
-
-                                                if (self.captured_count >= self.auto_capture_target
-                                                        or self._next_incomplete_pose_bucket() is None):
-                                                    self.auto_capture_mode = False
-                                                    self.root.after(
-                                                        0, self.complete_auto_registration)
-
-                                    cv2.rectangle(display_frame, (left, top),
-                                                  (right, bottom), box_color, 3)
-                                    cv2.putText(display_frame, status_text,
-                                                (frame_width // 2 - 135, frame_height - 70),
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.62, box_color, 2)
-
-                                    if len(faces) > 1:
-                                        cv2.putText(display_frame, "Multiple faces detected; using largest face", (12, frame_height - 95),
-                                                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 180, 255), 1)
-
-                                    # Flash on capture
-                                    if (time.time() - self.last_auto_capture) < 0.08:
-                                        cv2.rectangle(
-                                            display_frame, (0, 0), (frame_width, frame_height), (0, 255, 0), 12)
+                            # Flash on capture
+                            if (time.time() - self.last_auto_capture) < 0.08:
+                                cv2.rectangle(
+                                    display_frame, (0, 0), (frame_width, frame_height), (0, 255, 0), 12)
 
                         elif len(faces) == 0:
-                            self.last_head_pose = (0.0, 0.0, 0.0)
-                            self.overlay_face_location = None
-                            self.auto_capture_stall_started = 0.0
                             cv2.putText(display_frame, "Position your face in frame", (frame_width // 2 - 150, frame_height // 2),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+                        else:
+                            cv2.putText(display_frame, "Only one face please", (frame_width // 2 - 100, frame_height // 2),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
                         # Draw Face ID style overlay
                         self.draw_faceid_overlay(display_frame)
@@ -4471,20 +4307,6 @@ class DoorEntryKiosk:
         if duration is None:
             duration = Config.TOAST_DURATION
 
-        payload = (message, toast_type, duration)
-        toast_visible = (
-            hasattr(self, 'toast_label')
-            and self.toast_label.winfo_exists()
-            and self.toast_label.winfo_ismapped()
-        )
-        if self._toast_id and toast_visible:
-            # Queue sequential toasts instead of replacing current feedback.
-            if not self._pending_toasts or self._pending_toasts[-1] != payload:
-                if len(self._pending_toasts) >= 12:
-                    self._pending_toasts.pop(0)
-                self._pending_toasts.append(payload)
-            return
-
         # Color schemes for each toast type
         colors = {
             "success": (Config.COLOR_GRANTED, "#FFFFFF"),
@@ -4541,16 +4363,6 @@ class DoorEntryKiosk:
         if hasattr(self, 'toast_label') and self.toast_label.winfo_exists():
             self.toast_label.place_forget()
         self._toast_id = None
-
-        if self._pending_toasts and self.is_running:
-            next_message, next_type, next_duration = self._pending_toasts.pop(0)
-            try:
-                self.root.after(
-                    0,
-                    lambda m=next_message, t=next_type, d=next_duration: self.show_toast(m, t, d)
-                )
-            except (tk.TclError, RuntimeError):
-                self._pending_toasts.clear()
 
     # ==================== INLINE DIALOG SYSTEM ====================
     # These replace Tkinter messagebox dialogs for Cage/Wayland kiosk compatibility
@@ -4809,13 +4621,7 @@ class DoorEntryKiosk:
         """Perform database write and UI update in background thread."""
         self.access_log.add_entry(name, access_granted, confidence)
         # Schedule UI update on main thread
-        if not self.is_running:
-            return
-        try:
-            self.root.after(0, self.update_log_display)
-        except (tk.TclError, RuntimeError):
-            # App is closing/destroyed; ignore late async update.
-            pass
+        self.root.after(0, self.update_log_display)
 
     def _pulse_border(self, color, duration=300):
         """Create a brief color pulse on the video container border."""
@@ -5074,8 +4880,8 @@ class DoorEntryKiosk:
         style = ttk.Style()
         style.configure('TNotebook', background=Config.COLOR_BG, borderwidth=0)
         style.configure('TNotebook.Tab',
-                        font=(Config.FONT_FAMILY, 10),
-                        padding=[12, 8],
+                        font=(Config.FONT_FAMILY, 9),
+                        padding=[10, 6],
                         background=Config.COLOR_BG,
                         foreground=Config.COLOR_TEXT_SECONDARY)
         style.map('TNotebook.Tab',
@@ -5113,7 +4919,7 @@ class DoorEntryKiosk:
     def create_register_tab(self, parent):
         """
         Build the face registration tab with camera preview.
-        Supports Face ID style head-pose map auto-capture.
+        Supports Face ID style zone-based capture.
         """
         self.reg_main_container = tk.Frame(parent, bg=Config.COLOR_BG)
         self.reg_main_container.pack(
@@ -5200,7 +5006,7 @@ class DoorEntryKiosk:
         self.reg_count_label = tk.Label(
             top_row,
             text="0 photos",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD
         )
@@ -5209,7 +5015,7 @@ class DoorEntryKiosk:
         self.stop_reg_btn = tk.Button(
             top_row,
             text="Stop",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 9),
             fg="#FFFFFF",
             bg=Config.COLOR_DENIED,
             activeforeground="#FFFFFF",
@@ -5226,8 +5032,8 @@ class DoorEntryKiosk:
 
         self.auto_capture_btn = tk.Button(
             btn_row,
-            text=f"⟳ Start Auto Capture ({self.auto_capture_target})",
-            font=(Config.FONT_FAMILY, 10),
+            text="⟳ Start Auto Capture (100)",
+            font=(Config.FONT_FAMILY, 9),
             fg="#FFFFFF",
             bg="#5856D6",
             activebackground="#4744c4",
@@ -5267,7 +5073,7 @@ class DoorEntryKiosk:
         tk.Label(
             inner,
             text="Process photos to train recognition",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD
         ).pack(anchor=tk.W, pady=(3, 15))
@@ -5307,7 +5113,7 @@ class DoorEntryKiosk:
         self.train_status_label = tk.Label(
             inner,
             text="Ready to train",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD
         )
@@ -5360,11 +5166,8 @@ class DoorEntryKiosk:
                         highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
         card.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        users_list_frame = tk.Frame(card, bg=Config.COLOR_CARD)
-        users_list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
-
         self.manage_listbox = tk.Listbox(
-            users_list_frame,
+            card,
             font=(Config.FONT_FAMILY, 10),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_CARD,
@@ -5375,13 +5178,8 @@ class DoorEntryKiosk:
             relief=tk.FLAT,
             activestyle='none'
         )
-        self.manage_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self.manage_scrollbar = tk.Scrollbar(
-            users_list_frame, orient=tk.VERTICAL, command=self.manage_listbox.yview
-        )
-        self.manage_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.manage_listbox.config(yscrollcommand=self.manage_scrollbar.set)
+        self.manage_listbox.pack(
+            fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
 
         # Pagination controls
         pagination_frame = tk.Frame(card, bg=Config.COLOR_CARD)
@@ -5390,7 +5188,7 @@ class DoorEntryKiosk:
         self.users_prev_btn = tk.Button(
             pagination_frame,
             text="◀ Previous",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_CARD,
             activeforeground=Config.COLOR_SCANNING,
@@ -5404,7 +5202,7 @@ class DoorEntryKiosk:
         self.users_page_label = tk.Label(
             pagination_frame,
             text="Page 1 of 1",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD
         )
@@ -5413,7 +5211,7 @@ class DoorEntryKiosk:
         self.users_next_btn = tk.Button(
             pagination_frame,
             text="Next ▶",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_CARD,
             activeforeground=Config.COLOR_SCANNING,
@@ -5433,7 +5231,7 @@ class DoorEntryKiosk:
         tk.Button(
             btn_frame1,
             text="Revoke Access",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_SCANNING,
@@ -5445,7 +5243,7 @@ class DoorEntryKiosk:
         tk.Button(
             btn_frame1,
             text="Delete + Photos",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_DENIED,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_DENIED,
@@ -5461,7 +5259,7 @@ class DoorEntryKiosk:
         tk.Button(
             btn_frame2,
             text="Restore Access",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_GRANTED,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_GRANTED,
@@ -5478,7 +5276,7 @@ class DoorEntryKiosk:
         self.log_total_count = 0
         self.log_date_from = None
         self.log_date_to = None
-        self.log_name_var = tk.StringVar(value="")
+        self.log_name_var = tk.StringVar(value="All")
 
         # Header with title and clear button
         header = tk.Frame(parent, bg=Config.COLOR_BG)
@@ -5495,7 +5293,7 @@ class DoorEntryKiosk:
         tk.Button(
             header,
             text="Clear",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_DENIED,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_DENIED,
@@ -5511,7 +5309,7 @@ class DoorEntryKiosk:
         tk.Button(
             filter_frame,
             text="Today",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 8),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_SCANNING,
@@ -5523,7 +5321,7 @@ class DoorEntryKiosk:
         tk.Button(
             filter_frame,
             text="7 Days",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 8),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_SCANNING,
@@ -5535,7 +5333,7 @@ class DoorEntryKiosk:
         tk.Button(
             filter_frame,
             text="30 Days",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 8),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_SCANNING,
@@ -5547,7 +5345,7 @@ class DoorEntryKiosk:
         tk.Button(
             filter_frame,
             text="All",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 8),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_BG,
             activeforeground=Config.COLOR_TEXT,
@@ -5556,68 +5354,14 @@ class DoorEntryKiosk:
             command=self.clear_log_filter
         ).pack(side=tk.LEFT, padx=2)
 
-        # Name filter row
-        name_filter_row = tk.Frame(parent, bg=Config.COLOR_BG)
-        name_filter_row.pack(fill=tk.X, padx=10, pady=(0, 5))
-
-        tk.Label(
-            name_filter_row,
-            text="Name:",
-            font=(Config.FONT_FAMILY, 10),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_BG
-        ).pack(side=tk.LEFT)
-
-        self.log_name_entry = tk.Entry(
-            name_filter_row,
-            textvariable=self.log_name_var,
-            font=(Config.FONT_FAMILY, 10),
-            bg=Config.COLOR_CARD_SECONDARY,
-            fg=Config.COLOR_TEXT,
-            relief=tk.FLAT,
-            highlightbackground=Config.COLOR_BORDER,
-            highlightthickness=1
-        )
-        self.log_name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6), ipady=2)
-        self.log_name_entry.bind('<Return>', lambda e: self.apply_log_name_filter())
-        self.log_name_entry.bind('<Button-1>', lambda e: show_keyboard(
-            parent, self.log_name_entry, self.root))
-
-        tk.Button(
-            name_filter_row,
-            text="Apply",
-            font=(Config.FONT_FAMILY, 10),
-            fg=Config.COLOR_SCANNING,
-            bg=Config.COLOR_BG,
-            activeforeground=Config.COLOR_SCANNING,
-            bd=0,
-            cursor="hand2",
-            command=self.apply_log_name_filter
-        ).pack(side=tk.LEFT, padx=(0, 4))
-
-        tk.Button(
-            name_filter_row,
-            text="Reset",
-            font=(Config.FONT_FAMILY, 10),
-            fg=Config.COLOR_TEXT_SECONDARY,
-            bg=Config.COLOR_BG,
-            activeforeground=Config.COLOR_TEXT,
-            bd=0,
-            cursor="hand2",
-            command=self.clear_log_filter
-        ).pack(side=tk.LEFT)
-
         # Log entries list
         card = tk.Frame(parent, bg=Config.COLOR_CARD,
                         highlightbackground=Config.COLOR_BORDER, highlightthickness=1)
         card.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        log_list_frame = tk.Frame(card, bg=Config.COLOR_CARD)
-        log_list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
-
         self.admin_log_listbox = tk.Listbox(
-            log_list_frame,
-            font=(Config.FONT_FAMILY_MONO, 10),
+            card,
+            font=(Config.FONT_FAMILY_MONO, 9),
             fg=Config.COLOR_TEXT,
             bg=Config.COLOR_CARD,
             selectbackground=Config.COLOR_CARD_SECONDARY,
@@ -5627,13 +5371,8 @@ class DoorEntryKiosk:
             relief=tk.FLAT,
             activestyle='none'
         )
-        self.admin_log_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self.admin_log_scrollbar = tk.Scrollbar(
-            log_list_frame, orient=tk.VERTICAL, command=self.admin_log_listbox.yview
-        )
-        self.admin_log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.admin_log_listbox.config(yscrollcommand=self.admin_log_scrollbar.set)
+        self.admin_log_listbox.pack(
+            fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
 
         # Pagination controls
         pagination_frame = tk.Frame(card, bg=Config.COLOR_CARD)
@@ -5642,7 +5381,7 @@ class DoorEntryKiosk:
         self.log_prev_btn = tk.Button(
             pagination_frame,
             text="◀ Previous",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_CARD,
             activeforeground=Config.COLOR_SCANNING,
@@ -5656,7 +5395,7 @@ class DoorEntryKiosk:
         self.log_page_label = tk.Label(
             pagination_frame,
             text="Page 1 of 1",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_TEXT_SECONDARY,
             bg=Config.COLOR_CARD
         )
@@ -5665,7 +5404,7 @@ class DoorEntryKiosk:
         self.log_next_btn = tk.Button(
             pagination_frame,
             text="Next ▶",
-            font=(Config.FONT_FAMILY, 10),
+            font=(Config.FONT_FAMILY, 9),
             fg=Config.COLOR_SCANNING,
             bg=Config.COLOR_CARD,
             activeforeground=Config.COLOR_SCANNING,
@@ -5695,14 +5434,9 @@ class DoorEntryKiosk:
 
     def clear_log_filter(self):
         """Remove all filters and show all log entries."""
-        self.log_name_var.set("")
+        self.log_name_var.set("All")
         self.log_date_from = None
         self.log_date_to = None
-        self.log_current_page = 0
-        self.refresh_log_page()
-
-    def apply_log_name_filter(self):
-        """Apply name filter from the Activity tab input."""
         self.log_current_page = 0
         self.refresh_log_page()
 
@@ -5725,7 +5459,7 @@ class DoorEntryKiosk:
             page_size=Config.LOG_PAGE_SIZE,
             date_from=self.log_date_from,
             date_to=self.log_date_to,
-            name_filter=self.log_name_var.get().strip() or None
+            name_filter=None if self.log_name_var.get() == "All" else self.log_name_var.get()
         )
 
         self.log_total_count = total_count
@@ -6013,16 +5747,9 @@ class DoorEntryKiosk:
         self.registration_name = name
         self.captured_count = 0
         self.auto_capture_mode = False
-        self.zone_captures = {bucket: 0 for bucket in self.zone_targets}
-        self.current_zone = 'mid_center'
-        self.last_head_pose = (0.0, 0.0, 0.0)
-        self.pose_anchor = None
-        self.auto_capture_stall_started = 0.0
-        self.last_capture_pose_by_bucket = {}
-        self.overlay_face_location = None
-        # Keep navigation unlocked during manual registration setup/capture.
-        # Locking is enabled only for auto-capture/training operations.
-        self.reg_process_locked = False
+        self.zone_captures = {'center': 0, 'left': 0,
+                              'right': 0, 'up': 0, 'down': 0}
+        self.reg_process_locked = True  # Lock tab navigation during registration
         self.already_trained = False  # Reset for new registration
 
         # Transition UI from setup panel to capture panel
@@ -6032,13 +5759,6 @@ class DoorEntryKiosk:
         # Update capture panel labels
         self.reg_name_display.config(text=name)
         self.reg_count_label.config(text="0 photos • Position face in frame")
-        self.stop_reg_btn.config(state=tk.NORMAL)
-        self.auto_capture_btn.config(
-            state=tk.NORMAL,
-            text=f"⟳ Start Auto Capture ({self.auto_capture_target})",
-            bg="#5856D6",
-            command=self.start_auto_capture
-        )
 
         self.show_toast(f"Registering {name}", "info")
 
@@ -6063,13 +5783,8 @@ class DoorEntryKiosk:
         self.registration_mode = False
         self.registration_name = ""
         self.auto_capture_mode = False
-        self.zone_captures = {bucket: 0 for bucket in self.zone_targets}
-        self.current_zone = 'mid_center'
-        self.last_head_pose = (0.0, 0.0, 0.0)
-        self.pose_anchor = None
-        self.auto_capture_stall_started = 0.0
-        self.last_capture_pose_by_bucket = {}
-        self.overlay_face_location = None
+        self.zone_captures = {'center': 0, 'left': 0,
+                              'right': 0, 'up': 0, 'down': 0}
         self.reg_process_locked = False  # Unlock tab navigation
 
         # Transition UI back to setup panel
@@ -6078,8 +5793,7 @@ class DoorEntryKiosk:
 
         # Reset auto capture button for next registration
         self.auto_capture_btn.config(
-            text=f"⟳ Start Auto Capture ({self.auto_capture_target})", bg="#5856D6", command=self.start_auto_capture, state=tk.NORMAL)
-        self.stop_reg_btn.config(state=tk.NORMAL)
+            text="⟳ Start Auto Capture (100)", bg="#5856D6", command=self.start_auto_capture)
 
         # Clear name entry for next use
         self.reg_name_entry.delete(0, tk.END)
@@ -6104,8 +5818,9 @@ class DoorEntryKiosk:
     def start_auto_capture(self):
         """Begin automatic Face ID style photo capture.
 
-        Enables head-pose bucket capture mode that guides the user
-        through yaw/pitch targets to build a full face-angle map.
+        Enables zone-based capture mode that guides the user to move
+        their face to different positions (center, left, right, up, down)
+        to capture diverse angles for better recognition accuracy.
         """
         if not self.registration_mode:
             return
@@ -6113,20 +5828,14 @@ class DoorEntryKiosk:
         # Enable auto-capture and lock navigation
         self.auto_capture_mode = True
         self.reg_process_locked = True
-        self.last_auto_capture = 0.0
-        self.auto_capture_stall_started = 0.0
-        self.zone_captures = {bucket: 0 for bucket in self.zone_targets}
-        self.current_zone = 'mid_center'
-        self.last_head_pose = (0.0, 0.0, 0.0)
-        self.pose_anchor = None
-        self.last_capture_pose_by_bucket = {}
-        self.overlay_face_location = None
-        self.auto_capture_target = sum(self.zone_targets.values())
+        self.last_auto_capture = time.time()
+        self.zone_captures = {'center': 0, 'left': 0,
+                              'right': 0, 'up': 0, 'down': 0}
 
         # Update button state
         self.auto_capture_btn.config(
-            text="Stop", bg=Config.COLOR_DENIED, command=self.stop_auto_capture, state=tk.NORMAL)
-        self.reg_count_label.config(text="Move head to fill pose map bins...")
+            text="Stop", bg=Config.COLOR_DENIED, command=self.stop_auto_capture)
+        self.reg_count_label.config(text="Move face to fill all zones...")
 
     def stop_auto_capture(self):
         """Stop the automatic capture process with user confirmation.
@@ -6142,290 +5851,129 @@ class DoorEntryKiosk:
         # Reset auto-capture state
         self.auto_capture_mode = False
         self.reg_process_locked = False
-        self.pose_anchor = None
-        self.auto_capture_stall_started = 0.0
-        self.last_capture_pose_by_bucket = {}
-        self.overlay_face_location = None
         self.auto_capture_btn.config(
-            text=f"⟳ Start Auto Capture ({self.auto_capture_target})", bg="#5856D6", command=self.start_auto_capture, state=tk.NORMAL)
+            text="⟳ Start Auto Capture (100)", bg="#5856D6", command=self.start_auto_capture)
         self.update_registration_ui()
 
-    def _estimate_head_pose(self, face) -> Optional[Tuple[float, float, float]]:
-        """
-        Estimate (yaw, pitch, roll) in degrees from InsightFace output.
-        Uses model-provided pose when available, with a keypoint fallback.
-        """
-        def _clip_pose(yaw_val: float, pitch_val: float, roll_val: float) -> Tuple[float, float, float]:
-            return (
-                float(np.clip(yaw_val, -60.0, 60.0)),
-                float(np.clip(pitch_val, -60.0, 60.0)),
-                float(np.clip(roll_val, -60.0, 60.0))
-            )
-
-        model_candidates: List[Tuple[float, float, float]] = []
-        pose = getattr(face, 'pose', None)
-        if pose is not None:
-            pose_arr = np.asarray(pose, dtype=np.float32).reshape(-1)
-            if pose_arr.size >= 3 and np.all(np.isfinite(pose_arr[:3])):
-                # InsightFace versions differ in pose axis ordering. Keep both
-                # interpretations and resolve with landmark geometry when available.
-                model_candidates.append(
-                    _clip_pose(float(pose_arr[0]), float(pose_arr[1]), float(pose_arr[2]))
-                )
-                model_candidates.append(
-                    _clip_pose(float(pose_arr[1]), float(pose_arr[0]), float(pose_arr[2]))
-                )
-
-        kps = getattr(face, 'kps', None)
-        kps_pose: Optional[Tuple[float, float, float]] = None
-        if kps is not None:
-            pts = np.asarray(kps, dtype=np.float32)
-            if pts.shape[0] >= 5:
-                left_eye = pts[0]
-                right_eye = pts[1]
-                nose = pts[2]
-                mouth_left = pts[3]
-                mouth_right = pts[4]
-
-                eye_center = (left_eye + right_eye) / 2.0
-                mouth_center = (mouth_left + mouth_right) / 2.0
-                inter_eye = max(1.0, float(np.linalg.norm(right_eye - left_eye)))
-                eye_to_mouth = max(1.0, float(mouth_center[1] - eye_center[1]))
-
-                # Approximate pose from 2D landmark geometry.
-                yaw = ((nose[0] - eye_center[0]) / (inter_eye * 0.5)) * 30.0
-                pitch_ratio = (nose[1] - eye_center[1]) / eye_to_mouth
-                pitch = (pitch_ratio - 0.45) * 35.0
-                roll = np.degrees(np.arctan2(
-                    right_eye[1] - left_eye[1], right_eye[0] - left_eye[0]))
-                kps_pose = _clip_pose(yaw, pitch, roll)
-
-        if model_candidates:
-            if kps_pose is not None:
-                def pose_distance(candidate: Tuple[float, float, float]) -> float:
-                    # Compare yaw/pitch agreement to pick the correct axis order.
-                    return abs(candidate[0] - kps_pose[0]) + abs(candidate[1] - kps_pose[1])
-
-                return min(model_candidates, key=pose_distance)
-            return model_candidates[0]
-
-        return kps_pose
-
-    def _select_primary_face(self, faces: List[Any]) -> Optional[Any]:
-        """Select the largest detected face when multiple faces are present."""
-        if not faces:
-            return None
-
-        best_face = None
-        best_area = -1.0
-
-        for face in faces:
-            bbox = getattr(face, 'bbox', None)
-            if bbox is None:
-                continue
-
-            coords = np.asarray(bbox, dtype=np.float32).reshape(-1)
-            if coords.size < 4 or not np.all(np.isfinite(coords[:4])):
-                continue
-
-            width = max(0.0, float(coords[2] - coords[0]))
-            height = max(0.0, float(coords[3] - coords[1]))
-            area = width * height
-            if area > best_area:
-                best_area = area
-                best_face = face
-
-        return best_face if best_face is not None else faces[0]
-
-    def _pose_bucket_from_angles(self, yaw: float, pitch: float) -> str:
-        """Map yaw/pitch angles into one of 9 pose buckets."""
-        if yaw <= -15:
-            yaw_band = 'left'
-        elif yaw >= 15:
-            yaw_band = 'right'
-        else:
-            yaw_band = 'center'
-
-        if pitch <= -10:
-            pitch_band = 'up'
-        elif pitch >= 10:
-            pitch_band = 'down'
-        else:
-            pitch_band = 'mid'
-
-        return f"{pitch_band}_{yaw_band}"
-
-    def _next_incomplete_pose_bucket(self) -> Optional[str]:
-        """Return the next pose bucket that still needs captures."""
-        for bucket in self.pose_bucket_order:
-            if self.zone_captures.get(bucket, 0) < self.zone_targets.get(bucket, 0):
-                return bucket
-        return None
-
-    def _extract_face_location(self, face, frame_shape: Tuple[int, ...]) -> Optional[Tuple[int, int, int, int]]:
-        """Extract and clamp face bbox to (top, right, bottom, left)."""
-        bbox = getattr(face, 'bbox', None)
-        if bbox is None:
-            return None
-
-        coords = np.asarray(bbox, dtype=np.float32).reshape(-1)
-        if coords.size < 4 or not np.all(np.isfinite(coords[:4])):
-            return None
-
-        frame_height, frame_width = frame_shape[:2]
-        if frame_height < 2 or frame_width < 2:
-            return None
-
-        left = int(round(float(coords[0])))
-        top = int(round(float(coords[1])))
-        right = int(round(float(coords[2])))
-        bottom = int(round(float(coords[3])))
-
-        left = max(0, min(frame_width - 2, left))
-        right = max(left + 1, min(frame_width - 1, right))
-        top = max(0, min(frame_height - 2, top))
-        bottom = max(top + 1, min(frame_height - 1, bottom))
-
-        return (top, right, bottom, left)
-
-    def _pose_capture_ready(
-        self,
-        frame: np.ndarray,
-        location: Tuple[int, int, int, int],
-        target_bucket: Optional[str],
-        yaw: float,
-        pitch: float,
-        roll: float
-    ) -> Tuple[bool, str]:
-        """
-        Validate whether current frame is suitable for auto-capture.
-        """
-        if not target_bucket:
-            return False, "Pose map complete"
-
-        live_bucket = self._pose_bucket_from_angles(yaw, pitch)
-        if live_bucket != target_bucket:
-            hint = self.pose_bucket_hints.get(target_bucket, "Align to target pose")
-            return False, hint
-
-        target_yaw, target_pitch = self.pose_bucket_centers.get(
-            target_bucket, (0.0, 0.0))
-        if abs(yaw - target_yaw) > 18.0 or abs(pitch - target_pitch) > 16.0:
-            return False, "Hold target pose"
-
-        if abs(roll) > 25.0:
-            return False, "Keep head upright"
-
-        top, right, bottom, left = location
-        frame_height, frame_width = frame.shape[:2]
-        face_width = max(1, right - left)
-        face_height = max(1, bottom - top)
-        face_area_ratio = (face_width * face_height) / max(1, frame_height * frame_width)
-        if face_area_ratio < 0.022:
-            return False, "Move closer"
-
-        face_roi = frame[top:bottom, left:right]
-        if face_roi.size == 0:
-            return False, "Center face"
-
-        gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
-        brightness = float(np.mean(gray))
-        if brightness < 25.0 or brightness > 235.0:
-            return False, "Adjust lighting"
-
-        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        if sharpness < 25.0:
-            return False, "Hold still"
-
-        last_pose = self.last_capture_pose_by_bucket.get(target_bucket)
-        if last_pose is not None:
-            dyaw = abs(yaw - last_pose[0])
-            dpitch = abs(pitch - last_pose[1])
-            droll = abs(roll - last_pose[2])
-            if dyaw < 1.0 and dpitch < 1.0 and droll < 2.0:
-                return False, "Slightly change angle"
-
-        return True, "Capture ready"
-
-    def _faceid_progress_color(self, progress: float) -> Tuple[int, int, int]:
-        """Interpolate ring color from red to green based on progress."""
-        p = float(np.clip(progress, 0.0, 1.0))
-        start = np.array([70.0, 80.0, 255.0], dtype=np.float32)   # Red-ish (BGR)
-        end = np.array([90.0, 220.0, 105.0], dtype=np.float32)    # Green-ish (BGR)
-        mixed = start + (end - start) * p
-        return (int(mixed[0]), int(mixed[1]), int(mixed[2]))
-
     def draw_faceid_overlay(self, frame):
-        """Draw a Face ID style circular enrollment overlay."""
+        """Draw Face ID style visual guide showing zone positions.
+
+        Args:
+            frame: OpenCV frame to draw the overlay on.
+
+        Draws a circular face positioning guide with zone indicators
+        around it (up, down, left, right, center) to help users
+        position their face correctly during auto-capture.
+        """
         frame_height, frame_width = frame.shape[:2]
-        progress = min(1.0, self.captured_count / max(1, self.auto_capture_target))
-        ring_color = self._faceid_progress_color(progress)
+        center_x, center_y = frame_width // 2, frame_height // 2
 
-        # Header
-        cv2.putText(frame, "FACE ID", (15, 34),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.86, (230, 230, 230), 2)
-        cv2.putText(frame, self.registration_name, (15, 62),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
+        # Calculate guide circle radius based on frame size
+        guide_radius = min(frame_width, frame_height) // 4
 
-        # Ring follows the detected face when available.
-        location = self.overlay_face_location
-        if location is not None:
-            top, right, bottom, left = location
-            center_x = (left + right) // 2
-            center_y = (top + bottom) // 2
-            face_size = max(right - left, bottom - top)
-            radius = int(face_size * 0.72) + 22
-        else:
-            center_x = frame_width // 2
-            center_y = frame_height // 2
-            radius = min(frame_width, frame_height) // 5
+        # Draw outer positioning guide circle
+        cv2.circle(frame, (center_x, center_y),
+                   guide_radius, (100, 100, 100), 2)
 
-        max_radius = max(42, min(frame_width, frame_height) // 2 - 18)
-        radius = max(52, min(radius, max_radius))
+        # Zone indicator positions around the guide circle
+        zone_positions = {
+            'up': (center_x, center_y - guide_radius - 30),
+            'down': (center_x, center_y + guide_radius + 30),
+            'left': (center_x - guide_radius - 30, center_y),
+            'right': (center_x + guide_radius + 30, center_y),
+            'center': (center_x, center_y)
+        }
 
-        # Base track + active progress arc
-        cv2.circle(frame, (center_x, center_y), radius,
-                   (44, 44, 44), 10, cv2.LINE_AA)
-        cv2.circle(frame, (center_x, center_y), radius + 7,
-                   ring_color, 2, cv2.LINE_AA)
-        end_angle = -90 + int(360 * progress)
-        cv2.ellipse(frame, (center_x, center_y), (radius, radius),
-                    0, -90, end_angle, ring_color, 10, cv2.LINE_AA)
+        # Draw zone indicators showing capture progress
+        for zone, (zx, zy) in zone_positions.items():
+            current = self.zone_captures.get(zone, 0)
+            target = self.zone_targets.get(zone, 0)
 
-        # Inner guide ring gives a cleaner "enrollment target" look.
-        cv2.circle(frame, (center_x, center_y), max(20, radius - 18),
-                   (110, 110, 110), 1, cv2.LINE_AA)
-        cv2.circle(frame, (center_x, center_y), 2, (220, 220, 220), -1, cv2.LINE_AA)
+            # Calculate completion percentage for this zone
+            fill_pct = min(1.0, current / target) if target > 0 else 1.0
 
-        bins_done = sum(
-            1 for z in self.zone_captures
-            if self.zone_captures[z] >= self.zone_targets.get(z, 0)
-        )
-        total_bins = len(self.zone_targets)
-        cv2.putText(frame, f"{self.captured_count}/{self.auto_capture_target} captures",
-                    (15, frame_height - 34), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (245, 245, 245), 1)
-        cv2.putText(frame, f"Coverage {bins_done}/{total_bins} angles",
-                    (15, frame_height - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+            # Color coding: gray=empty, yellow=partial, green=complete
+            if fill_pct >= 1.0:
+                color = (0, 255, 0)   # Green - zone complete
+            elif fill_pct > 0:
+                color = (0, 255, 255)  # Yellow - in progress
+            else:
+                color = (80, 80, 80)  # Gray - not started
 
-        next_bucket = self._next_incomplete_pose_bucket()
-        if next_bucket:
-            hint = self.pose_bucket_hints.get(next_bucket, "Move head")
-            hint_x = max(12, min(frame_width - 250, center_x - radius))
-            hint_y = max(24, center_y - radius - 14)
-            cv2.putText(frame, f"Move: {hint}", (hint_x, hint_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.56, (255, 255, 255), 1)
-        else:
-            cv2.putText(frame, "Face map complete", (center_x - 78, center_y + 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.56, (130, 255, 140), 2)
+            # Highlight the current target zone with larger radius
+            radius = 18 if zone == self.current_zone else 12
+            thickness = -1 if fill_pct >= 1.0 else 2  # Filled if complete
+
+            if zone == 'center':
+                # Center uses a ring instead of filled circle
+                cv2.circle(frame, (zx, zy), radius + 5, color, 2)
+            else:
+                cv2.circle(frame, (zx, zy), radius, color, thickness)
+                # Show count for incomplete zones
+                if fill_pct < 1.0:
+                    cv2.putText(frame, str(current), (zx - 8, zy + 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        # Mode header text
+        mode_text = "FACE ID CAPTURE" if self.auto_capture_mode else "REGISTRATION"
+        cv2.putText(frame, mode_text, (15, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 100, 200), 2)
+        cv2.putText(frame, self.registration_name, (15, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        # Progress bar at bottom (only during auto-capture)
+        if self.auto_capture_mode:
+            bar_width = 350
+            bar_height = 14
+            bar_x = center_x - bar_width // 2
+            bar_y = frame_height - 45
+
+            progress = self.captured_count / self.auto_capture_target
+
+            # Draw progress bar background
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width,
+                          bar_y + bar_height), (40, 40, 40), -1)
+            # Draw progress fill
+            fill_width = int(bar_width * progress)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x +
+                          fill_width, bar_y + bar_height), (0, 200, 0), -1)
+            # Draw border
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width,
+                          bar_y + bar_height), (100, 100, 100), 1)
+
+            # Progress count text
+            count_text = f"{self.captured_count}/{self.auto_capture_target}"
+            cv2.putText(frame, count_text, (bar_x + bar_width + 10, bar_y + 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+            # Zone guidance text
+            zones_complete = sum(
+                1 for z in self.zone_captures if self.zone_captures[z] >= self.zone_targets.get(z, 0))
+            if zones_complete < 5:
+                # Find the next zone that needs more captures
+                for zone in ['center', 'left', 'right', 'up', 'down']:
+                    if self.zone_captures.get(zone, 0) < self.zone_targets.get(zone, 0):
+                        guidance = {
+                            'center': "Look at the center",
+                            'left': "Move face LEFT",
+                            'right': "Move face RIGHT",
+                            'up': "Move face UP",
+                            'down': "Move face DOWN"
+                        }
+                        cv2.putText(frame, guidance.get(zone, ""), (center_x - 80, bar_y - 15),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                        break
+            else:
+                cv2.putText(frame, "All angles captured!", (center_x - 90, bar_y - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
 
     def update_registration_ui(self):
         """Update the registration UI labels with current capture progress."""
         if self.auto_capture_mode:
-            bins_done = sum(1 for z in self.zone_captures
-                            if self.zone_captures[z] >= self.zone_targets.get(z, 0))
-            total_bins = len(self.zone_targets)
+            zones_done = sum(1 for z in self.zone_captures
+                             if self.zone_captures[z] >= self.zone_targets.get(z, 0))
             self.reg_count_label.config(
-                text=f"{self.captured_count} photos • {bins_done}/{total_bins} pose bins"
+                text=f"{self.captured_count} photos • {zones_done}/5 zones"
             )
         else:
             self.reg_count_label.config(text=f"{self.captured_count} photos")
@@ -6439,6 +5987,9 @@ class DoorEntryKiosk:
         """
         self.auto_capture_mode = False
         # Keep reg_process_locked True - will be cleared after encoding completes
+
+        zones_done = sum(1 for z in self.zone_captures
+                         if self.zone_captures[z] >= self.zone_targets.get(z, 0))
 
         # Update UI to show training state
         self.reg_count_label.config(
@@ -6478,46 +6029,30 @@ class DoorEntryKiosk:
                 pass
 
         def training_thread():
-            success = False
-            message = "Training failed"
+            nonlocal total_images
+            # Count images for progress tracking
+            from imutils import paths
             try:
-                nonlocal total_images
-                # Count images for progress tracking
-                from imutils import paths
-                try:
-                    person_folder = self.face_system.get_person_folder(person_name)
-                except ValueError:
-                    person_folder = ""
-                if os.path.exists(person_folder):
-                    total_images = len(list(paths.list_images(person_folder)))
+                person_folder = self.face_system.get_person_folder(person_name)
+            except ValueError:
+                person_folder = ""
+            if os.path.exists(person_folder):
+                total_images = len(list(paths.list_images(person_folder)))
 
-                def progress_callback(current, total, filepath):
-                    """Update UI with encoding progress."""
-                    try:
-                        if current == total:
-                            self.root.after(0, lambda: update_progress_label(
-                                "Saving encodings..."))
-                        else:
-                            self.root.after(0, lambda c=current, t=total: update_progress_label(
-                                f"Encoding {c}/{t}..."))
-                    except (tk.TclError, RuntimeError):
-                        pass
+            def progress_callback(current, total, filepath):
+                """Update UI with encoding progress."""
+                if current == total:
+                    self.root.after(0, lambda: update_progress_label(
+                        "Saving encodings..."))
+                else:
+                    self.root.after(0, lambda c=current, t=total: update_progress_label(
+                        f"Encoding {c}/{t}..."))
 
-                success, message = self.face_system.train_single_person(
-                    person_name, progress_callback)
-            except Exception as e:
-                logger.error(
-                    f"Auto-capture training thread failed for '{person_name}': {e}",
-                    exc_info=True
-                )
-                message = f"Training failed: {e}"
-            finally:
-                # Always schedule completion to release lock/UI state.
-                try:
-                    self.root.after(
-                        0, lambda s=success, m=message: self.training_with_progress_complete(s, m))
-                except (tk.TclError, RuntimeError):
-                    pass
+            success, message = self.face_system.train_single_person(
+                person_name, progress_callback)
+            # Schedule completion on main thread
+            self.root.after(
+                0, lambda: self.training_with_progress_complete(success, message))
 
         thread = threading.Thread(target=training_thread, daemon=True)
         thread.start()
@@ -6580,23 +6115,10 @@ class DoorEntryKiosk:
         self.is_training = True  # Pause live recognition during training
 
         def training_thread():
-            success = False
-            message = "Training failed"
-            try:
-                success, message = self.face_system.train_single_person(
-                    person_name)
-            except Exception as e:
-                logger.error(
-                    f"Single-person training thread failed for '{person_name}': {e}",
-                    exc_info=True
-                )
-                message = f"Training failed: {e}"
-            finally:
-                try:
-                    self.root.after(
-                        0, lambda s=success, m=message: self.single_training_complete(s, m))
-                except (tk.TclError, RuntimeError):
-                    pass
+            success, message = self.face_system.train_single_person(
+                person_name)
+            self.root.after(
+                0, lambda: self.single_training_complete(success, message))
 
         thread = threading.Thread(target=training_thread, daemon=True)
         thread.start()
@@ -6649,33 +6171,17 @@ class DoorEntryKiosk:
         self.reg_process_locked = True  # Lock tab navigation during training
 
         def training_thread():
-            success = False
-            message = "Training failed"
-            try:
-                def progress_callback(current, total, filepath):
-                    """Update progress bar and status from training thread."""
-                    progress = (current / total) * 100
-                    try:
-                        self.root.after(
-                            0, lambda: self.train_progress.configure(value=progress))
-                        self.root.after(0, lambda: self.train_status_label.config(
-                            text=f"Processing {current}/{total}..."))
-                    except (tk.TclError, RuntimeError):
-                        pass
+            def progress_callback(current, total, filepath):
+                """Update progress bar and status from training thread."""
+                progress = (current / total) * 100
+                self.root.after(
+                    0, lambda: self.train_progress.configure(value=progress))
+                self.root.after(0, lambda: self.train_status_label.config(
+                    text=f"Processing {current}/{total}..."))
 
-                success, message = self.face_system.train_model(progress_callback)
-            except Exception as e:
-                logger.error(
-                    f"Full training thread failed: {e}",
-                    exc_info=True
-                )
-                message = f"Training failed: {e}"
-            finally:
-                try:
-                    self.root.after(
-                        0, lambda s=success, m=message: self.training_complete(s, m))
-                except (tk.TclError, RuntimeError):
-                    pass
+            success, message = self.face_system.train_model(progress_callback)
+            self.root.after(
+                0, lambda: self.training_complete(success, message))
 
         thread = threading.Thread(target=training_thread, daemon=True)
         thread.start()
@@ -6879,7 +6385,7 @@ class DoorEntryKiosk:
                     self.admin_notebook.select(0)
                     # Use toast instead of blocking dialog to avoid stuck state
                     self.show_toast(
-                        "Please wait for auto-capture or encoding to complete", "warning")
+                        "Please wait for capture and encoding to complete", "warning")
                 elif self.is_training:
                     # Full model training from Train tab - force back to train tab (index 1)
                     self.admin_notebook.select(1)
@@ -6909,7 +6415,7 @@ class DoorEntryKiosk:
         # Prevent closing during active process
         if self.reg_process_locked:
             self.show_toast(
-                "Please wait for auto-capture or training to complete", "warning")
+                "Please wait for capture and encoding to complete", "warning")
             return
 
         # Clean up any in-progress registration
