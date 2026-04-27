@@ -3476,6 +3476,8 @@ class DoorEntryKiosk:
             'down_right': "Look down-right",
         }
         self.last_head_pose = (0.0, 0.0, 0.0)  # yaw, pitch, roll
+        # Per-session neutral pose baseline so "look straight" adapts to camera angle.
+        self.pose_anchor: Optional[Tuple[float, float]] = None
         self.last_capture_pose_by_bucket: Dict[str, Tuple[float, float, float]] = {}
         self.overlay_face_location: Optional[Tuple[int, int, int, int]] = None
         self.auto_capture_target = sum(self.zone_targets.values())
@@ -4124,76 +4126,100 @@ class DoorEntryKiosk:
                             self.auto_capture_mode = False
                             self.overlay_face_location = None
                             self.root.after(0, self.complete_auto_registration)
-                        elif len(faces) == 1:
-                            face = faces[0]
-                            location = self._extract_face_location(
-                                face, frame.shape)
-                            if location is None:
+                        elif len(faces) >= 1:
+                            face = self._select_primary_face(faces)
+                            if face is None:
                                 self.overlay_face_location = None
                                 cv2.putText(display_frame, "Face detection unstable", (frame_width // 2 - 140, frame_height // 2),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
                             else:
-                                top, right, bottom, left = location
-                                self.overlay_face_location = location
-                                pose = self._estimate_head_pose(face)
-
-                                if pose is None:
-                                    self.last_head_pose = (0.0, 0.0, 0.0)
-                                    box_color = (0, 200, 255)
-                                    status_text = "Turn slightly toward camera"
+                                location = self._extract_face_location(
+                                    face, frame.shape)
+                                if location is None:
+                                    self.overlay_face_location = None
+                                    cv2.putText(display_frame, "Face detection unstable", (frame_width // 2 - 140, frame_height // 2),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
                                 else:
-                                    yaw, pitch, roll = pose
-                                    self.last_head_pose = (yaw, pitch, roll)
-                                    live_bucket = self._pose_bucket_from_angles(
-                                        yaw, pitch)
-                                    self.current_zone = live_bucket
+                                    top, right, bottom, left = location
+                                    self.overlay_face_location = location
+                                    pose = self._estimate_head_pose(face)
 
-                                    can_capture, status_text = self._pose_capture_ready(
-                                        frame, location, target_bucket, yaw, pitch, roll)
-                                    box_color = (0, 255, 0) if can_capture else (
-                                        0, 200, 255)
+                                    if pose is None:
+                                        self.last_head_pose = (0.0, 0.0, 0.0)
+                                        box_color = (0, 200, 255)
+                                        status_text = "Turn slightly toward camera"
+                                    else:
+                                        yaw_raw, pitch_raw, roll = pose
 
-                                    now = time.time()
-                                    if (can_capture
-                                            and self.captured_count < self.auto_capture_target
-                                            and now - self.last_auto_capture >= self.auto_capture_interval):
-                                        self.face_system.save_face_image(
-                                            frame, self.registration_name)
-                                        self.captured_count += 1
-                                        self.zone_captures[target_bucket] = self.zone_captures.get(
-                                            target_bucket, 0) + 1
-                                        self.last_auto_capture = now
-                                        self.last_capture_pose_by_bucket[target_bucket] = (
-                                            yaw, pitch, roll)
-                                        self.root.after(
-                                            0, self.update_registration_ui)
+                                        # Calibrate a neutral baseline once so the pose map works
+                                        # even when the camera is mounted above/below eye level.
+                                        if self.pose_anchor is None:
+                                            self.pose_anchor = (yaw_raw, pitch_raw)
 
-                                        if (self.captured_count >= self.auto_capture_target
-                                                or self._next_incomplete_pose_bucket() is None):
-                                            self.auto_capture_mode = False
-                                            self.root.after(
-                                                0, self.complete_auto_registration)
+                                        anchor_yaw, anchor_pitch = self.pose_anchor
+                                        yaw = yaw_raw - anchor_yaw
+                                        pitch = pitch_raw - anchor_pitch
 
-                                cv2.rectangle(display_frame, (left, top),
-                                              (right, bottom), box_color, 3)
-                                cv2.putText(display_frame, status_text,
-                                            (frame_width // 2 - 135, frame_height - 70),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.62, box_color, 2)
+                                        self.last_head_pose = (yaw, pitch, roll)
+                                        live_bucket = self._pose_bucket_from_angles(
+                                            yaw, pitch)
+                                        self.current_zone = live_bucket
 
-                                # Flash on capture
-                                if (time.time() - self.last_auto_capture) < 0.08:
-                                    cv2.rectangle(
-                                        display_frame, (0, 0), (frame_width, frame_height), (0, 255, 0), 12)
+                                        can_capture, status_text = self._pose_capture_ready(
+                                            frame, location, target_bucket, yaw, pitch, roll)
+                                        box_color = (0, 255, 0) if can_capture else (
+                                            0, 200, 255)
+
+                                        now = time.time()
+                                        if (can_capture
+                                                and self.captured_count < self.auto_capture_target
+                                                and now - self.last_auto_capture >= self.auto_capture_interval):
+                                            try:
+                                                self.face_system.save_face_image(
+                                                    frame, self.registration_name)
+                                            except Exception as capture_error:
+                                                logger.error(
+                                                    f"Auto-capture save failed for '{self.registration_name}': {capture_error}",
+                                                    exc_info=True
+                                                )
+                                                self.root.after(
+                                                    0, lambda: self.show_toast("Failed to save capture", "error"))
+                                            else:
+                                                self.captured_count += 1
+                                                self.zone_captures[target_bucket] = self.zone_captures.get(
+                                                    target_bucket, 0) + 1
+                                                self.last_auto_capture = now
+                                                self.last_capture_pose_by_bucket[target_bucket] = (
+                                                    yaw, pitch, roll)
+                                                self.root.after(
+                                                    0, self.update_registration_ui)
+
+                                                if (self.captured_count >= self.auto_capture_target
+                                                        or self._next_incomplete_pose_bucket() is None):
+                                                    self.auto_capture_mode = False
+                                                    self.root.after(
+                                                        0, self.complete_auto_registration)
+
+                                    cv2.rectangle(display_frame, (left, top),
+                                                  (right, bottom), box_color, 3)
+                                    cv2.putText(display_frame, status_text,
+                                                (frame_width // 2 - 135, frame_height - 70),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.62, box_color, 2)
+
+                                    if len(faces) > 1:
+                                        cv2.putText(display_frame, "Multiple faces detected; using largest face", (12, frame_height - 95),
+                                                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 180, 255), 1)
+
+                                    # Flash on capture
+                                    if (time.time() - self.last_auto_capture) < 0.08:
+                                        cv2.rectangle(
+                                            display_frame, (0, 0), (frame_width, frame_height), (0, 255, 0), 12)
 
                         elif len(faces) == 0:
                             self.last_head_pose = (0.0, 0.0, 0.0)
                             self.overlay_face_location = None
                             cv2.putText(display_frame, "Position your face in frame", (frame_width // 2 - 150, frame_height // 2),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
-                        else:
-                            self.overlay_face_location = None
-                            cv2.putText(display_frame, "Only one face please", (frame_width // 2 - 100, frame_height // 2),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
                         # Draw Face ID style overlay
                         self.draw_faceid_overlay(display_frame)
@@ -5956,6 +5982,7 @@ class DoorEntryKiosk:
         self.zone_captures = {bucket: 0 for bucket in self.zone_targets}
         self.current_zone = 'mid_center'
         self.last_head_pose = (0.0, 0.0, 0.0)
+        self.pose_anchor = None
         self.last_capture_pose_by_bucket = {}
         self.overlay_face_location = None
         # Keep navigation unlocked during manual registration setup/capture.
@@ -6004,6 +6031,7 @@ class DoorEntryKiosk:
         self.zone_captures = {bucket: 0 for bucket in self.zone_targets}
         self.current_zone = 'mid_center'
         self.last_head_pose = (0.0, 0.0, 0.0)
+        self.pose_anchor = None
         self.last_capture_pose_by_bucket = {}
         self.overlay_face_location = None
         self.reg_process_locked = False  # Unlock tab navigation
@@ -6053,6 +6081,7 @@ class DoorEntryKiosk:
         self.zone_captures = {bucket: 0 for bucket in self.zone_targets}
         self.current_zone = 'mid_center'
         self.last_head_pose = (0.0, 0.0, 0.0)
+        self.pose_anchor = None
         self.last_capture_pose_by_bucket = {}
         self.overlay_face_location = None
         self.auto_capture_target = sum(self.zone_targets.values())
@@ -6076,6 +6105,7 @@ class DoorEntryKiosk:
         # Reset auto-capture state
         self.auto_capture_mode = False
         self.reg_process_locked = False
+        self.pose_anchor = None
         self.last_capture_pose_by_bucket = {}
         self.overlay_face_location = None
         self.auto_capture_btn.config(
@@ -6087,49 +6117,87 @@ class DoorEntryKiosk:
         Estimate (yaw, pitch, roll) in degrees from InsightFace output.
         Uses model-provided pose when available, with a keypoint fallback.
         """
+        def _clip_pose(yaw_val: float, pitch_val: float, roll_val: float) -> Tuple[float, float, float]:
+            return (
+                float(np.clip(yaw_val, -60.0, 60.0)),
+                float(np.clip(pitch_val, -60.0, 60.0)),
+                float(np.clip(roll_val, -60.0, 60.0))
+            )
+
+        model_candidates: List[Tuple[float, float, float]] = []
         pose = getattr(face, 'pose', None)
         if pose is not None:
             pose_arr = np.asarray(pose, dtype=np.float32).reshape(-1)
             if pose_arr.size >= 3 and np.all(np.isfinite(pose_arr[:3])):
-                yaw, pitch, roll = float(pose_arr[0]), float(
-                    pose_arr[1]), float(pose_arr[2])
-                return (
-                    float(np.clip(yaw, -60.0, 60.0)),
-                    float(np.clip(pitch, -60.0, 60.0)),
-                    float(np.clip(roll, -60.0, 60.0))
+                # InsightFace versions differ in pose axis ordering. Keep both
+                # interpretations and resolve with landmark geometry when available.
+                model_candidates.append(
+                    _clip_pose(float(pose_arr[0]), float(pose_arr[1]), float(pose_arr[2]))
+                )
+                model_candidates.append(
+                    _clip_pose(float(pose_arr[1]), float(pose_arr[0]), float(pose_arr[2]))
                 )
 
         kps = getattr(face, 'kps', None)
-        if kps is None:
+        kps_pose: Optional[Tuple[float, float, float]] = None
+        if kps is not None:
+            pts = np.asarray(kps, dtype=np.float32)
+            if pts.shape[0] >= 5:
+                left_eye = pts[0]
+                right_eye = pts[1]
+                nose = pts[2]
+                mouth_left = pts[3]
+                mouth_right = pts[4]
+
+                eye_center = (left_eye + right_eye) / 2.0
+                mouth_center = (mouth_left + mouth_right) / 2.0
+                inter_eye = max(1.0, float(np.linalg.norm(right_eye - left_eye)))
+                eye_to_mouth = max(1.0, float(mouth_center[1] - eye_center[1]))
+
+                # Approximate pose from 2D landmark geometry.
+                yaw = ((nose[0] - eye_center[0]) / (inter_eye * 0.5)) * 30.0
+                pitch_ratio = (nose[1] - eye_center[1]) / eye_to_mouth
+                pitch = (pitch_ratio - 0.45) * 35.0
+                roll = np.degrees(np.arctan2(
+                    right_eye[1] - left_eye[1], right_eye[0] - left_eye[0]))
+                kps_pose = _clip_pose(yaw, pitch, roll)
+
+        if model_candidates:
+            if kps_pose is not None:
+                def pose_distance(candidate: Tuple[float, float, float]) -> float:
+                    # Compare yaw/pitch agreement to pick the correct axis order.
+                    return abs(candidate[0] - kps_pose[0]) + abs(candidate[1] - kps_pose[1])
+
+                return min(model_candidates, key=pose_distance)
+            return model_candidates[0]
+
+        return kps_pose
+
+    def _select_primary_face(self, faces: List[Any]) -> Optional[Any]:
+        """Select the largest detected face when multiple faces are present."""
+        if not faces:
             return None
 
-        pts = np.asarray(kps, dtype=np.float32)
-        if pts.shape[0] < 5:
-            return None
+        best_face = None
+        best_area = -1.0
 
-        left_eye = pts[0]
-        right_eye = pts[1]
-        nose = pts[2]
-        mouth_left = pts[3]
-        mouth_right = pts[4]
+        for face in faces:
+            bbox = getattr(face, 'bbox', None)
+            if bbox is None:
+                continue
 
-        eye_center = (left_eye + right_eye) / 2.0
-        mouth_center = (mouth_left + mouth_right) / 2.0
-        inter_eye = max(1.0, float(np.linalg.norm(right_eye - left_eye)))
-        eye_to_mouth = max(1.0, float(mouth_center[1] - eye_center[1]))
+            coords = np.asarray(bbox, dtype=np.float32).reshape(-1)
+            if coords.size < 4 or not np.all(np.isfinite(coords[:4])):
+                continue
 
-        # Approximate pose from 2D landmark geometry.
-        yaw = ((nose[0] - eye_center[0]) / (inter_eye * 0.5)) * 30.0
-        pitch_ratio = (nose[1] - eye_center[1]) / eye_to_mouth
-        pitch = (pitch_ratio - 0.45) * 35.0
-        roll = np.degrees(np.arctan2(
-            right_eye[1] - left_eye[1], right_eye[0] - left_eye[0]))
+            width = max(0.0, float(coords[2] - coords[0]))
+            height = max(0.0, float(coords[3] - coords[1]))
+            area = width * height
+            if area > best_area:
+                best_area = area
+                best_face = face
 
-        return (
-            float(np.clip(yaw, -60.0, 60.0)),
-            float(np.clip(pitch, -60.0, 60.0)),
-            float(np.clip(roll, -60.0, 60.0))
-        )
+        return best_face if best_face is not None else faces[0]
 
     def _pose_bucket_from_angles(self, yaw: float, pitch: float) -> str:
         """Map yaw/pitch angles into one of 9 pose buckets."""
@@ -6204,10 +6272,10 @@ class DoorEntryKiosk:
 
         target_yaw, target_pitch = self.pose_bucket_centers.get(
             target_bucket, (0.0, 0.0))
-        if abs(yaw - target_yaw) > 14.0 or abs(pitch - target_pitch) > 12.0:
+        if abs(yaw - target_yaw) > 18.0 or abs(pitch - target_pitch) > 16.0:
             return False, "Hold target pose"
 
-        if abs(roll) > 20.0:
+        if abs(roll) > 25.0:
             return False, "Keep head upright"
 
         top, right, bottom, left = location
@@ -6215,7 +6283,7 @@ class DoorEntryKiosk:
         face_width = max(1, right - left)
         face_height = max(1, bottom - top)
         face_area_ratio = (face_width * face_height) / max(1, frame_height * frame_width)
-        if face_area_ratio < 0.035:
+        if face_area_ratio < 0.022:
             return False, "Move closer"
 
         face_roi = frame[top:bottom, left:right]
@@ -6224,11 +6292,11 @@ class DoorEntryKiosk:
 
         gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
         brightness = float(np.mean(gray))
-        if brightness < 35.0 or brightness > 225.0:
+        if brightness < 25.0 or brightness > 235.0:
             return False, "Adjust lighting"
 
         sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        if sharpness < 45.0:
+        if sharpness < 25.0:
             return False, "Hold still"
 
         last_pose = self.last_capture_pose_by_bucket.get(target_bucket)
@@ -6236,7 +6304,7 @@ class DoorEntryKiosk:
             dyaw = abs(yaw - last_pose[0])
             dpitch = abs(pitch - last_pose[1])
             droll = abs(roll - last_pose[2])
-            if dyaw < 2.0 and dpitch < 2.0 and droll < 3.0:
+            if dyaw < 1.0 and dpitch < 1.0 and droll < 2.0:
                 return False, "Slightly change angle"
 
         return True, "Capture ready"
