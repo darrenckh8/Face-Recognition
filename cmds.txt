@@ -1,6 +1,6 @@
 '''Useful commands'''
 
-gsettings set org.gnome.desktop.interface cursor-theme 'transparent-cursor'
+gsettings set org.gnome.desktop.interface cursor-theme '' // Adwaita, transparent-cursor
 nano ~/.icons/default/index.theme
 systemctl --user enable kiosk.service
 systemctl --user disable kiosk.service
