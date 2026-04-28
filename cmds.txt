@@ -1,0 +1,9 @@
+'''Useful commands'''
+
+gsettings set org.gnome.desktop.interface cursor-theme 'transparent-cursor'
+nano ~/.icons/default/index.theme
+systemctl --user enable kiosk.service
+systemctl --user disable kiosk.service
+sudo raspi-config
+sudo nano /etc/udev/rules.d/99-touchscreen.rules
+nano ~/.config/systemd/user/kiosk.service
