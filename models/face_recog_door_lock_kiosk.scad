@@ -69,6 +69,11 @@ m4_clearance_d = 4.50;
 display_mount_hole_d = m2_5_clearance_d;
 display_boss_outer_d = 8.50;
 display_boss_h = 7.00;
+display_boss_height_raise = 10.00;
+display_boss_lower_cut = 10.00;
+display_support_w = 5.50;
+display_support_contact_w = 5.50;
+display_support_boss_overlap = 1.20;
 
 // ---------------------------------------------------------------------------
 // Kiosk body
@@ -81,6 +86,10 @@ corner_r = 8;
 wall_t = 3;
 front_t = 4;
 rear_wall_t = 3;
+// Keep the LCD hole pattern and support plane fixed while trimming the lower side.
+display_mount_surface_z = front_t + display_boss_h + display_boss_height_raise;
+display_standoff_z = front_t + display_boss_lower_cut;
+display_standoff_h = display_mount_surface_z - display_standoff_z;
 
 display_center_x = 0;
 display_center_y = -7;
@@ -104,6 +113,7 @@ camera_mount_pitch_y = 12.5;
 camera_mount_hole_d = 2.20;
 camera_boss_outer_d = 5.80;
 camera_boss_h = 5.00;
+camera_mount_bosses_enabled = false;
 
 // Aux front features.
 speaker_hole_d = 2.0;
@@ -224,17 +234,23 @@ module xz_prism(points, h) {
 
 module display_mount_tab_at(p) {
     xsign = p[0] < display_center_x ? -1 : 1;
-    ysign = p[1] < display_center_y ? -1 : 1;
     side_edge_x = xsign * body_w / 2;
-    end_edge_y = ysign * body_h / 2;
+    boss_side_x = p[0] + xsign * display_boss_outer_d / 2;
+    support_z = front_t - eps;
+    support_h = display_mount_surface_z - front_t + 2 * eps;
+    contact_z = display_standoff_z - eps;
+    contact_h = display_standoff_h + 2 * eps;
+    lcd_area_edge_x = display_center_x + xsign * display_window_w / 2;
+    support_inner_x = boss_side_x - xsign * display_support_boss_overlap;
 
-    // Hidden ribs tie the near-bezelless display standoffs back into the
-    // surrounding shell lip so the bosses are not floating islands.
-    translate([(p[0] + side_edge_x) / 2, p[1], front_t + display_boss_h / 2])
-        cube([abs(side_edge_x - p[0]) + eps, display_boss_outer_d * 0.75, display_boss_h], center = true);
+    // Main rectangular side support stops at the LCD/window boundary.
+    translate([(side_edge_x + lcd_area_edge_x) / 2, p[1], support_z + support_h / 2])
+        cube([abs(side_edge_x - lcd_area_edge_x) + eps, display_support_w, support_h], center = true);
 
-    translate([p[0], (p[1] + end_edge_y) / 2, front_t + display_boss_h / 2])
-        cube([display_boss_outer_d * 0.75, abs(end_edge_y - p[1]) + eps, display_boss_h], center = true);
+    // Only this short contact tab enters the LCD area, just enough to touch
+    // the standoff from the side at standoff height.
+    translate([(lcd_area_edge_x + support_inner_x) / 2, p[1], contact_z + contact_h / 2])
+        cube([abs(lcd_area_edge_x - support_inner_x) + eps, display_support_contact_w, contact_h], center = true);
 }
 
 // ---------------------------------------------------------------------------
@@ -350,19 +366,21 @@ module front_panel_bosses() {
     // Display mounting bosses, aligned to Elecrow's outer M2.5 hole pattern.
     for (p = display_outer_holes) {
         display_mount_tab_at(p);
-        boss_at(p, display_boss_outer_d, display_mount_hole_d, display_boss_h, front_t);
+        boss_at(p, display_boss_outer_d, display_mount_hole_d, display_standoff_h, display_standoff_z);
     }
 
-    // Camera module bosses.
-    for (x = [-camera_mount_pitch_x / 2, camera_mount_pitch_x / 2])
-        for (y = [-camera_mount_pitch_y / 2, camera_mount_pitch_y / 2])
-            boss_at(
-                [camera_center_x + x, camera_center_y + y],
-                camera_boss_outer_d,
-                camera_mount_hole_d,
-                camera_boss_h,
-                front_t
-            );
+    if (camera_mount_bosses_enabled) {
+        // Camera module bosses.
+        for (x = [-camera_mount_pitch_x / 2, camera_mount_pitch_x / 2])
+            for (y = [-camera_mount_pitch_y / 2, camera_mount_pitch_y / 2])
+                boss_at(
+                    [camera_center_x + x, camera_center_y + y],
+                    camera_boss_outer_d,
+                    camera_mount_hole_d,
+                    camera_boss_h,
+                    front_t
+                );
+    }
 
     // Receiver bosses for screws inserted from the rear shell.
     for (p = case_screw_points)
@@ -446,7 +464,7 @@ module rear_shell() {
 // ---------------------------------------------------------------------------
 
 module display_reference() {
-    display_back_z = front_t + display_boss_h;
+    display_back_z = display_mount_surface_z;
     display_front_z = display_back_z - display_board_t;
     display_center_z = (display_back_z + display_front_z) / 2;
 
