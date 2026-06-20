@@ -10,6 +10,7 @@
   Suggested use:
   - Render part="assembly" to inspect the complete kiosk.
   - Render part="front_panel" for the printable front/display mount.
+  - Render part="front_fascia" for the printable front overlay/bezel.
   - Render part="rear_shell" for the printable rear enclosure.
   - Render part="display_drill_template" to check the display hole pattern.
 
@@ -21,8 +22,8 @@
 $fn = 64;
 eps = 0.02;
 
-part = "assembly"; // "assembly", "front_panel", "rear_shell", "display_drill_template", "display_reference"
-part_id = 0;       // CLI override: 1 front, 2 rear, 3 drill template, 4 display ref, 5 assembly
+part = "assembly"; // "assembly", "front_panel", "front_fascia", "rear_shell", "display_drill_template", "display_reference"
+part_id = 0;       // CLI override: 1 front, 2 rear, 3 drill template, 4 display ref, 5 assembly, 6 fascia
 show_reference_parts = true;
 
 // ---------------------------------------------------------------------------
@@ -86,6 +87,8 @@ corner_r = 8;
 wall_t = 3;
 front_t = 4;
 rear_wall_t = 3;
+front_fascia_t = 2.00;
+front_fascia_lcd_inset = 3.00;
 // Keep the LCD hole pattern and support plane fixed while trimming the lower side.
 display_mount_surface_z = front_t + display_boss_h + display_boss_height_raise;
 display_standoff_z = front_t + display_boss_lower_cut;
@@ -100,6 +103,8 @@ display_window_h = display_inst_board_h + display_module_clearance;
 display_visible_w = display_inst_active_w + display_window_clearance;
 display_visible_h = display_inst_active_h + display_window_clearance;
 display_window_r = 1.25;
+front_fascia_window_w = display_window_w - 2 * front_fascia_lcd_inset;
+front_fascia_window_h = display_window_h - 2 * front_fascia_lcd_inset;
 
 // Face recognition camera area.
 camera_center_x = 0;
@@ -397,6 +402,29 @@ module front_panel() {
     }
 }
 
+module front_fascia_cutouts() {
+    translate([display_center_x, display_center_y, 0])
+        rounded_cut(front_fascia_window_w, front_fascia_window_h, front_fascia_t, display_window_r);
+
+    round_hole_at([camera_center_x, camera_center_y], camera_lens_d, front_fascia_t);
+
+    if (front_speaker_enabled) {
+        for (ix = [0 : speaker_cols - 1])
+            for (iy = [0 : speaker_rows - 1])
+                round_hole_at([
+                    -body_w / 2 + 31 + ix * speaker_pitch,
+                    -body_h / 2 + 27 + iy * speaker_pitch
+                ], speaker_hole_d, front_fascia_t);
+    }
+}
+
+module front_fascia() {
+    difference() {
+        rounded_prism(body_w, body_h, front_fascia_t, corner_r);
+        front_fascia_cutouts();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rear shell with integrated 45 degree door-frame mounting face
 // ---------------------------------------------------------------------------
@@ -561,6 +589,8 @@ if (part_id == 5 || (part_id == 0 && part == "assembly")) {
     assembly();
 } else if (part_id == 1 || (part_id == 0 && part == "front_panel")) {
     front_panel();
+} else if (part_id == 6 || (part_id == 0 && part == "front_fascia")) {
+    front_fascia();
 } else if (part_id == 2 || (part_id == 0 && part == "rear_shell")) {
     rear_shell();
 } else if (part_id == 3 || (part_id == 0 && part == "display_drill_template")) {
